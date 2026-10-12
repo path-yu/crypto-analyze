@@ -909,3 +909,61 @@ test('M6: 复合赋值与单行函数体在产物中正确脱糖', () => {
   assert.ok(comp.ts.includes('function f_scale'), '单行函数体应生成函数声明')
   assert.ok(comp.ts.includes('return (v * '), '单行函数体的表达式应成为返回值')
 })
+
+/* ================================================================== */
+/* M7 数组 / 元组解构 / 泛型声明 / 顶层标量在用户函数中可见            */
+/* ================================================================== */
+
+/** 覆盖 array.* 命名空间、泛型类型声明、元组解构与「用户函数读顶层逐 bar 标量」 */
+const M7_SRC = [
+  '//@version=6',
+  'indicator("m7", overlay=true)',
+  '',
+  'var array<float> acc = array.new<float>()',
+  '// 逐 bar 标量（不是初始化期常量），用户函数必须能读到它',
+  'scale = close * 0 + 10.0',
+  '',
+  'plan(float x) =>',
+  '    array.push(acc, x)',
+  '    [x * 2, x * 3]',
+  '',
+  'f(int v) => v * scale',
+  '',
+  'total = 0.0',
+  'if bar_index == 0',
+  '    [a, b] = plan(2.0)',
+  '    total := a + b + f(1)',
+  '    total := total + array.size(acc) + array.last(acc)',
+  'plot(total, title="Out")',
+].join('\n')
+
+test('M7: array.* / 泛型声明 / 元组解构 / 顶层标量捕获在运行期数值正确', () => {
+  const comp = compilePine(M7_SRC, { sourceName: 'm7.pine' })
+  const errors = comp.diagnostics.filter((d) => d.severity === 'error')
+  assert.deepEqual(errors, [], `不应有 error：${JSON.stringify(errors)}`)
+
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  const FLAT = { flat: true, positionSize: 0, prevPositionSize: 0, avgPrice: Number.NaN, side: null }
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT as never)
+  // a=4 b=6 f(1)=10 → 20；再加 array.size(acc)=1 与 array.last(acc)=2 → 23
+  assert.equal(Number(program.plots['Out']?.[0]), 23, `第 0 根 bar 的 Out 应为 23，实际 ${program.plots['Out']?.[0]}`)
+})
+
+test('M7: array.new(size, init) 按 init 填满，越界读返回 na', () => {
+  const src = [
+    '//@version=6',
+    'indicator("m7b")',
+    'var array<float> a = array.new<float>(3, 7.0)',
+    'v = array.get(a, 1) + array.get(a, 99)',
+    'plot(array.size(a) + (na(v) ? 100 : v), title="Out")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm7b.pine' })
+  assert.deepEqual(comp.diagnostics.filter((d) => d.severity === 'error'), [])
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  const FLAT = { flat: true, positionSize: 0, prevPositionSize: 0, avgPrice: Number.NaN, side: null }
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT as never)
+  // size=3，get(1)=7，get(99)=na → v 为 na → 3 + 100 = 103
+  assert.equal(Number(program.plots['Out']?.[0]), 103, `越界读应得 na（而非抛错），实际 ${program.plots['Out']?.[0]}`)
+})

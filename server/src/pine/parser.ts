@@ -25,6 +25,7 @@ import type {
   Stmt,
   SwitchArm,
   SwitchExpr,
+  TupleAssignStmt,
   TypeDeclStmt,
   TypeField,
   WhileStmt,
@@ -252,7 +253,52 @@ class Parser {
     return false
   }
 
-  private parseAssign(): AssignStmt {
+  /**
+   * 尝试消费泛型类型前缀：`array<float>` / `map<string, float>` / `matrix<int>`。
+   * 只有在「`>` 之后紧跟变量名、再接 `=` / `:=` / 复合赋值」时才认定是类型声明，
+   * 因此不会把 `a < b > c` 这类比较表达式误判成泛型。成功返回类型文本并推进游标。
+   */
+  private tryGenericType(): string | null {
+    const isAssignOp = (t: Token | undefined): boolean =>
+      isOp(t, '=') || isOp(t, ':=') || (t?.kind === 'op' && COMPOUND_ASSIGN[t.text] !== undefined)
+    // v4/v5 的数组类型后缀：`line[] x = ...` / `float[] ys = ...`
+    if (this.peek()?.kind === 'ident' && isOp(this.peek(1), '[') && isOp(this.peek(2), ']')) {
+      const nameTok = this.tokens[this.pos + 3]
+      if (nameTok?.kind !== 'ident' || !isAssignOp(this.tokens[this.pos + 4])) return null
+      const text = `${this.tokens[this.pos].text}[]`
+      this.pos += 3
+      return text
+    }
+    if (this.peek()?.kind !== 'ident' || !isOp(this.peek(1), '<')) return null
+    let depth = 0
+    let end = -1
+    for (let i = this.pos + 1; i < this.tokens.length; i++) {
+      const t = this.tokens[i]
+      if (t.kind === 'newline' || t.kind === 'eof' || t.kind === 'indent' || t.kind === 'dedent') break
+      if (t.kind !== 'op') continue
+      if (t.text === '<') depth++
+      else if (t.text === '>') {
+        depth--
+        if (depth === 0) {
+          end = i
+          break
+        }
+      }
+    }
+    if (end < 0) return null
+    const nameTok = this.tokens[end + 1]
+    const opTok = this.tokens[end + 2]
+    if (nameTok?.kind !== 'ident') return null
+    if (!isAssignOp(opTok)) return null
+    const typeText = this.tokens
+      .slice(this.pos, end + 1)
+      .map((t) => t.text)
+      .join('')
+    this.pos = end + 1
+    return typeText
+  }
+
+  private parseAssign(): AssignStmt | TupleAssignStmt {
     const start = this.peek()!
     let isVar = false
     let typeName: string | undefined
@@ -262,13 +308,10 @@ class Parser {
       isVar = true
       this.next()
       const t0 = this.peek()
-      if (t0?.kind === 'ident' && isOp(this.peek(1), '<')) {
-        // var array<OB> zones = ...
-        this.next()
-        this.next()
-        const arg = this.expectIdent()
-        typeName = `${t0.text}<${arg.text}>`
-        this.expectOp('>')
+      const generic = this.tryGenericType()
+      if (generic) {
+        // var array<line> lvLine = array.new<line>()
+        typeName = generic
         const name = this.expectIdent()
         target = { kind: 'ident', name: name.text, line: name.line, col: name.col }
       } else if (t0?.kind === 'ident' && this.peek(1)?.kind === 'ident') {
@@ -286,7 +329,13 @@ class Parser {
       const t0 = this.peek()
       const t1 = this.peek(1)
       const t2 = this.peek(2)
-      if (
+      const generic = this.tryGenericType()
+      if (generic) {
+        // 泛型类型化声明：array<float> lvPx = array.new<float>()
+        typeName = generic
+        const name = this.expectIdent()
+        target = { kind: 'ident', name: name.text, line: name.line, col: name.col }
+      } else if (
         t0?.kind === 'ident' &&
         t1?.kind === 'ident' &&
         (isOp(t2, '=') || isOp(t2, ':='))
@@ -310,6 +359,28 @@ class Parser {
     }
     this.next()
     const rhs = this.parseTernary()
+    // 元组解构：`[a, b] = f()`。左侧被 parsePrimary 解析成了数组字面量，
+    // 若元素全是标识符就改写为元组赋值语句。
+    if (!compound && target.kind === 'array') {
+      const names: string[] = []
+      for (const it of target.items) {
+        if (it.kind !== 'ident') {
+          names.length = 0
+          break
+        }
+        names.push(it.name)
+      }
+      if (names.length > 0) {
+        return {
+          kind: 'tupleAssign',
+          names,
+          op: isOp(opTok, ':=') ? ':=' : '=',
+          value: rhs,
+          line: start.line,
+          col: start.col,
+        }
+      }
+    }
     const value: Expr = compound
       ? { kind: 'binary', op: compound, left: target, right: rhs, line: target.line, col: target.col }
       : rhs
@@ -356,6 +427,35 @@ class Parser {
     if (this.atKind('dedent')) this.next()
   }
 
+  private readTypePrefix(): { text: string; len: number } | null {
+    const t0 = this.peek()
+    if (t0?.kind !== 'ident') return null
+    if (isOp(this.peek(1), '<')) {
+      let depth = 0
+      for (let i = this.pos + 1; i < this.tokens.length; i++) {
+        const t = this.tokens[i]
+        if (t.kind === 'newline' || t.kind === 'eof') break
+        if (t.kind !== 'op') continue
+        if (t.text === '<') depth++
+        else if (t.text === '>') {
+          depth--
+          if (depth === 0) {
+            const text = this.tokens
+              .slice(this.pos, i + 1)
+              .map((x) => x.text)
+              .join('')
+            return { text, len: i + 1 - this.pos }
+          }
+        }
+      }
+      return null
+    }
+    if (isOp(this.peek(1), '[') && isOp(this.peek(2), ']')) {
+      return { text: `${t0.text}[]`, len: 3 }
+    }
+    return { text: t0.text, len: 1 }
+  }
+
   private parseFuncDecl(): FuncDeclStmt {
     const start = this.peek()!
     const name = this.expectIdent()
@@ -364,11 +464,13 @@ class Parser {
     if (!isOp(this.peek(), ')')) {
       for (;;) {
         const a = this.peek()
-        const b = this.peek(1)
-        if (a?.kind === 'ident' && b?.kind === 'ident') {
-          params.push({ typeName: a.text, name: b.text })
-          this.next()
-          this.next()
+        // 形参类型前缀：`float v` / `array<float> H` / `line[] xs`
+        const type = this.readTypePrefix()
+        const nameAfter = type ? this.tokens[this.pos + type.len] : undefined
+        if (type && nameAfter?.kind === 'ident') {
+          this.pos += type.len
+          const name = this.expectIdent()
+          params.push({ typeName: type.text, name: name.text })
         } else if (a?.kind === 'ident') {
           params.push({ name: a.text })
           this.next()
@@ -529,12 +631,15 @@ class Parser {
         e = this.parseCallArgs(e)
         continue
       }
-      // 泛型调用 `array.new<OB>()`
+      // 泛型调用 `array.new<OB>()` / `array.new<chart.point>()`
       if (isOp(t, '<') && this.isGenericCall()) {
-        const arg = this.peek(1)!.text
-        this.next()
-        this.next()
-        this.next() // '<' ident '>'
+        this.next() // '<'
+        let arg = this.expectIdent().text
+        while (isOp(this.peek(), '.') && this.peek(1)?.kind === 'ident') {
+          this.next()
+          arg += `.${this.expectIdent().text}`
+        }
+        this.next() // '>'
         e = this.parseCallArgs(e, arg)
         continue
       }
@@ -545,12 +650,11 @@ class Parser {
 
   /** 形如 `<Ident>(` 的泛型调用前缀 */
   private isGenericCall(): boolean {
-    return (
-      isOp(this.peek(), '<') &&
-      this.peek(1)?.kind === 'ident' &&
-      isOp(this.peek(2), '>') &&
-      isOp(this.peek(3), '(')
-    )
+    if (!isOp(this.peek(), '<') || this.peek(1)?.kind !== 'ident') return false
+    // 泛型实参可以是点分路径（如 chart.point）
+    let k = this.pos + 2
+    while (isOp(this.tokens[k], '.') && this.tokens[k + 1]?.kind === 'ident') k += 2
+    return isOp(this.tokens[k], '>') && isOp(this.tokens[k + 1], '(')
   }
 
   private parsePrimary(): Expr {

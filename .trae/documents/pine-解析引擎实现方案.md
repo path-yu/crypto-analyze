@@ -464,24 +464,59 @@ apiRouter.post('/pine/backtest', async (req, res) => {
 
 ### 11.4 第三方脚本能力现状（实测结论）
 
-| 脚本 | 行数 | 状态 |
+| 脚本 | 行数 | 状态（M9 后） |
 | --- | --- | --- |
-| `Breakout.pine` | 433 | **语法全通过**；语义阶段 210 条（149 处无法映射的标识符 / 38 处未支持内置成员 / 23 处未定义标识符） |
-| `SwiftEdge GEX.pine` | 785 | 语法第 362 行止步：`array<float> HV = array.new<float>(14, na)`（泛型类型声明 + `array.new`） |
-| `Ichimoku.pine` | 966 | 语法第 577 行止步：`array<float> tg = array.from(...)` |
+| `Breakout.pine` | 433 | ✅ **编译通过并跑通回测**（kind=indicator · 6 条 plot · 4 条 alert · 25 个 input；1200 根 BTC 1h，耗时 72ms）。0 笔交易属预期：该脚本用 `label.new` + `alertcondition` 发信号，引擎的 indicator 通路只认 `plotshape` 的方向 |
+| `SwiftEdge GEX.pine` | 785 | 语法全通过，剩余 66 条语义错误，首条为 `time_close[1]`（`time_close` 尚未进入可历史引用的内置序列集） |
+| `Ichimoku.pine` | 966 | 语法全通过，剩余 19 条语义错误，全部是「对局部变量 `sA[1]` 的历史引用」——见 §12.3 的下一项 |
 | `Institutional .pine` | 0 | **空文件（0 字节）**，无法测试 |
 
-结论：这三个脚本是「重量级」TradingView 脚本，主要依赖 `array.*`（54–144 处）、UDT `new()`（18–41 处）、绘图对象 `table/label/line/box`（20–60 处）、`request.security` 等尚未实现的 API 面。要完整编译并回测，需要按下列顺序扩面（每项都是独立里程碑）：
+---
 
-1. 泛型类型声明 `array<float> x = ...` 与 `array/map/matrix` 命名空间运行时；
-2. UDT 实例化 `Type.new(...)` 与 `method` 绑定；
-3. 绘图命名空间（`table/label/line/box/polyline`）作为**执行但不影响回测**的存根（与 §9 第 6 条的 `box.*` 一致）；
-4. `request.security` 的 HTF 取值（含 `lookahead` 语义）。
+## 12. M9 —— 数组 / 泛型 / 元组解构与运行时命名空间
 
-### 11.5 验收清单（M8 收口）
+本轮按 §11.4 的顺序推进「array 与 UDT」轴，目标是让重量级脚本真正跑起来。`npm test` 由 53 → **55 全绿**。
 
-- [x] v6 语法补全 7 项，新增 3 条 M6 回归测试，`npm test` 53/53 通过
-- [x] 脚本保存 / 下拉选择：接口层实测新建、同名更新（id 不变）、删除、非法入参 400、落盘持久化；浏览器端刷新后仍可从下拉菜单选中并编译
-- [x] CodeMirror 高亮 + Drawer 放大编辑：浏览器实测无控制台报错，Drawer 宽度 80vw、占满高度，Esc / 按钮均可关闭
-- [x] `npm run typecheck`、`npx vite build` 均通过
-- [ ] 第三方重量级脚本的完整编译与回测：见 §11.4 的扩面顺序，尚未开始
+### 12.1 语法与类型
+
+| 能力 | 说明 |
+| --- | --- |
+| 泛型类型声明 | `array<float> lvPx = array.new<float>()`、`map<string, float>` 任意嵌套；`var` 前缀同样支持。`tryGenericType()` 只在「`>` 后紧跟变量名再接 `=`/`:=`/复合赋值」时才认定，因此不会误判 `a < b > c` |
+| v4/v5 数组类型后缀 | `var line[] flatSpanBLines = ...`（`type[]` 形式） |
+| 函数形参类型前缀 | `hAt(array<float> H, float glo, int t)`、`f(float v)`、`g(x)`（无类型） |
+| 泛型实参点分路径 | `array.new<chart.point>()` |
+| 元组解构 | `[a, b] = f()`：先取一次返回值再按位置落到各名字；`=` 就地引入局部名、`:=` 写给已有名字。函数体的末元组字面量 `[x*2, x*3]` 即为多值返回 |
+| 类型转换函数 | `float(x)` / `int(x)` / `bool(x)` / `string(x)` / `color(x)` → `__pine.cast.*`（`float(na)` 得 na） |
+
+### 12.2 运行时命名空间
+
+- **`array.*`（13 个高频函数 + 遗留构造器）**：`new(size, init)` 按 init 填满、`from` / `get` / `set` / `size` / `push` / `pop` / `shift` / `unshift` / `last` / `first` / `remove` / `clear` / `includes` / `indexof` / `slice` / `concat` / `sum` / `avg` / `sort_indices`。**越界读返回 na 而不是抛错**，`array.remove` 返回被删元素，空数组 pop/shift 得 na。`array.new_float` 等 v4/v5 遗留名在 codegen 层归一化成 `new`。
+  > 关键修正：原先的数组支持只认**方法式**写法（`arr.push(v)`），而 Pine 用的是 `array.push(arr, v)`；后者会把命名空间 `array` 当成对象求值 → 报「无法映射的标识符 array」。现在 `array.*` 在 call() 里被更早拦截，方法式写法作为兼容保留。
+- **绘图命名空间改用 Proxy 存根**：`box/label/line/table/polyline/linefill` 的任意方法都不再报错 —— `new` 返回不透明对象、`get_*` 返回 na、其余空操作。原先枚举 `set_*` 名单的做法会漏 `set_x2` 这类方法，Proxy 从根上消除这一类问题。
+- **`str.*`** 补齐 `upper/lower/contains/startswith/endswith/replace/replace_all/split/length/trim/substring/tonumber/toint/char/reverse/repeat/format`。
+- **`color.r/g/b/t`** 通道提取（兼容 `#RRGGBB(AA)`、`rgb()/rgba()` 与对象形式）。
+- **`ta.pivothigh` / `ta.pivotlow`**：严格不等判定，值落在「右侧窗口走完」的确认 bar；两参形式默认以 high / low 为源。
+- **成员补齐**：`plotcandle/plotbar/plotchar/plotarrow`（登记标题后 no-op）、`position.*`、`order.*`、`scale.*`、`font.*`、`currency.*`、`hline.*`、`line.style_*`、`table.position_*`、`barstate.*`（逐 bar 回测语义）、`syminfo.pointvalue/root/type/session/...`、`timeframe.period/in_seconds`（周期由请求真实注入）、`request.currency_rate` = 1。
+- 语义检查表（check.ts）同步放宽：命名空间根、内置标识符与内置函数名三张表。
+
+### 12.3 两个 codegen 作用域修复（重量级脚本能否跑起来的关键）
+
+1. **顶层逐 bar 标量改为 `__create` 作用域声明**。原先 C 类标量在 `step` 内 `let` 声明，而用户函数是 `step` 的兄弟节点 —— 脚本里 `f(x) => x * tol`（`tol` 是顶层变量）会直接 `ReferenceError: tol is not defined`。Pine 的顶层变量本就是全局的，现改为在 `__create` 里 `let <name> = NaN`，`step` 内只赋值。
+2. **`collectReassigned` 补上 `while` / `forIn` 递归**。原先只递归 if / for / funcDecl，导致 `while` 体内的 `brkUp := true` 未被识别为重赋值 → 该名字被当成初始化期常量发成 `const` → 逐 bar 赋值抛 `TypeError: Assignment to constant variable`。同时初始化期常量若后续会被 `:=` 改写，改用 `let` 发出。
+
+### 12.4 下一步（按优先级）
+
+1. `time_close` / `time_tradingday` 进入可历史引用的内置序列集（SwiftEdge 的 66 条错误大多由它衍生）；
+2. **局部变量 `[k]` 历史引用**（Ichimoku 的 19 条错误全部是它）：需要按调用点建立环形缓冲，是 v1 明确不做的项之一；
+3. `request.security` 的 HTF 取值（含 `lookahead` 语义）；
+4. `map.*` / `matrix.*` 命名空间。
+
+### 12.5 验收清单（M8 + M9 收口）
+
+- [x] v6 语法补全 7 项（数组字面量 / switch / 单行函数体 / while / for-in / 复合赋值 / 悬挂缩进续行），新增 3 条 M6 回归测试
+- [x] M9：泛型类型声明、`type[]` 后缀、元组解构、类型转换函数、`array.*` 运行时、绘图 Proxy 存根、`str.*` / `color.rgb 通道` / `ta.pivothigh`、成员表与语义检查表放宽，新增 2 条 M7 运行期数值测试
+- [x] 两个 codegen 作用域修复（`__create` 作用域标量、`while`/`forIn` 重赋值识别）
+- [x] `npm test` **55/55 通过**；服务端 / web `tsc --noEmit` 与 `vite build` 均通过
+- [x] 脚本保存 / 下拉选择、CodeMirror 高亮 + Drawer 放大编辑（均经浏览器实测）
+- [x] `Breakout.pine`（433 行）编译通过并跑通回测
+- [ ] `SwiftEdge GEX.pine` / `Ichimoku.pine` 的完整编译与回测：按 §12.4 的顺序推进

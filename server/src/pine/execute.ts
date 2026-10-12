@@ -82,7 +82,11 @@ export function runPineProgram(
   opts: RunPineOptions = {},
 ): CompiledProgram {
   const js = stripTypeScriptTypes(ts, { mode: 'strip' })
-  const runtime = createRuntime(candles, { inputs: opts.inputs, tickSize: opts.tickSize })
+  const runtime = createRuntime(candles, {
+    inputs: opts.inputs,
+    tickSize: opts.tickSize,
+    timeframe: opts.timeframe,
+  })
 
   const sandbox: Record<string, unknown> = { __pine: runtime, console }
   vm.runInNewContext(js, sandbox, { timeout: opts.timeoutMs ?? 2000 })

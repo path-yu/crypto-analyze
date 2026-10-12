@@ -167,6 +167,7 @@ export type Stmt =
   | ForStmt
   | WhileStmt
   | ForInStmt
+  | TupleAssignStmt
   | ExprStmt
   | BreakStmt
   | ContinueStmt
@@ -249,6 +250,19 @@ export interface ForInStmt {
   varName: string
   iterable: Expr
   body: Stmt[]
+  line: number
+  col: number
+}
+
+/**
+ * 元组解构：`[a, b] = f()`。
+ * Pine 的函数可返回元组，取回时按位置拆到多个名字；`=` 引入新名字，`:=` 写给已有名字。
+ */
+export interface TupleAssignStmt {
+  kind: 'tupleAssign'
+  names: string[]
+  op: '=' | ':='
+  value: Expr
   line: number
   col: number
 }

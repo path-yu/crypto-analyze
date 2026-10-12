@@ -105,6 +105,45 @@ export function lowest(src: readonly number[], length: number): number[] {
   return rollingExtreme(src, length, false)
 }
 
+/**
+ * ta.pivothigh —— 左 leftbars 根、右 rightbars 根内**严格**最高的点。
+ * 与 TradingView 一致：值出现在「右侧窗口走完」的确认 bar 上，取的是 pivot bar 自己的价位。
+ */
+export function pivothigh(src: readonly number[], leftbars: number, rightbars: number): number[] {
+  return pivotExtreme(src, leftbars, rightbars, true)
+}
+
+/** ta.pivotlow —— 与 pivothigh 对称 */
+export function pivotlow(src: readonly number[], leftbars: number, rightbars: number): number[] {
+  return pivotExtreme(src, leftbars, rightbars, false)
+}
+
+function pivotExtreme(
+  src: readonly number[],
+  leftbars: number,
+  rightbars: number,
+  isMax: boolean,
+): number[] {
+  const n = src.length
+  const out = new Array<number>(n).fill(NA)
+  const l = Math.max(0, Math.floor(leftbars))
+  const r = Math.max(0, Math.floor(rightbars))
+  for (let i = l + r; i < n; i++) {
+    const j = i - r
+    const v = src[j]
+    if (!Number.isFinite(v)) continue
+    let ok = true
+    // 任一邻居相等即不算 pivot（TradingView 亦按严格不等判定）
+    for (let k = j - l; k <= j + r && ok; k++) {
+      if (k === j) continue
+      const o = src[k]
+      if (!Number.isFinite(o) || (isMax ? o >= v : o <= v)) ok = false
+    }
+    if (ok) out[i] = v
+  }
+  return out
+}
+
 function rollingExtreme(src: readonly number[], length: number, isMax: boolean): number[] {
   const n = src.length
   const out = new Array<number>(n).fill(NA)

@@ -161,6 +161,8 @@ export interface PineRuntimeOptions {
   inputs?: Record<string, unknown>
   /** syminfo.mintick（下单精度），由请求的 tickSize 注入 */
   tickSize?: number
+  /** 当前 K 线周期（如 '1h'），供 timeframe.period 读取 */
+  timeframe?: string
 }
 
 export interface PineRuntime {
@@ -190,13 +192,20 @@ export interface PineRuntime {
   arrClear: typeof arrClear
   ta: typeof taLib
   math: Record<string, unknown>
-  str: { tostring: (v: unknown, fmt?: unknown) => string }
+  str: Record<string, (...args: never[]) => unknown>
   color: Record<string, unknown>
   input: Record<string, (name: string, def: unknown, opts?: unknown) => unknown>
   chart: { fg_color: string; bg_color: string }
   format: { mintick: string; price: string; percent: string; volume: string }
   session: { isfirstbar: boolean; islastbar: boolean }
-  syminfo: { mintick: number }
+  timeframe: {
+    period: string
+    multiplier: number
+    isseconds: boolean
+    isintraday: boolean
+    in_seconds: () => number
+  }
+  syminfo: { mintick: number } & Record<string, unknown>
   plot: (store: Record<string, unknown[]>, series: unknown, title: string, index: number) => void
   mark: (
     markers: unknown[],
@@ -208,6 +217,12 @@ export interface PineRuntime {
   barColor: (store: unknown[], color: unknown, index: number) => void
   box: Record<string, (...args: unknown[]) => unknown>
   label: Record<string, (...args: unknown[]) => unknown>
+  line: Record<string, (...args: unknown[]) => unknown>
+  table: Record<string, (...args: unknown[]) => unknown>
+  polyline: Record<string, (...args: unknown[]) => unknown>
+  linefill: Record<string, (...args: unknown[]) => unknown>
+  array: Record<string, (...args: unknown[]) => unknown>
+  cast: Record<string, (v: unknown) => unknown>
 }
 
 /**
@@ -222,6 +237,19 @@ export function createRuntime(
   const inputs = opts.inputs ?? {}
   const tick = Number.isFinite(opts.tickSize) ? (opts.tickSize as number) : 0
   const digits = mintickDigits(tick)
+  // timeframe.*：period 用请求里的真实周期，衍生字段按同一份周期换算
+  const tfText = opts.timeframe && opts.timeframe.trim() ? opts.timeframe.trim() : '1h'
+  const tfMatch = /^(\d*)([smhdW])$/.exec(tfText)
+  const tfUnitSec: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400, W: 604800 }
+  const tfUnit = tfMatch ? tfMatch[2] : 'h'
+  const tfMult = tfMatch && tfMatch[1] ? Number(tfMatch[1]) : 1
+  const timeframeNs = {
+    period: tfText,
+    multiplier: tfMult,
+    isseconds: tfUnit === 's',
+    isintraday: tfUnit === 's' || tfUnit === 'm' || tfUnit === 'h',
+    in_seconds: () => tfMult * (tfUnitSec[tfUnit] ?? 3600),
+  }
 
   const n = candles.length
   const open = new Array<number>(n)
@@ -292,10 +320,40 @@ export function createRuntime(
     sum: (...xs: number[]) => xs.reduce((a, b) => a + nz(b), 0),
   }
 
+  /**
+   * 取颜色的某一通道：0=r 1=g 2=b 3=a(0..255)。
+   * 同时兼容 `#RRGGBB(AA)`、`rgb()/rgba()` 字符串与 {r,g,b,a} 对象三种表示。
+   */
+  const colorChannel = (c: unknown, idx: number): number => {
+    if (c && typeof c === 'object') {
+      const o = c as Record<string, number>
+      const v = o[['r', 'g', 'b', 'a'][idx]]
+      return Number.isFinite(v) ? v : 0
+    }
+    const s = String(c ?? '')
+    const hex = /^#([0-9a-fA-F]{6})([0-9a-fA-F]{2})?$/.exec(s)
+    if (hex) {
+      const v = parseInt(hex[1], 16)
+      const ch = [(v >> 16) & 255, (v >> 8) & 255, v & 255, hex[2] ? parseInt(hex[2], 16) : 255]
+      return ch[idx]
+    }
+    const nums = s.match(/[\d.]+/g)
+    if (nums && nums.length >= 3) {
+      const a = nums[3] === undefined ? 255 : Math.round(Number(nums[3]) * 255)
+      return [Number(nums[0]), Number(nums[1]), Number(nums[2]), a][idx]
+    }
+    return 0
+  }
+
   const colorNs: Record<string, unknown> = {
     new: newColor,
     rgb,
     from_gradient: fromGradient,
+    // 通道提取：color.r/g/b 返回 0..255，color.t 返回 0..1 的透明度
+    r: (c: unknown) => colorChannel(c, 0),
+    g: (c: unknown) => colorChannel(c, 1),
+    b: (c: unknown) => colorChannel(c, 2),
+    t: (c: unknown) => colorChannel(c, 3) / 255,
     red: NAMED_COLORS.red,
     green: NAMED_COLORS.green,
     blue: NAMED_COLORS.blue,
@@ -315,42 +373,116 @@ export function createRuntime(
     teal: NAMED_COLORS.teal,
   }
 
-  // box / label：执行但不影响回测的存根（方案 §9.6）。
-  // 构造函数返回不透明对象，`set_*` 全部为空操作，`delete` 同样无副作用 ——
-  // 保证脚本忠实执行（`not na(bx)` 判定仍成立），又不影响回测。
+  // 绘图命名空间：执行但不影响回测的存根（方案 §9.6）。
+  // 用 Proxy 兜住任意方法名，脚本里的任何图元 API 都不会中断执行：
+  //   · `new` 返回不透明对象（`not na(bx)` 判定仍成立）
+  //   · `get_*` 返回 na（坐标类读取在回测里无意义）
+  //   · `delete` 与 `set_*` 为空操作
   const noop = (): undefined => undefined
-  const stubNs = (): Record<string, (...args: unknown[]) => unknown> => {
-    const ns: Record<string, (...args: unknown[]) => unknown> = { new: () => ({}), delete: noop }
-    for (const key of [
-      'set_left',
-      'set_right',
-      'set_top',
-      'set_bottom',
-      'set_lefttop',
-      'set_rightbottom',
-      'set_xy',
-      'set_x',
-      'set_y',
-      'set_bgcolor',
-      'set_border_color',
-      'set_border_width',
-      'set_text',
-      'set_textcolor',
-      'set_text_color',
-      'set_text_size',
-      'set_style',
-      'set_color',
-      'set_size',
-      'set_tooltip',
-      'set_text_align',
-      'copy',
-    ]) {
-      ns[key] = noop
-    }
-    return ns
-  }
+  const stubNs = (): Record<string, (...args: unknown[]) => unknown> =>
+    new Proxy({} as Record<string, (...args: unknown[]) => unknown>, {
+      get: (_target, prop) => {
+        if (prop === 'new') return () => ({})
+        if (typeof prop !== 'string') return undefined
+        if (prop.startsWith('get_')) return () => Number.NaN
+        return noop
+      },
+    })
   const boxNs = stubNs()
   const labelNs = stubNs()
+  // 其余绘图命名空间同样是「执行但不出图」的存根：回测只吃信号，不吃图元
+  const lineNs = stubNs()
+  const tableNs = stubNs()
+  const polylineNs = stubNs()
+  const linefillNs = stubNs()
+
+  /** 越界读取按 Pine 的 na 语义返回 NaN，而不是抛错 */
+  const arrAt = (arr: unknown, i: number): unknown =>
+    Array.isArray(arr) && Number.isFinite(i) && i >= 0 && i < arr.length ? arr[i] : Number.NaN
+
+  /** 类型转换函数：float(x) / int(x) / bool(x) / string(x) / color(x) */
+  const castNs = {
+    float: (v: unknown): number => {
+      const n = Number(v)
+      return Number.isFinite(n) ? n : Number.NaN
+    },
+    int: (v: unknown): number => {
+      const n = Number(v)
+      return Number.isFinite(n) ? Math.trunc(n) : Number.NaN
+    },
+    bool: (v: unknown): boolean => (isNa(v) ? false : Boolean(v)),
+    string: (v: unknown): string => (isNa(v) ? '' : String(v)),
+    color: (v: unknown): unknown => v,
+  }
+
+  /**
+   * Pine 数组命名空间（`array.*`）。
+   *
+   * 与 JS 数组的差别都在这里抹平：`array.new<T>(size, init)` 按 init 填满、
+   * 越界读返回 na、`array.remove` 返回被删元素、空数组的 pop/shift 返回 na。
+   * v4/v5 的遗留构造器（array.new_float 等）由 codegen 归一化成 `new`。
+   */
+  const arrayNs = {
+    new: (size?: unknown, init?: unknown): unknown[] => {
+      const n = Math.floor(Number(size))
+      if (!Number.isFinite(n) || n <= 0) return []
+      return new Array<unknown>(n).fill(init === undefined ? Number.NaN : init)
+    },
+    from: (...vals: unknown[]): unknown[] => vals.slice(),
+    get: (arr: unknown, i: unknown): unknown => arrAt(arr, Math.floor(Number(i))),
+    set: (arr: unknown, i: unknown, v: unknown): void => {
+      const k = Math.floor(Number(i))
+      if (Array.isArray(arr) && Number.isFinite(k) && k >= 0) arr[k] = v
+    },
+    size: (arr: unknown): number => (Array.isArray(arr) ? arr.length : 0),
+    push: (arr: unknown, ...vals: unknown[]): void => {
+      if (Array.isArray(arr)) arr.push(...vals)
+    },
+    pop: (arr: unknown): unknown => (Array.isArray(arr) && arr.length ? arr.pop() : Number.NaN),
+    shift: (arr: unknown): unknown => (Array.isArray(arr) && arr.length ? arr.shift() : Number.NaN),
+    unshift: (arr: unknown, v: unknown): void => {
+      if (Array.isArray(arr)) arr.unshift(v)
+    },
+    last: (arr: unknown): unknown => (Array.isArray(arr) ? arrAt(arr, arr.length - 1) : Number.NaN),
+    first: (arr: unknown): unknown => arrAt(arr, 0),
+    remove: (arr: unknown, i: unknown): unknown => {
+      const k = Math.floor(Number(i))
+      if (!Array.isArray(arr) || !Number.isFinite(k) || k < 0 || k >= arr.length) return Number.NaN
+      return arr.splice(k, 1)[0]
+    },
+    clear: (arr: unknown): void => {
+      if (Array.isArray(arr)) arr.length = 0
+    },
+    includes: (arr: unknown, v: unknown): boolean => (Array.isArray(arr) ? arr.includes(v) : false),
+    indexof: (arr: unknown, v: unknown): number => (Array.isArray(arr) ? arr.indexOf(v) : -1),
+    lastindexof: (arr: unknown, v: unknown): number => (Array.isArray(arr) ? arr.lastIndexOf(v) : -1),
+    reverse: (arr: unknown): unknown[] => (Array.isArray(arr) ? arr.reverse() : []),
+    slice: (arr: unknown, a: unknown, b?: unknown): unknown[] =>
+      Array.isArray(arr)
+        ? arr.slice(Math.floor(Number(a)), b === undefined ? undefined : Math.floor(Number(b)))
+        : [],
+    concat: (a: unknown, b: unknown): unknown => (Array.isArray(a) && Array.isArray(b) ? a.concat(b) : a),
+    sum: (arr: unknown): number =>
+      Array.isArray(arr)
+        ? arr.reduce<number>((s, v) => s + (Number.isFinite(Number(v)) ? Number(v) : 0), 0)
+        : 0,
+    avg: (arr: unknown): number =>
+      Array.isArray(arr) && arr.length
+        ? arr.reduce<number>((s, v) => s + (Number.isFinite(Number(v)) ? Number(v) : 0), 0) / arr.length
+        : Number.NaN,
+    /** 取值排序后的下标序列；order 传 'ascending' / 'descending' */
+    sort_indices: (arr: unknown, order?: unknown): number[] => {
+      if (!Array.isArray(arr)) return []
+      const idx = arr.map((_, i) => i)
+      const desc = order === 'descending'
+      idx.sort((x, y) => {
+        const a = Number.isFinite(Number(arr[x])) ? Number(arr[x]) : 0
+        const b = Number.isFinite(Number(arr[y])) ? Number(arr[y]) : 0
+        return desc ? b - a : a - b
+      })
+      return idx
+    },
+  }
 
   return {
     candles: { open, high, low, close, volume, timestamp },
@@ -388,13 +520,66 @@ export function createRuntime(
         }
         return String(num)
       },
+      upper: (s: unknown): string => String(s ?? '').toUpperCase(),
+      lower: (s: unknown): string => String(s ?? '').toLowerCase(),
+      contains: (s: unknown, sub: unknown): boolean => String(s ?? '').includes(String(sub ?? '')),
+      startswith: (s: unknown, sub: unknown): boolean => String(s ?? '').startsWith(String(sub ?? '')),
+      endswith: (s: unknown, sub: unknown): boolean => String(s ?? '').endsWith(String(sub ?? '')),
+      replace: (s: unknown, a: unknown, b: unknown): string =>
+        String(s ?? '').replace(String(a ?? ''), String(b ?? '')),
+      replace_all: (s: unknown, a: unknown, b: unknown): string =>
+        String(s ?? '').split(String(a ?? '')).join(String(b ?? '')),
+      split: (s: unknown, sep: unknown): string[] => String(s ?? '').split(String(sep ?? '')),
+      length: (s: unknown): number => String(s ?? '').length,
+      trim: (s: unknown): string => String(s ?? '').trim(),
+      substring: (s: unknown, from: unknown, to?: unknown): string => {
+        const str = String(s ?? '')
+        const a = Math.max(0, Math.floor(Number(from)))
+        const b = to === undefined ? str.length : Math.floor(Number(to))
+        return str.slice(a, b)
+      },
+      tonumber: (s: unknown): number => {
+        const num = Number(String(s ?? '').trim())
+        return Number.isFinite(num) ? num : Number.NaN
+      },
+      toint: (s: unknown): number => {
+        const num = Number(String(s ?? '').trim())
+        return Number.isFinite(num) ? Math.trunc(num) : Number.NaN
+      },
+      tochar: (n: unknown): string => String.fromCharCode(Math.floor(Number(n))),
+      char: (n: unknown): string => String.fromCharCode(Math.floor(Number(n))),
+      reverse: (s: unknown): string => [...String(s ?? '')].reverse().join(''),
+      repeat: (s: unknown, count: unknown): string =>
+        String(s ?? '').repeat(Math.max(0, Math.floor(Number(count)))),
+      /** str.format("a {0} b", x) → 位置占位符替换 */
+      format: (template: unknown, ...args: unknown[]): string =>
+        String(template ?? '').replace(/\{(\d+)\}/g, (m, i) => {
+          const v = args[Number(i)]
+          return v === undefined || isNa(v) ? m : String(v)
+        }),
     },
     color: colorNs,
     input: inputNs,
     chart: { fg_color: '#131722', bg_color: '#ffffff' },
     format: { mintick: MINTICK, price: MINTICK, percent: '#.##%', volume: '#.##' },
     session: { isfirstbar: false, islastbar: false },
-    syminfo: { mintick: tick },
+    timeframe: timeframeNs,
+    syminfo: {
+      mintick: tick,
+      pointvalue: 1,
+      ticker: '',
+      tickerid: '',
+      root: '',
+      basecurrency: '',
+      currency: 'USD',
+      type: 'crypto',
+      session: '24x7',
+      timezone: 'UTC',
+      description: '',
+      prefix: '',
+      isin: '',
+      main_tickerid: '',
+    },
     plot: (store, series, title, index) => {
       let arr = store[title]
       if (!arr) {
@@ -412,5 +597,11 @@ export function createRuntime(
     },
     box: boxNs,
     label: labelNs,
+    line: lineNs,
+    table: tableNs,
+    polyline: polylineNs,
+    linefill: linefillNs,
+    array: arrayNs,
+    cast: castNs,
   }
 }

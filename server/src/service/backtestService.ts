@@ -279,6 +279,7 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
     const program = runPineProgram(comp.ts, allCandles, {
       inputs: req.pine?.inputs,
       tickSize,
+      timeframe,
     })
     const signals = allCandles.map(() => emptyPineSignal())
     signalProvider = (index, ctx) => {

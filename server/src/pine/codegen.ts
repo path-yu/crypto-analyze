@@ -26,6 +26,7 @@ import type {
   MemberExpr,
   Program,
   Stmt,
+  TupleAssignStmt,
   TypeDeclStmt,
   WhileStmt,
 } from './ast'
@@ -93,6 +94,28 @@ CONST_MEMBERS['format.percent'] = '__pine.format.percent'
 CONST_MEMBERS['format.volume'] = '__pine.format.volume'
 CONST_MEMBERS['chart.fg_color'] = '__pine.chart.fg_color'
 CONST_MEMBERS['chart.bg_color'] = '__pine.chart.bg_color'
+// v6 常用枚举：面板位置 / 排序方向 / 货币 / 缩放 / 字体 / 线型
+addMembers('position', [
+  'top_left', 'top_center', 'top_right',
+  'middle_left', 'middle_center', 'middle_right',
+  'bottom_left', 'bottom_center', 'bottom_right',
+])
+addMembers('text', ['align_left', 'align_center', 'align_right', 'align_top', 'align_bottom', 'wrap', 'nowrap'])
+addMembers('order', ['ascending', 'descending'])
+addMembers('scale', ['right', 'left', 'none'])
+addMembers('font', ['family_default', 'family_monospace'])
+addMembers('currency', ['USD', 'EUR', 'GBP', 'JPY', 'USDT', 'AUD', 'CAD', 'CHF', 'NZD'])
+addMembers('hline', ['style_solid', 'style_dashed', 'style_dotted'])
+addMembers('line', [
+  'style_solid', 'style_dashed', 'style_dotted',
+  'style_arrow_left', 'style_arrow_right', 'style_arrow_both',
+])
+addMembers('plot', ['style_linebr', 'style_steplinebr', 'style_area'])
+addMembers('table', [
+  'position_top_left', 'position_top_center', 'position_top_right',
+  'position_middle_left', 'position_middle_center', 'position_middle_right',
+  'position_bottom_left', 'position_bottom_center', 'position_bottom_right',
+])
 
 /** `strategy.position_size` 等随 bar 演进的成员 */
 const CTX_MEMBERS: Record<string, string> = {
@@ -119,6 +142,43 @@ const PLOTSHAPE_PARAMS = ['series', 'title', 'style', 'location', 'color', 'offs
 const BARCOLOR_PARAMS = ['color', 'offset', 'editable', 'show_last', 'title', 'display', 'force_overlay']
 /** `alertcondition` 的形参顺序 */
 const ALERT_PARAMS = ['condition', 'title', 'message']
+/** `plotcandle` / `plotbar` 的形参顺序（title 在第 5 位） */
+const PLOTOHLC_PARAMS = [
+  'open', 'high', 'low', 'close', 'title', 'color', 'wickcolor', 'bordercolor',
+  'editable', 'show_last', 'display', 'format', 'precision', 'force_overlay',
+]
+/** `plotchar` / `plotarrow` 的形参顺序（title 在第 2 位） */
+const PLOTCHAR_PARAMS = [
+  'series', 'title', 'char', 'location', 'color', 'offset', 'text', 'textcolor',
+  'editable', 'size', 'show_last', 'display', 'format', 'precision', 'force_overlay',
+]
+
+/** 类型转换函数（既是类型名也是函数名） */
+const CAST_FNS = new Set(['float', 'int', 'bool', 'string', 'color'])
+/** 绘图命名空间：执行但不出图 */
+const DRAWING_NS = new Set(['box', 'label', 'line', 'table', 'polyline', 'linefill'])
+/**
+ * 方法式数组调用的识别集合（`arr.get(i)` —— Pine 无此写法，保留兼容旧产物）。
+ * 命名空间式 `array.get(arr, i)` 在 call() 里已被更早拦截，不会走到这里。
+ */
+const ARRAY_METHODS = new Set([
+  'size', 'get', 'set', 'push', 'pop', 'shift', 'unshift', 'remove', 'clear',
+  'includes', 'indexof', 'lastindexof', 'reverse', 'slice', 'concat', 'sum', 'avg', 'min', 'max',
+])
+/** v4/v5 遗留的数组构造器 → v6 的 array.new */
+const LEGACY_ARRAY_CTORS: Record<string, string> = {
+  new_float: 'new',
+  new_int: 'new',
+  new_bool: 'new',
+  new_string: 'new',
+  new_color: 'new',
+  new_label: 'new',
+  new_line: 'new',
+  new_box: 'new',
+  new_table: 'new',
+  new_polyline: 'new',
+  new_linefill: 'new',
+}
 
 export interface CodegenOptions {
   /** 源码文件名，仅用于生成物头部的注释 */
@@ -170,6 +230,8 @@ class Codegen {
   private currentAssignName: string | undefined
   /** 块级作用域栈 —— 记录 if/for/函数体内声明的局部变量名 */
   private readonly localScopes: Set<string>[] = []
+  /** 元组解构的临时变量序号（保证同一块内多次解构不重名） */
+  private tupleSeq = 0
 
   constructor(program: Program, opts: CodegenOptions) {
     this.program = program
@@ -221,6 +283,11 @@ class Codegen {
     // 环形缓冲（历史引用）
     for (const [name, k] of this.histNeed) {
       lines.push(`  const __h_${name} = __pine.makeRing(${k + 1})`)
+    }
+    // 顶层逐 bar 标量：声明在 __create 作用域（与 step、用户函数同级）。
+    // Pine 的顶层变量本就是全局的 —— 用户函数会读到它们，若只声明在 step 内会 ReferenceError。
+    for (const name of this.stepScalars) {
+      lines.push(`  let ${name} = NaN`)
     }
     // 初始化期声明（保持源码顺序，保证「先声明后引用」）
     for (const stmt of this.program.body) {
@@ -294,6 +361,11 @@ class Codegen {
           if (s.elseBody) this.collectReassigned(s.elseBody)
           break
         case 'for':
+          this.collectReassigned(s.body)
+          break
+        // while / for-in 里的 `:=` 同样要算作重赋值，否则会被误判成初始化期常量
+        case 'while':
+        case 'forIn':
           this.collectReassigned(s.body)
           break
         case 'funcDecl':
@@ -479,7 +551,9 @@ class Codegen {
           this.currentAssignName = name
           const code = this.expr(stmt.value)
           this.currentAssignName = undefined
-          return [`const ${name} = ${code}`]
+          // 后续还会被 `:=` 改写的话不能是 const（否则逐 bar 赋值会抛 TypeError）
+          const kw = this.reassigned.has(name) ? 'let' : 'const'
+          return [`${kw} ${name} = ${code}`]
         }
         return []
       }
@@ -670,6 +744,8 @@ class Codegen {
         return this.whileCode(stmt, depth)
       case 'forIn':
         return this.forInCode(stmt, depth)
+      case 'tupleAssign':
+        return this.tupleAssignCode(stmt, depth)
       case 'break':
         return [`${pad}break`]
       case 'continue':
@@ -686,8 +762,13 @@ class Codegen {
       if (name === '_') return null
       const lines: string[] = []
       if (stmt.op === '=') {
-        lines.push(`let ${name} = ${rhs}`)
-        this.declareLocal(name)
+        if (this.stepScalars.has(name)) {
+          // 顶层逐 bar 标量已在 __create 作用域声明，这里只做赋值
+          lines.push(`${name} = ${rhs}`)
+        } else {
+          lines.push(`let ${name} = ${rhs}`)
+          this.declareLocal(name)
+        }
       } else {
         lines.push(`${name} = ${rhs}`)
       }
@@ -698,6 +779,25 @@ class Codegen {
     }
     // 成员赋值：`z.used := true`
     return `${this.expr(stmt.target)} = ${rhs}`
+  }
+
+  /**
+   * 元组解构：`[a, b] = f()` → 先取一次返回值再按位置落到各个名字。
+   * `=` 形式按 Pine 语义就地引入新名字（块级 let），`:=` 形式写给已存在的名字。
+   */
+  private tupleAssignCode(stmt: TupleAssignStmt, depth: number): string[] {
+    const pad = '  '.repeat(depth)
+    const tmp = `__tup${this.tupleSeq++}`
+    const out: string[] = [`${pad}const ${tmp} = ${this.expr(stmt.value)}`]
+    stmt.names.forEach((name, i) => {
+      if (stmt.op === '=') {
+        out.push(`${pad}let ${name} = ${tmp}[${i}]`)
+        this.declareLocal(name)
+      } else {
+        out.push(`${pad}${name} = ${tmp}[${i}]`)
+      }
+    })
+    return out
   }
 
   private ifCode(stmt: IfStmt, depth: number): string[] {
@@ -855,6 +955,18 @@ class Codegen {
     return `__pine.barColor(barColor, ${this.expr(color)}, __index)`
   }
 
+  /**
+   * plotcandle / plotbar / plotchar / plotarrow。
+   *
+   * 回测只消费信号，图元与盈亏无关，因此这里不生成绘制代码（与 box/label 存根同一策略），
+   * 只把标题登记进 meta.plotTitles，让编辑器仍能显示「N 条 plot」。
+   */
+  private plotFamilyNoop(call: CallExpr, params: string[]): string {
+    const title = this.normalizeArgs(call, params).get('title')
+    if (title && title.kind === 'string') this.meta.plotTitles.push(title.value)
+    return 'void 0'
+  }
+
   private entryStatement(call: CallExpr): string {
     const m = this.normalizeArgs(call, ['id', 'direction', 'qty', 'limit', 'stop', 'oca_name', 'oca_type', 'comment'])
     const idExpr = m.get('id')
@@ -980,6 +1092,17 @@ class Codegen {
       if (path === 'session.islastbar') return '(__index === n - 1)'
       if (path === 'syminfo.mintick') return '__pine.ctx.mintick'
       if (path === 'syminfo.ticker' || path === 'syminfo.tickerid') return "''"
+      // barstate：逐 bar 回测里「历史 K 线」恒为已确认，只有最后一根是 islast
+      if (path === 'barstate.islast' || path === 'barstate.islastconfirmedhistory') return '(__index === n - 1)'
+      if (path === 'barstate.isfirst') return '(__index === 0)'
+      if (path === 'barstate.isconfirmed' || path === 'barstate.ishistory') return 'true'
+      if (path === 'barstate.isnew' || path === 'barstate.isrealtime') return 'false'
+      // 其余 syminfo.* 一律取运行时里的同名字段（pointvalue / root / type / session …）
+      if (path.startsWith('syminfo.') && NAMESPACE_ROOTS.has('syminfo')) {
+        return `__pine.syminfo.${e.property}`
+      }
+      // timeframe.*（period / multiplier / isintraday …）同理由运行时提供
+      if (path.startsWith('timeframe.')) return `__pine.timeframe.${e.property}`
       if (path === 'timenow') return 'NaN'
       if (path.startsWith('color.')) return `__pine.color.${e.property}`
       const root = path.split('.')[0]
@@ -1070,16 +1193,33 @@ class Codegen {
     const name = path ? path.join('.') : ''
 
     if (name === 'nz') return this.nzCall(e)
+    // 类型转换：float(x) / int(x) / bool(x) / string(x) / color(x)
+    if (path && path.length === 1 && CAST_FNS.has(path[0])) {
+      return `__pine.cast.${path[0]}(${e.args[0] ? this.expr(e.args[0].value) : 'NaN'})`
+    }
     if (path && path[0] === 'ta') return this.taCall(e)
     if (path && path[0] === 'math') return this.mathCall(e)
     if (path && path[0] === 'str') return this.strCall(e)
     if (path && path[0] === 'input') return this.inputCall(e)
     if (path && path[0] === 'color') return this.colorCall(e)
-    if (path && (path[0] === 'box' || path[0] === 'label')) {
+    // 数组命名空间：array.push(arr, v) → __pine.array.push(arr, v)
+    if (path && path[0] === 'array' && path[1]) {
+      const fn = LEGACY_ARRAY_CTORS[path[1]] ?? path[1]
+      return `__pine.array.${fn}(${this.callArgs(e).join(', ')})`
+    }
+    // 绘图命名空间（line / table / polyline / linefill / box / label）：执行但不出图
+    if (path && DRAWING_NS.has(path[0])) {
       return `__pine.${path[0]}.${path[1] ?? 'new'}(${this.callArgs(e).join(', ')})`
     }
-    if (path && path[0] === 'array' && path[1] === 'new') return '[]'
+    // plotcandle / plotbar / plotchar / plotarrow 与 plotshape 同族：回测不消费图元，只登记标题
+    if (path && path.length === 1) {
+      if (path[0] === 'plotcandle' || path[0] === 'plotbar') return this.plotFamilyNoop(e, PLOTOHLC_PARAMS)
+      if (path[0] === 'plotchar' || path[0] === 'plotarrow') return this.plotFamilyNoop(e, PLOTCHAR_PARAMS)
+    }
     if (path && path[0] === 'syminfo' && path[1] === 'currency') return "''"
+    // request.currency_rate：单币种回测按 1 处理（不涉及跨币种换算）
+    if (path && path[0] === 'request' && path[1] === 'currency_rate') return '1'
+    if (path && path[0] === 'timeframe' && path[1] === 'in_seconds') return '__pine.timeframe.in_seconds()'
 
     // 用户函数 / 方法调用
     if (path && path.length === 1 && this.userFuncs.has(path[0])) {
@@ -1127,6 +1267,14 @@ class Codegen {
     if (fn === 'tr') {
       if (args.length === 0) return '__pine.ta.trueRange(C.high, C.low, C.close)'
       return `__pine.ta.trueRange(${args.join(', ')})`
+    }
+    // `ta.pivothigh(leftbars, rightbars)` 两参形式默认以 high / low 为源
+    if (fn === 'pivothigh' || fn === 'pivotlow') {
+      if (args.length === 2) {
+        const src = fn === 'pivothigh' ? 'C.high' : 'C.low'
+        return `__pine.ta.${fn}(${src}, ${args[0]}, ${args[1]})`
+      }
+      return `__pine.ta.${fn}(${args.join(', ')})`
     }
     return `__pine.ta.${fn}(${args.join(', ')})`
   }
@@ -1213,6 +1361,9 @@ class Codegen {
   private arrayMethod(e: CallExpr): string | null {
     if (e.callee.kind !== 'member') return null
     const prop = e.callee.property
+    // 先确认属性名确实是数组方法，再求值接收者 ——
+    // 否则任何成员调用（如 request.currency_rate）都会提前评估接收者，产生假报错
+    if (!ARRAY_METHODS.has(prop)) return null
     const recv = this.expr(e.callee.object)
     const args = this.positionalArgs(e).map((a) => this.expr(a.value))
     switch (prop) {

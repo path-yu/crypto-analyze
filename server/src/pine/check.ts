@@ -15,19 +15,39 @@ import type { Expr, Program, Stmt } from './ast'
 /** 具备历史序列的内置变量（`close[1]` 合法） */
 const BUILTIN_HIST = new Set(['open', 'high', 'low', 'close', 'volume', 'time', 'hl2', 'hlc3', 'ohlc4'])
 /** 可用作裸标识符的内置量 */
-const BUILTIN_IDENTS = new Set([...BUILTIN_HIST, 'bar_index', 'timenow', 'last_bar_index', 'last_bar_time'])
+const BUILTIN_IDENTS = new Set([
+  ...BUILTIN_HIST,
+  'bar_index',
+  'timenow',
+  'last_bar_index',
+  'last_bar_time',
+  'last_bar_time_close',
+  'time_close',
+  'time_tradingday',
+  'hlcc4',
+  'na',
+  'true',
+  'false',
+])
 /** 命名空间根（`ta.* / math.* / strategy.* …`），无需事先声明 */
 const NAMESPACE_ROOTS = new Set([
   'ta', 'math', 'str', 'session', 'input', 'strategy', 'syminfo', 'color', 'size',
   'location', 'shape', 'plot', 'label', 'box', 'array', 'matrix', 'map', 'table',
   'chart', 'text', 'format', 'request', 'line', 'polyline', 'linefill', 'timeframe',
   'currency', 'dayofweek', 'display', 'alert', 'barstate', 'runtime',
+  // 枚举命名空间（`position.top_right` / `yloc.belowbar` / `order.ascending` …）
+  'position', 'order', 'scale', 'font', 'hline', 'yloc', 'xloc', 'extend', 'barmerge',
+  'adjustment', 'backadjustment', 'settlement_as_close', 'earnings', 'dividends', 'splits',
+  'dayofmonth', 'month', 'weekofyear', 'hour', 'minute', 'second', 'year',
+  'log', 'ticker', 'time',
 ])
 /** 顶层内置函数（直接调用，无命名空间前缀） */
 const BUILTIN_FUNCS = new Set([
-  'indicator', 'strategy', 'nz', 'plot', 'plotshape', 'plotchar', 'plotarrow',
-  'barcolor', 'bgcolor', 'fill', 'hline', 'alertcondition', 'alert',
+  'indicator', 'strategy', 'library', 'nz', 'plot', 'plotshape', 'plotchar', 'plotarrow',
+  'plotcandle', 'plotbar', 'barcolor', 'bgcolor', 'fill', 'hline', 'alertcondition', 'alert',
   'timestamp', 'ticker', 'timeframe', 'input', 'request', 'color',
+  // 类型转换函数与类型名本身
+  'float', 'int', 'bool', 'string',
 ])
 
 export function check(program: Program): PineDiagnostic[] {
@@ -181,6 +201,16 @@ export function check(program: Program): PineDiagnostic[] {
           scope.add(s.varName)
           locals.add(s.varName)
           walk(s.body, true)
+          break
+        case 'tupleAssign':
+          checkExpr(s.value)
+          // `=` 形式就地引入新名字（Pine 的元组解构）；`:=` 形式写给已存在的名字
+          if (s.op === '=') {
+            for (const n of s.names) {
+              scope.add(n)
+              locals.add(n)
+            }
+          }
           break
         case 'funcDecl':
           for (const p of s.params) {
