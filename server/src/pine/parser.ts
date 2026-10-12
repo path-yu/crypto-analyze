@@ -20,6 +20,7 @@ import type {
   FuncDeclStmt,
   FuncParam,
   IfBranch,
+  IfExpr,
   IfStmt,
   Program,
   Stmt,
@@ -76,6 +77,8 @@ class Parser {
   private pos = 0
   private readonly diagnostics: PineDiagnostic[] = []
   private readonly version?: string
+  /** 刚刚消费掉一个块结束的 DEDENT：阻止紧跟其后的 `[` 被误当成下标 */
+  private blockEnded = false
 
   constructor(tokens: Token[], version?: string) {
     this.tokens = tokens
@@ -159,6 +162,13 @@ class Parser {
         this.next()
         continue
       }
+      // v4 允许一行内用逗号分隔多条语句（含行尾悬挂逗号）：
+      //   src1 = a, src2 = b, src3 = c,
+      // 表达式解析天然止步于逗号，这里把它当作语句分隔符消费即可。
+      if (isOp(t, ',')) {
+        this.next()
+        continue
+      }
       out.push(this.parseStatement())
     }
     return out
@@ -184,11 +194,15 @@ class Parser {
   private parseStatement(): Stmt {
     const t = this.peek()
     if (!t) throw this.error('意外的结束', t)
+    // 新语句开始：上一次的「块刚结束」标记失效
+    this.blockEnded = false
 
     if (t.kind === 'ident') {
       switch (t.text) {
         case 'var':
-          return this.parseAssign()
+          // `var` 只在后面紧跟变量名时才是关键字（v3 里允许 `var = input(close)` 当普通变量名）
+          if (this.peek(1)?.kind === 'ident') return this.parseAssign()
+          break
         case 'type':
           if (this.peek(1)?.kind === 'ident') return this.parseTypeDecl()
           break
@@ -304,7 +318,7 @@ class Parser {
     let typeName: string | undefined
     let target: Expr
 
-    if (isIdent(this.peek(), 'var')) {
+    if (isIdent(this.peek(), 'var') && this.peek(1)?.kind === 'ident') {
       isVar = true
       this.next()
       const t0 = this.peek()
@@ -614,19 +628,23 @@ class Parser {
     let e = this.parsePrimary()
     for (;;) {
       const t = this.peek()
+      // 上一行刚结束一个块（switch / if 表达式）：紧随的 `[` 是新数组/元组，不是下标
+      const endedWithBlock = this.blockEnded
+      this.blockEnded = false
       if (isOp(t, '.')) {
         this.next()
         const prop = this.expectIdent()
         e = { kind: 'member', object: e, property: prop.text, line: prop.line, col: prop.col }
         continue
       }
-      if (isOp(t, '[')) {
+      if (isOp(t, '[') && !endedWithBlock) {
         this.next()
         const idx = this.parseTernary()
         const close = this.expectOp(']')
         e = { kind: 'index', object: e, index: idx, line: close.line, col: close.col }
         continue
       }
+      if (endedWithBlock) break
       if (isOp(t, '(')) {
         e = this.parseCallArgs(e)
         continue
@@ -673,6 +691,8 @@ class Parser {
       return { kind: 'color', value: t.value as string, line: t.line, col: t.col }
     }
     if (t.kind === 'ident' && t.text === 'switch') return this.parseSwitch()
+    // `if` 表达式：`x = if cond` + 缩进分支块（不是语句级 if —— 那些已在 parseStatement 分流）
+    if (t.kind === 'ident' && t.text === 'if') return this.parseIfExpr()
     if (t.kind === 'ident') {
       this.next()
       if (t.text === 'true') return { kind: 'bool', value: true, line: t.line, col: t.col }
@@ -730,8 +750,36 @@ class Parser {
       arms.push({ cond, value })
       if (this.atKind('newline')) this.next()
     }
-    if (this.atKind('dedent')) this.next()
+    if (this.atKind('dedent')) {
+      this.next()
+      this.blockEnded = true
+    }
     return { kind: 'switch', subject, arms, line: start.line, col: start.col }
+  }
+
+  /**
+   * `if` 表达式：与语句级 if 同构，但整体是一个值 ——
+   * 每个分支块的最后一条表达式即分支值。codegen 会把整个表达式落成 IIFE。
+   */
+  private parseIfExpr(): IfExpr {
+    const start = this.next() // if
+    const branches: IfBranch[] = []
+    let elseBody: Stmt[] | undefined
+    for (;;) {
+      const cond = this.parseTernary()
+      const body = this.parseIndentedBlock()
+      branches.push({ cond, body })
+      if (!isIdent(this.peek(), 'else')) break
+      this.next() // else
+      if (isIdent(this.peek(), 'if')) {
+        this.next() // if
+        continue
+      }
+      elseBody = this.parseIndentedBlock()
+      break
+    }
+    this.blockEnded = true
+    return { kind: 'ifExpr', branches, elseBody, line: start.line, col: start.col }
   }
 
   private parseCallArgs(callee: Expr, generic?: string): CallExpr {

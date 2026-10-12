@@ -25,6 +25,7 @@ export type Expr =
   | TernaryExpr
   | ArrayLit
   | SwitchExpr
+  | IfExpr
 
 export interface NumberLit {
   kind: 'number'
@@ -151,6 +152,19 @@ export interface SwitchExpr {
   kind: 'switch'
   subject: Expr
   arms: SwitchArm[]
+  line: number
+  col: number
+}
+
+/**
+ * `if` 表达式（`x = if cond` / `else if` / `else` 缩进分支块）。
+ * 每个分支块的**最后一条表达式**即该分支的值；带前置语句的分支同样合法
+ * （codegen 会把它整体落成一个 IIFE）。
+ */
+export interface IfExpr {
+  kind: 'ifExpr'
+  branches: IfBranch[]
+  elseBody?: Stmt[]
   line: number
   col: number
 }

@@ -967,3 +967,402 @@ test('M7: array.new(size, init) 按 init 填满，越界读返回 na', () => {
   // size=3，get(1)=7，get(99)=na → v 为 na → 3 + 100 = 103
   assert.equal(Number(program.plots['Out']?.[0]), 103, `越界读应得 na（而非抛错），实际 ${program.plots['Out']?.[0]}`)
 })
+
+/* ================================================================== */
+/* M8 v4 兼容层：逗号多语句 / 派生序列 / 裸内置函数 / 元组解构 + 形参历史   */
+/* ================================================================== */
+
+const FLAT_CTX = { flat: true, positionSize: 0, prevPositionSize: 0, avgPrice: Number.NaN, side: null }
+
+test('M8: v4 一行内逗号分隔的多条语句被拆成独立语句', () => {
+  const src = [
+    '//@version=4',
+    'strategy("comma")',
+    'a = 1, b = 2,',
+    'c = a + b',
+  ].join('\n')
+  const { program, diagnostics } = frontEnd(src)
+  assert.deepEqual(diagnostics.filter((d) => d.severity === 'error'), [])
+  assert.ok(program)
+  const names = program.body
+    .filter((s) => s.kind === 'assign')
+    .map((s) => (s.kind === 'assign' && s.target.kind === 'ident' ? s.target.name : '?'))
+  assert.deepEqual(names, ['a', 'b', 'c'])
+})
+
+test('M8: 派生序列（窗口函数/交叉，含 [k] 偏移）与 ta.ts 参考实现逐 bar 一致', () => {
+  const src = [
+    '//@version=4',
+    'strategy("derived")',
+    'useRange = true',
+    'mid = (high + low) / 2',
+    'len = input(3, minval=1)',
+    'ma = sma(mid, len)',
+    'up = crossover(mid, ma)',
+    'dn = crossunder(mid[1], ma[1])',
+    'rng = useRange ? tr : high - low',
+    'plot(mid, title="Mid")',
+    'plot(ma, title="Ma")',
+    'plot(up ? 1.0 : 0.0, title="Up")',
+    'plot(dn ? 1.0 : 0.0, title="Dn")',
+    'plot(rng, title="Rng")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm8-derived.pine' })
+  assert.deepEqual(
+    comp.diagnostics.filter((d) => d.severity === 'error'),
+    [],
+    `不应有 error：${JSON.stringify(comp.diagnostics)}`,
+  )
+
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+
+  const highs = candles.map((c) => c.high)
+  const lows = candles.map((c) => c.low)
+  const closes = candles.map((c) => c.close)
+  const midRef = highs.map((h, i) => (h + lows[i]) / 2)
+  const maRef = taLib.sma(midRef, 3)
+  const upRef = taLib.crossover(midRef, maRef)
+  const dnRef = taLib.crossunder(midRef, maRef)
+  const rngRef = taLib.trueRange(highs, lows, closes)
+
+  for (let i = 0; i < candles.length; i++) {
+    assert.ok(Object.is(program.plots['Mid'][i], midRef[i]), `bar=${i} Mid`)
+    assert.ok(Object.is(program.plots['Ma'][i], maRef[i]), `bar=${i} Ma`)
+    assert.equal(Number(program.plots['Up'][i]), upRef[i] ? 1 : 0, `bar=${i} Up`)
+    // crossunder(x[1], y[1]) ≡ 参考实现中上一根 bar 的 crossunder
+    assert.equal(Number(program.plots['Dn'][i]), i > 0 && dnRef[i - 1] ? 1 : 0, `bar=${i} Dn`)
+    assert.ok(Object.is(program.plots['Rng'][i], rngRef[i]), `bar=${i} Rng`)
+  }
+})
+
+test('M8: 顶层元组解构（macd）+ 形参 [k] 历史引用与 ta.ts 参考一致', () => {
+  const src = [
+    '//@version=4',
+    'strategy("tuple-macd")',
+    '[macdLine, macdSignalLine, macdHist] = macd(close, 12, 26, 7)',
+    'rising(data, loopBack) =>',
+    '    b = true',
+    '    for n = 1 to loopBack',
+    '        if data[n] > data[n-1]',
+    '            b := false',
+    '    b',
+    'isUp = rising(macdLine, 3)',
+    'plot(macdLine, title="Macd")',
+    'plot(macdSignalLine, title="Signal")',
+    'plot(macdHist, title="Hist")',
+    'plot(isUp ? 1.0 : 0.0, title="Up")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm8-tuple.pine' })
+  assert.deepEqual(
+    comp.diagnostics.filter((d) => d.severity === 'error'),
+    [],
+    `不应有 error：${JSON.stringify(comp.diagnostics)}`,
+  )
+
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+
+  const closes = candles.map((c) => c.close)
+  const [macdRef, signalRef, histRef] = taLib.macd(closes, 12, 26, 7)
+  const risingRef = (arr: number[], i: number, loopBack: number): boolean => {
+    let b = true
+    for (let n = 1; n <= loopBack; n++) {
+      // Pine 的 data[n] / data[n-1] 分别是 arr[i-n] / arr[i-n+1]
+      const a = arr[i - n]
+      const c = arr[i - n + 1]
+      // 与 runtime 的 na-safe 比较一致：na 参与比较恒为 false
+      if (!isNa(a) && !isNa(c) && (a as number) > (c as number)) b = false
+    }
+    return b
+  }
+
+  for (let i = 0; i < candles.length; i++) {
+    assert.ok(Object.is(program.plots['Macd'][i], macdRef[i]), `bar=${i} Macd`)
+    assert.ok(Object.is(program.plots['Signal'][i], signalRef[i]), `bar=${i} Signal`)
+    assert.ok(Object.is(program.plots['Hist'][i], histRef[i]), `bar=${i} Hist`)
+    assert.equal(
+      Number(program.plots['Up'][i]),
+      risingRef(macdRef, i, 3) ? 1 : 0,
+      `bar=${i} Up`,
+    )
+  }
+})
+
+/* ================================================================== */
+/* M9 语料回归：if 表达式 / 函数局部序列 / ASI / v3-v4 遗留写法           */
+/* ================================================================== */
+
+test('M9: `if` 表达式（含前置语句）取值正确', () => {
+  const src = [
+    '//@version=6',
+    'indicator("ifexpr")',
+    'mode = "b"',
+    'v = if mode == "a"',
+    '    1.0',
+    'else if mode == "b"',
+    '    t = close * 0 + 2.0',
+    '    t + 3.0',
+    'else',
+    '    9.0',
+    'plot(v, title="V")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm9-if.pine' })
+  assert.deepEqual(comp.diagnostics.filter((d) => d.severity === 'error'), [])
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+  assert.equal(Number(program.plots['V'][0]), 5, '分支内前置语句 + 尾表达式应得 5')
+})
+
+test('M9: 表达式语句与上一行不因 ASI 粘连（`let x = 3` 后接 `(a + b)`）', () => {
+  const src = [
+    '//@version=6',
+    'indicator("asi")',
+    'f(x) =>',
+    '    if x > 0',
+    '        a = 1',
+    '        b = 2',
+    '        c = 3',
+    '        ((3 * a) - (3 * b)) + c',
+    '    else',
+    '        0',
+    'v = f(5)',
+    'plot(v, title="V")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm9-asi.pine' })
+  assert.deepEqual(comp.diagnostics.filter((d) => d.severity === 'error'), [])
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+  // 3*1 - 3*2 + 3 = 0；不得抛 ReferenceError（TDZ）
+  assert.equal(Number(program.plots['V'][0]), 0)
+})
+
+test('M9: 函数局部变量的 [k] 历史引用（提升为模块级序列）数值正确', () => {
+  const src = [
+    '//@version=6',
+    'indicator("fnlocal")',
+    'f(p) =>',
+    '    a = 0.0',
+    '    a := nz(a[1] + p, p)',
+    '    a',
+    'v = f(close)',
+    'plot(v, title="V")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm9-fnlocal.pine' })
+  assert.deepEqual(comp.diagnostics.filter((d) => d.severity === 'error'), [])
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+  const closes = candles.map((c) => c.close)
+  // a 是 close 的累加（第一根 bar 时 a[1] 为 na → 取 p）
+  let acc = 0
+  for (let i = 0; i < Math.min(candles.length, 5); i++) {
+    acc = i === 0 ? closes[0] : acc + closes[i]
+    assert.ok(
+      Math.abs(Number(program.plots['V'][i]) - acc) < 1e-9,
+      `bar=${i}: ${program.plots['V'][i]} ≠ ${acc}`,
+    )
+  }
+})
+
+test('M9: switch 分支块之后紧跟元组解构不被误判为下标', () => {
+  const src = [
+    '//@version=6',
+    'indicator("switch-tuple")',
+    'preset = "a"',
+    '[x, y] = switch preset',
+    '    "a" => [1.0, 2.0]',
+    '    => [3.0, 4.0]',
+    'plot(x + y, title="V")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm9-switch.pine' })
+  assert.deepEqual(
+    comp.diagnostics.filter((d) => d.severity === 'error'),
+    [],
+    JSON.stringify(comp.diagnostics),
+  )
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+  assert.equal(Number(program.plots['V'][0]), 3)
+})
+
+test('M9: Tab 缩进按 4 空格折算（TradingView 允许 Tab）', () => {
+  const src = ['//@version=6', 'indicator("tab")', 'if close > open', '\tplot(close, title="V")'].join('\n')
+  const { diagnostics, program } = frontEnd(src)
+  assert.deepEqual(diagnostics.filter((d) => d.severity === 'error'), [])
+  assert.ok(program)
+})
+
+test('M9: v3/v4 遗留写法（裸颜色 / period / 元组型 supertrend）编译零 error', () => {
+  const src = [
+    '//@version=4',
+    'strategy("legacy")',
+    'res = input(title="Resolution", type=resolution, defval="60")',
+    '[st, dir] = supertrend(3.0, 10)',
+    't = time("D")',
+    'plot(st, color=lime)',
+    'plot(dir, color=orange)',
+    'plot(close > st ? 1.0 : 0.0, title="Above")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm9-legacy.pine' })
+  assert.deepEqual(
+    comp.diagnostics.filter((d) => d.severity === 'error'),
+    [],
+    JSON.stringify(comp.diagnostics),
+  )
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+  const highs = candles.map((c) => c.high)
+  const lows = candles.map((c) => c.low)
+  const closes = candles.map((c) => c.close)
+  const [stRef] = taLib.supertrend(highs, lows, closes, 3.0, 10)
+  for (let i = 0; i < 20; i++) {
+    assert.ok(Object.is(program.plots[comp.meta.plotTitles[0]][i], stRef[i]), `bar=${i} supertrend`)
+  }
+})
+
+test('M9: strategy.position_size[k] 与 strategy.opentrades 历史引用可用', () => {
+  const src = [
+    '//@version=6',
+    'strategy("poshist")',
+    'entered = strategy.position_size > 0 and strategy.position_size[1] == 0',
+    'nt = strategy.opentrades + strategy.opentrades[1]',
+    'plot(entered ? 1.0 : 0.0, title="Entered")',
+    'plot(nt, title="Nt")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm9-pos.pine' })
+  assert.deepEqual(
+    comp.diagnostics.filter((d) => d.severity === 'error'),
+    [],
+    JSON.stringify(comp.diagnostics),
+  )
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) {
+    // bar0 空仓、此后持多仓 —— 用于验证 position_size[1] 的逐 bar 序列
+    program.step(i, {
+      flat: i === 0,
+      positionSize: i === 0 ? 0 : 1,
+      prevPositionSize: 0,
+      avgPrice: 100,
+      side: 'long',
+    } as never)
+  }
+  assert.equal(Number(program.plots['Entered'][0]), 0, '首根 bar 无上一根 → na 参与比较恒为假')
+  assert.equal(Number(program.plots['Entered'][1]), 1, 'bar1：持仓由 0 变 1')
+  assert.equal(Number(program.plots['Entered'][2]), 0, 'bar2：上一根已持仓')
+  assert.equal(Number(program.plots['Nt'][1]), 1, 'bar1：opentrades=1 + 上一根 0')
+})
+
+test('M9: 新增 ta 函数（rsi/hma/alma/linreg/barssince/valuewhen/mfi）数值合理', () => {
+  const src = [
+    '//@version=6',
+    'indicator("ta9")',
+    'r = rsi(close, 14)',
+    'h = hma(close, 9)',
+    'a = alma(close, 9)',
+    'lr = linreg(close, 10, 0)',
+    'up = close > open',
+    'bs = barssince(up)',
+    'vw = valuewhen(up, close, 0)',
+    'mf = ta.mfi(hlc3, 14)',
+    'plot(r, title="Rsi")',
+    'plot(h, title="Hma")',
+    'plot(a, title="Alma")',
+    'plot(lr, title="Lr")',
+    'plot(bs, title="Bs")',
+    'plot(vw, title="Vw")',
+    'plot(mf, title="Mf")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm9-ta.pine' })
+  assert.deepEqual(
+    comp.diagnostics.filter((d) => d.severity === 'error'),
+    [],
+    JSON.stringify(comp.diagnostics),
+  )
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+  const closes = candles.map((c) => c.close)
+  const highs = candles.map((c) => c.high)
+  const lows = candles.map((c) => c.low)
+  const vol = candles.map((c) => c.volume)
+  const upRef = candles.map((c) => c.close > c.open)
+  const expected: Record<string, number[]> = {
+    Rsi: taLib.rsi(closes, 14),
+    Hma: taLib.hma(closes, 9),
+    Alma: taLib.alma(closes, 9),
+    Lr: taLib.linreg(closes, 10, 0),
+    Bs: taLib.barssince(upRef),
+    Vw: taLib.valuewhen(closes, upRef, 0),
+    Mf: taLib.mfi(highs, lows, closes, vol, 14),
+  }
+  for (let i = 0; i < candles.length; i++) {
+    for (const [title, series] of Object.entries(expected)) {
+      assert.ok(
+        Object.is(program.plots[title][i], series[i]) ||
+          Math.abs(Number(program.plots[title][i]) - Number(series[i])) < 1e-9,
+        `bar=${i} ${title}: ${program.plots[title][i]} ≠ ${series[i]}`,
+      )
+    }
+  }
+})
+
+test('M8: v4 裸内置函数 / input / security / timestamp 编译零 error 且元信息正确', () => {
+  const src = [
+    '//@version=4',
+    'strategy("v4-compat")',
+    'stopPct = input(5, "Stop in %", type=input.float)',
+    'longOnly = input(true)',
+    'volK = input(0.9, step=0.1)',
+    'start = timestamp(2020, 1, 1, 0, 0)',
+    'src = security("BINANCE:BTCUSDT", timeframe.period, close)',
+    'lv = highest(high, 5) - lowest(low, 5)',
+    'atrV = atr(14)',
+    'rng = tr',
+    'hi = pow(lv, 2) / 2',
+    'txt = tostring(atrV, "#.##")',
+    'csUp = crossover(src, hi)',
+    'plot(src + rng - hi + lv, title="Out")',
+    'plot(start, title="Start")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm8-compat.pine' })
+  assert.deepEqual(
+    comp.diagnostics.filter((d) => d.severity === 'error'),
+    [],
+    `不应有 error：${JSON.stringify(comp.diagnostics)}`,
+  )
+  const inputTypes = new Map(comp.meta.inputs.map((it) => [it.name, it.type]))
+  assert.equal(inputTypes.get('stopPct'), 'float', 'v4 显式 type=input.float 应被识别')
+  assert.equal(inputTypes.get('longOnly'), 'bool', 'v4 input(true) 应推断为 bool')
+  assert.equal(inputTypes.get('volK'), 'float')
+  assert.ok(
+    comp.diagnostics.some((d) => d.severity === 'warning' && d.message.includes('security')),
+    'security() 降级应给出警告',
+  )
+
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+  assert.equal(Number(program.plots['Start'][0]), Date.UTC(2020, 0, 1), 'timestamp() 应按 UTC 解析')
+
+  const highs = candles.map((c) => c.high)
+  const lows = candles.map((c) => c.low)
+  const closes = candles.map((c) => c.close)
+  const lvRef = taLib.highest(highs, 5).map((h, i) => h - (taLib.lowest(lows, 5)[i] as number))
+  for (let i = 0; i < candles.length; i++) {
+    const expected = closes[i] + (taLib.trueRange(highs, lows, closes)[i] as number) -
+      Math.pow(lvRef[i], 2) / 2 + lvRef[i]
+    assert.ok(
+      Object.is(Number(program.plots['Out'][i]), expected) ||
+        Math.abs(Number(program.plots['Out'][i]) - expected) < 1e-9,
+      `bar=${i} Out: ${program.plots['Out'][i]} ≠ ${expected}`,
+    )
+  }
+})

@@ -70,6 +70,102 @@ export function hist(ring: Ring, k: number): unknown {
   return ring.buf[(ring.n - 1 - k) % ring.cap]
 }
 
+/**
+ * 统一下标历史读取：容器既可以是整条数组（内置序列 / 预计算数组），
+ * 也可以是环形缓冲（逐 bar 标量）。用于用户函数形参的历史引用透传。
+ */
+export function histOf(container: unknown, index: number, k: number): unknown {
+  if (Array.isArray(container)) return at(container, index, k)
+  if (container && typeof container === 'object' && 'buf' in (container as Record<string, unknown>)) {
+    return hist(container as Ring, k)
+  }
+  return Number.NaN
+}
+
+/** 时间的 UTC 分量（timestamp / dayofweek 共用） */
+function utcParts(ms: number): { y: number; mo: number; d: number; h: number; wd: number } {
+  const t = new Date(ms)
+  return {
+    y: t.getUTCFullYear(),
+    mo: t.getUTCMonth() + 1,
+    d: t.getUTCDate(),
+    h: t.getUTCHours(),
+    wd: t.getUTCDay(),
+  }
+}
+
+/**
+ * Pine 的 `dayofweek(time)` / `dayofweek(dayofweek, timezone)`：
+ * 返回 1（周日）..7（周六）。
+ */
+export function dayOfWeekOf(...args: unknown[]): number {
+  const first = args[0]
+  if (typeof first === 'number') return utcParts(first).wd + 1
+  const ms = args.find((a) => typeof a === 'number')
+  if (typeof ms === 'number') return utcParts(ms).wd + 1
+  return Number.NaN
+}
+
+/** `year(time)` / `month(time)` / `hour(time)` … 一族日期分量（v5 起为 `year(time)` 形式） */
+export function timePartOf(part: string, ...args: unknown[]): number {
+  const ms = args.find((a) => typeof a === 'number')
+  if (typeof ms !== 'number') return Number.NaN
+  const p = utcParts(ms)
+  switch (part) {
+    case 'year':
+      return p.y
+    case 'month':
+      return p.mo
+    case 'dayofmonth':
+      return p.d
+    case 'hour':
+      return p.h
+    case 'minute':
+      return new Date(ms).getUTCMinutes()
+    case 'second':
+      return new Date(ms).getUTCSeconds()
+    case 'dayofweek':
+      return p.wd + 1
+    case 'weekofyear': {
+      const start = Date.UTC(p.y, 0, 1)
+      return Math.floor((ms - start) / (7 * 86_400_000)) + 1
+    }
+    default:
+      return Number.NaN
+  }
+}
+
+/**
+ * 逐 bar 标量的序列写入：把当前 bar 的值写到下标 `i`（中间缺位补 na）。
+ * 保证 `arr[i] ≡ bar i 的值`，这样数组可以当作真正的序列交给 `*At` 变体计算。
+ */
+export function serSet(arr: unknown[], i: number, v: unknown): void {
+  if (!(i >= 0)) return
+  while (arr.length < i) arr.push(Number.NaN)
+  arr[i] = v
+}
+
+/**
+ * Pine 的 `timestamp()`：位置参数 (年, 月, 日[, 时, 分, 秒]) 或单个日期字符串。
+ * 年/月/日按 UTC 解释（回测窗口比较用，与交易所时区存在整小时级偏差，已记入文档）。
+ * 以 `pine` 前缀命名，避免与 createRuntime 内的 K 线时间戳数组同名。
+ */
+export function pineTimestamp(...args: unknown[]): number {
+  if (args.length === 1 && typeof args[0] === 'string') {
+    const t = Date.parse(args[0])
+    return Number.isFinite(t) ? t : Number.NaN
+  }
+  const nums = args.map((a) => Number(a))
+  const y = nums[0]
+  const mo = nums[1]
+  const d = nums[2]
+  const h = nums[3] ?? 0
+  const mi = nums[4] ?? 0
+  const s = nums[5] ?? 0
+  if (![y, mo, d, h, mi, s].every((v) => Number.isFinite(v))) return Number.NaN
+  return Date.UTC(y, mo - 1, d, h, mi, s)
+}
+
 /* ------------------------------------------------------------------ */
 /* 数组助手（Pine 的 array.* 方法）                                     */
 /* ------------------------------------------------------------------ */
@@ -165,6 +261,70 @@ export interface PineRuntimeOptions {
   timeframe?: string
 }
 
+/** `*At` 变体的统一签名：序列参数用整条数组传入，另给当前 bar 下标 */
+type AtFn = (...args: never[]) => unknown
+
+/**
+ * 「多序列 → 元组/序列」的 ta 函数，返回第 tupleIdx 项在当前 bar 的取值。
+ * 供 dmi / mfi 这类固定以内置 OHLC(V) 为源的函数复用。
+ */
+function atOfTuple(
+  fn: (...args: never[]) => readonly (number | boolean)[] | readonly (number | boolean)[][],
+  seriesArgs: unknown[],
+  index: number,
+  scalarArgs: number[],
+  tupleIdx: number,
+): unknown {
+  if (!Number.isFinite(index) || index < 0) return Number.NaN
+  if (!seriesArgs.every((a) => Array.isArray(a))) return Number.NaN
+  const i = Math.floor(index)
+  const sliced = seriesArgs.map((a) => (a as number[]).slice(0, i + 1))
+  const res = (fn as (...a: unknown[]) => unknown)(...sliced, ...scalarArgs)
+  const arr = Array.isArray(res) && tupleIdx > 0 ? (res as unknown[])[tupleIdx] : res
+  if (!Array.isArray(arr)) return Number.NaN
+  return i < arr.length ? (arr as number[])[i] : Number.NaN
+}
+
+/**
+ * `ta.*` 的「当前 bar 标量」变体集合（codegen 在 `step` 内调用）。
+ *
+ * 序列参数为整条数组（内置序列 / 预计算数组 / 逐 bar 标量跟踪数组），
+ * 第二个参数固定为当前 bar 下标，之后是该函数的其余标量参数。
+ */
+export interface TaAtFns {
+  smaAt: AtFn
+  emaAt: AtFn
+  rmaAt: AtFn
+  wmaAt: AtFn
+  highestAt: AtFn
+  lowestAt: AtFn
+  hmaAt: AtFn
+  almaAt: AtFn
+  rsiAt: AtFn
+  changeAt: AtFn
+  momAt: AtFn
+  rocAt: AtFn
+  stdevAt: AtFn
+  varianceAt: AtFn
+  devAt: AtFn
+  risingAt: AtFn
+  fallingAt: AtFn
+  stochAt: AtFn
+  linregAt: AtFn
+  barssinceAt: AtFn
+  valuewhenAt: AtFn
+  sarAt: AtFn
+  dmiAt: AtFn
+  mfiAt: AtFn
+  pivothighAt: AtFn
+  pivotlowAt: AtFn
+  atrAt: AtFn
+  trAt: AtFn
+  crossoverAt: AtFn
+  crossunderAt: AtFn
+  crossAt: AtFn
+}
+
 export interface PineRuntime {
   candles: {
     open: number[]
@@ -188,9 +348,14 @@ export interface PineRuntime {
   makeRing: typeof makeRing
   push: typeof push
   hist: typeof hist
+  histOf: typeof histOf
+  serSet: typeof serSet
+  timestamp: typeof pineTimestamp
+  dayofweek: typeof dayOfWeekOf
+  timePart: typeof timePartOf
   arrRemove: typeof arrRemove
   arrClear: typeof arrClear
-  ta: typeof taLib
+  ta: typeof taLib & TaAtFns
   math: Record<string, unknown>
   str: Record<string, (...args: never[]) => unknown>
   color: Record<string, unknown>
@@ -222,6 +387,7 @@ export interface PineRuntime {
   polyline: Record<string, (...args: unknown[]) => unknown>
   linefill: Record<string, (...args: unknown[]) => unknown>
   array: Record<string, (...args: unknown[]) => unknown>
+  matrix: Record<string, (...args: never[]) => unknown>
   cast: Record<string, (v: unknown) => unknown>
 }
 
@@ -484,6 +650,219 @@ export function createRuntime(
     },
   }
 
+  /** `ta.*` 的当前 bar 变体：先按前缀算整条数组，再取下标 */
+  const seriesAt =
+    <A extends unknown[]>(fn: (src: readonly number[], ...rest: A) => readonly (number | boolean)[]) =>
+    (arr: unknown, index: number, ...rest: A): unknown => {
+      if (!Array.isArray(arr) || !Number.isFinite(index) || index < 0) return Number.NaN
+      const out = fn(arr.slice(0, Math.floor(index) + 1), ...rest)
+      return index < out.length ? out[index] : Number.NaN
+    }
+
+  const atrAt = (
+    high: unknown,
+    low: unknown,
+    close: unknown,
+    index: number,
+    length: unknown,
+    smoothing?: unknown,
+  ): number => {
+    if (!Array.isArray(high) || !Array.isArray(low) || !Array.isArray(close)) return Number.NaN
+    if (!Number.isFinite(index) || index < 0) return Number.NaN
+    const i = Math.floor(index)
+    const out = taLib.atr(
+      high.slice(0, i + 1),
+      low.slice(0, i + 1),
+      close.slice(0, i + 1),
+      Number(length),
+      (smoothing as 'RMA' | 'SMA' | 'EMA' | 'WMA' | undefined) ?? 'RMA',
+    )
+    return i < out.length ? out[i] : Number.NaN
+  }
+
+  const trAt = (high: unknown, low: unknown, close: unknown, index: number): number => {
+    if (!Array.isArray(high) || !Array.isArray(low) || !Array.isArray(close)) return Number.NaN
+    if (!Number.isFinite(index) || index < 0) return Number.NaN
+    const i = Math.floor(index)
+    const out = taLib.trueRange(high.slice(0, i + 1), low.slice(0, i + 1), close.slice(0, i + 1))
+    return i < out.length ? out[i] : Number.NaN
+  }
+
+  /**
+   * 交叉的当前 bar 变体：`crossunderAt(a, b, i, offA, offB)` 语义为
+   *   a[i-offA] < b[i-offB] 且 a[i-offA-1] >= b[i-offB-1]
+   * 偏移量用于支持 v4 的 `crossunder(a[1], b[1])` 写法。
+   */
+  const crossAt =
+    (kind: 'crossover' | 'crossunder' | 'cross') =>
+    (a: unknown, b: unknown, index: number, offA = 0, offB = 0): boolean => {
+      if (!Array.isArray(a) || !Array.isArray(b)) return false
+      const i = Math.floor(index) - Math.floor(Number(offA) || 0)
+      const j = Math.floor(index) - Math.floor(Number(offB) || 0)
+      const a0 = at(a, i, 0)
+      const a1 = at(a, i, 1)
+      const b0 = at(b, j, 0)
+      const b1 = at(b, j, 1)
+      if (isNa(a0) || isNa(a1) || isNa(b0) || isNa(b1)) return false
+      const up = (a0 as number) > (b0 as number) && (a1 as number) <= (b1 as number)
+      const down = (a0 as number) < (b0 as number) && (a1 as number) >= (b1 as number)
+      if (kind === 'crossover') return up
+      if (kind === 'crossunder') return down
+      return up || down
+    }
+
+  const taNs: typeof taLib & TaAtFns = {
+    ...taLib,
+    smaAt: seriesAt(taLib.sma),
+    emaAt: seriesAt(taLib.ema),
+    rmaAt: seriesAt(taLib.rma),
+    wmaAt: seriesAt(taLib.wma),
+    highestAt: seriesAt(taLib.highest),
+    lowestAt: seriesAt(taLib.lowest),
+    hmaAt: seriesAt(taLib.hma),
+    almaAt: seriesAt(taLib.alma),
+    rsiAt: seriesAt(taLib.rsi),
+    changeAt: seriesAt(taLib.change),
+    momAt: seriesAt(taLib.mom),
+    rocAt: seriesAt(taLib.roc),
+    stdevAt: seriesAt(taLib.stdev),
+    varianceAt: seriesAt(taLib.variance),
+    devAt: seriesAt(taLib.dev),
+    risingAt: seriesAt(taLib.rising),
+    fallingAt: seriesAt(taLib.falling),
+    stochAt: seriesAt(taLib.stoch),
+    linregAt: seriesAt(taLib.linreg),
+    barssinceAt: seriesAt(taLib.barssince),
+    valuewhenAt: seriesAt(taLib.valuewhen),
+    sarAt: (high: unknown, low: unknown, index: number, start: number, inc: number, max: number) => {
+      if (!Array.isArray(high) || !Array.isArray(low)) return Number.NaN
+      if (!Number.isFinite(index) || index < 0) return Number.NaN
+      const i = Math.floor(index)
+      const out = taLib.sar(high.slice(0, i + 1), low.slice(0, i + 1), start, inc, max)
+      return i < out.length ? out[i] : Number.NaN
+    },
+    /** dmi / mfi 的元组或标量结果按下标取（i 落在 tupleIdx 指定的那一项上） */
+    dmiAt: (
+      high: unknown,
+      low: unknown,
+      close: unknown,
+      index: number,
+      diLength: number,
+      adxSmoothing: number,
+      tupleIdx = 0,
+    ) => atOfTuple(taLib.dmi, [high, low, close], index, [diLength, adxSmoothing], tupleIdx),
+    mfiAt: (
+      high: unknown,
+      low: unknown,
+      close: unknown,
+      index: number,
+      _series: unknown,
+      length: number,
+    ) => atOfTuple(taLib.mfi, [high, low, close, volume], index, [length], 0),
+    pivothighAt: seriesAt(taLib.pivothigh),
+    pivotlowAt: seriesAt(taLib.pivotlow),
+    atrAt,
+    trAt,
+    crossoverAt: crossAt('crossover'),
+    crossunderAt: crossAt('crossunder'),
+    crossAt: crossAt('cross'),
+  }
+
+  /** 矩阵：以「行数列数 + 一维数据」表示的极简实现（回测常用算子） */
+  const matrixNs = (() => {
+    const rowsOf = (m: unknown): unknown[][] => (Array.isArray(m) ? (m as unknown[][]) : [])
+    const num = (v: unknown): number => (Number.isFinite(Number(v)) ? Number(v) : Number.NaN)
+    const callable = (...args: unknown[]): unknown => {
+      const [m, r, c] = args
+      const a = rowsOf(m)
+      const ri = Math.floor(Number(r))
+      const ci = Math.floor(Number(c))
+      return Number.isFinite(ri) && Number.isFinite(ci) ? num(a[ri]?.[ci]) : Number.NaN
+    }
+    const ns: Record<string, (...args: never[]) => unknown> = {
+      new: (...args: unknown[]): unknown[][] => {
+        const r = Math.max(0, Math.floor(Number(args[0] ?? 0)))
+        const c = Math.max(0, Math.floor(Number(args[1] ?? 0)))
+        const init = args[2] ?? Number.NaN
+        return Array.from({ length: r }, () => new Array<unknown>(c).fill(init))
+      },
+      rows: (m: unknown): number => rowsOf(m).length,
+      columns: (m: unknown): number => rowsOf(m)[0]?.length ?? 0,
+      get: callable,
+      set: (...args: unknown[]): void => {
+        const a = rowsOf(args[0])
+        const ri = Math.floor(Number(args[1]))
+        const ci = Math.floor(Number(args[2]))
+        if (a[ri]) a[ri][ci] = args[3]
+      },
+      fill: (...args: unknown[]): unknown => {
+        const a = rowsOf(args[0])
+        for (const row of a) row.fill(args[1])
+        return a
+      },
+      row: (m: unknown, r: unknown): unknown[] => rowsOf(m)[Math.floor(Number(r))] ?? [],
+      col: (m: unknown, c: unknown): unknown[] =>
+        rowsOf(m).map((row) => row[Math.floor(Number(c))]),
+      sum: (m: unknown): number =>
+        rowsOf(m).reduce<number>((s, row) => s + row.reduce<number>((x, v) => x + (num(v) || 0), 0), 0),
+      avg: (m: unknown): number => {
+        const a = rowsOf(m)
+        const total = a.length * (a[0]?.length ?? 0)
+        const s = rowsOf(m).reduce<number>((acc, row) => acc + row.reduce<number>((x, v) => x + (num(v) || 0), 0), 0)
+        return total ? s / total : Number.NaN
+      },
+      min: (m: unknown): number => Math.min(...rowsOf(m).flat().map(num)),
+      max: (m: unknown): number => Math.max(...rowsOf(m).flat().map(num)),
+      transpose: (m: unknown): unknown[][] => {
+        const a = rowsOf(m)
+        return (a[0] ?? []).map((_, c) => a.map((row) => row[c]))
+      },
+      multiply: (x: unknown, y: unknown): unknown[][] => {
+        const a = rowsOf(x)
+        const b = rowsOf(y)
+        return a.map((row) =>
+          (b[0] ?? []).map((_, c) =>
+            row.reduce<number>((s, v, k) => s + num(v) * num(b[k]?.[c]), 0),
+          ),
+        )
+      },
+      is_valid: (m: unknown): boolean => Array.isArray(m),
+      is_square: (m: unknown): boolean => {
+        const a = rowsOf(m)
+        return a.length > 0 && a.length === (a[0]?.length ?? -1)
+      },
+      is_identity: (m: unknown): boolean =>
+        rowsOf(m).every((row, i) => row.every((v, j) => num(v) === (i === j ? 1 : 0))),
+      is_zero: (m: unknown): boolean => rowsOf(m).every((row) => row.every((v) => num(v) === 0)),
+      is_antisymmetric: (m: unknown): boolean => {
+        const a = rowsOf(m)
+        return a.every((row, i) => row.every((v, j) => num(v) === -num(a[j]?.[i])))
+      },
+      is_symmetric: (m: unknown): boolean => {
+        const a = rowsOf(m)
+        return a.every((row, i) => row.every((v, j) => num(v) === num(a[j]?.[i])))
+      },
+      is_diagonal: (m: unknown): boolean => {
+        const a = rowsOf(m)
+        return a.every((row, i) => row.every((v, j) => (i === j ? true : num(v) === 0)))
+      },
+      is_triangular: (): boolean => true,
+      is_stochastic: (m: unknown): boolean =>
+        rowsOf(m).every((row) => row.every((v) => num(v) >= 0 && num(v) <= 1)),
+    }
+    // 其余矩阵算子（逆/特征/分解等）：回测不消费，统一返回 na 占位
+    return new Proxy(ns, {
+      get: (target, prop) => {
+        if (typeof prop !== 'string') return undefined
+        if (prop in target) return target[prop]
+        return (...args: unknown[]): unknown => {
+          void args
+          return Number.NaN
+        }
+      },
+    }) as Record<string, (...args: never[]) => unknown>
+  })()
+
   return {
     candles: { open, high, low, close, volume, timestamp },
     ctx: { mintick: tick },
@@ -500,9 +879,15 @@ export function createRuntime(
     makeRing,
     push,
     hist,
+    histOf,
+    serSet,
+    timestamp: pineTimestamp,
+    dayofweek: dayOfWeekOf,
+    timePart: timePartOf,
     arrRemove,
     arrClear,
-    ta: taLib,
+    ta: taNs,
+    matrix: matrixNs,
     math: mathNs,
     str: {
       tostring: (v: unknown, fmt?: unknown): string => {

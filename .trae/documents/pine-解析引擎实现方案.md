@@ -520,3 +520,91 @@ apiRouter.post('/pine/backtest', async (req, res) => {
 - [x] 脚本保存 / 下拉选择、CodeMirror 高亮 + Drawer 放大编辑（均经浏览器实测）
 - [x] `Breakout.pine`（433 行）编译通过并跑通回测
 - [ ] `SwiftEdge GEX.pine` / `Ichimoku.pine` 的完整编译与回测：按 §12.4 的顺序推进
+
+## 13. M10 —— v4/v3 兼容层与 TradingView 真实语料回归
+
+本节记录「拿 16 个 TradingView 开源 BTC 策略源码跑通编译 + 逐 bar 执行」这一轮补齐的能力。
+语料获取方式（无需浏览器/登录）：先取搜索列表 `/pubscripts-suggest-json/?search=…`，
+再按 `scriptIdPart` 拉 `pine-facade.tradingview.com/pine-facade/get/<id>/<version>`，
+响应里的 `source` 字段即完整 Pine 源码（仅 `access === 1` 的开源脚本可用）。
+对应工具：`scripts/fetch-tv-scripts.mjs`（抓取）与 `scripts/check-pine-corpus.ts`（编译 + 运行体检）。
+
+### 13.1 语法层
+
+| 能力 | 说明 |
+| --- | --- |
+| Tab 缩进 | TradingView 允许 Tab，按 4 空格折算（原先直接报错） |
+| 一行多语句 | v4 允许 `a = 1, b = 2,` 用逗号分隔多条语句 |
+| `if` 表达式 | `x = if cond` + 缩进分支块（可为 `else if` / `else`）；分支块允许前置语句，codegen 落成 IIFE |
+| `switch` 后紧跟 `[` | 修复：块结束的 DEDENT 之后的 `[` 是新的元组/数组，不再被误解析为下标 |
+| `var` 作为变量名 | `var = input(close)`（v3 常见）不再被当成关键字 |
+| 函数尾 `if` 语句 | 隐式返回值扩展到「最后一条语句是 `if`」的情形（TEMA 类写法） |
+
+### 13.2 语义 / codegen
+
+- **顶层元组解构**：`[macdLine, macdSignalLine, macdHist] = macd(...)` 整体作为 A 类预计算元组
+  （`const [__a_a, __a_b, __a_c] = __pine.ta.macd(...)`），元素可参与 `[k]` 与 ta 函数的序列实参。
+- **逐 bar 标量的序列跟踪**：`__s_<name>` 数组（`__pine.serSet`）让派生序列
+  （`ma = sma(source, len)` 中的 `source`）和交叉（`crossover(source, upper)`）拿到整条序列，
+  用 `ta.*At` 变体在 step 内按当前 bar 取值；`*At` 一律「按前缀重算再取下标」，保证与
+  TradingView 的逐 bar 语义一致（O(n²)，回测 K 线量级下可接受）。
+- **形参历史透传**：用户函数形参被 `[k]` 引用时（`rising(data, n)` 里的 `data[k]`），
+  调用点把「整条数组 / 环形缓冲」透传给隐藏参数，函数体内用 `__pine.histOf` 读取。
+- **函数局部序列**：函数内被赋值且被 `[k]` 引用的局部变量提升为模块级状态 + 环形缓冲
+  （`__fl_<fn>_<name>` / `__hf_<fn>_<name>`），并按「每 bar 无条件推入」维持序列。
+- **`var` 状态的 `[k]`**：`var bool longOpened` 后 `longOpened[1]` 可用；环形缓冲在 step 序言推入当根值，
+  因此第 0 根 bar 的 `[1]` 为 na（与 Pine 一致）。
+- **ctx 成员历史**：`strategy.position_size[k]` / `strategy.opentrades[k]` 等通过 `__hm_*` 环形缓冲支持；
+  `__ctx` 提升到 `__create` 作用域（用户函数体内也能读），并带一份「空仓」初始快照。
+- **ASI 修复**：表达式语句统一加前置分号。此前 `let x = 3` 后跟 `(a + b)` 会被解析成 `3(a + b)`，
+  在 vm 下表现为诡异的 TDZ（`Cannot access 'x' before initialization`）。
+- **JS 保留字改名**：Pine 变量名若是 JS 保留字（`var` 等）自动加 `__v_` 前缀。
+- **exit 内联「尽力而为」**：`strategy.entry` 处内联 `strategy.exit` 的 stop/limit 时，
+  若表达式引用了入口处不可见的局部变量，则跳过内联（记 na），由 exit 分支自己执行时赋值。
+
+### 13.3 运行时补齐（`ta.*` / 命名空间）
+
+- 新增 ta 函数：`macd`（元组）、`supertrend`（元组）、`dmi`（元组）、`sar`、`rsi`、`hma`、`alma`、
+  `mfi`、`linreg`、`barssince`、`valuewhen`、`crossover/crossunder/cross`、`change/mom/roc`、
+  `stdev/variance/dev`、`rising/falling`、`stoch`。
+- v4 裸名别名（无命名空间）：上表全部 + `math.*`（abs/max/min/…）+ `str.*`（tostring 等）。
+- v3/v4 遗留：`period`/`resolution`（→ 当前周期字符串）、`tickerid`、裸颜色常量（`lime`/`aqua`…）、
+  `heikinashi/heikenashi`（单标的等价于原标的）、`time(resolution)`、`dayofweek(time[, tz])`、
+  `year/month/dayofmonth/hour/minute/second/weekofyear(time)`、`chart.left/right_visible_bar_time`、
+  `chart.point.*`（坐标对象占位）、`dayofweek.friday` 枚举、`text.format_*`（按 0 占位）。
+- `matrix.*`：`new/rows/columns/get/set/fill/row/col/sum/avg/min/max/transpose/multiply` 与
+  `is_*` 判定；未实现的算子（逆、特征值、分解等）统一返回 na（Proxy 兜底）。
+- `input` 兼容：v4 裸 `input(defval, title, type, minval, maxval, step, …)` 的位置形参顺序、
+  `type=input.float` / `type=resolution` 等；类型缺失时由默认值推断（`input(true)` → bool）。
+  `resolution/symbol/session` 落到运行时 `input.string`。
+
+### 13.4 明确降级（已记入本文档，不再当作缺陷）
+
+| 项 | 降级方式 |
+| --- | --- |
+| `security()` / `request.security()` | 取「当前序列」并忽略 symbol / timeframe（编译期一次性警告） |
+| `strategy.equity` / `openprofit` / `netprofit` / `closedtrades` 等 | 引擎不向脚本暴露，按 na 降级（编译期警告） |
+| 无法映射序列的 `crossover/crossunder` 实参 | 退化为当前 bar 的简单比较（编译期警告） |
+| `timestamp()` 的时区 | 按 UTC 解释（与交易所时区存在整小时级偏差） |
+| `time_close` / `time_tradingday` | 以开盘时间近似 |
+| 金额/数量类 `strategy.entry(qty=…)` | 引擎按自身仓位规则下单，脚本 qty 不参与撮合 |
+
+### 13.5 语料回归结果（16 个 TradingView 开源 BTC 策略）
+
+- `scripts/check-pine-corpus.ts server/pine/tv` → **编译 16/16、编译 + 逐 bar 运行 16/16**；
+  脚本自带的日期窗口（如 `toYear=2021`）可能导致 0 笔成交，属脚本语义而非编译问题。
+- `server/pine/` 原有脚本：`Breakout.pine` / `Institutional .pine` / `test.pine` / `test1.pine` /
+  `test4.pine`（v4，已跑通回测）/ `test5.pin`（v4，逗号多语句）全部通过；
+  `Ichimoku.pine` 剩 2 条 `request.security` 内联表达式的 `[k]` 引用（见 §13.6），
+  `SwiftEdge GEX.pine` 已从 66 条错误降到 0（上一轮的 §12.4 清单已收口）。
+- 回归测试：M8（v4 兼容层）+ M9（if 表达式 / ASI / 函数局部序列 / switch 后元组 / Tab /
+  遗留写法 / ctx 成员历史 / 新增 ta 函数）共 12 条，全仓 `npm test` **67/67 通过**。
+
+### 13.6 下一步（TODO，按优先级）
+
+1. `request.security(...)` 的内联表达式做 `[k]`：需要给「多行/内联序列表达式」建立临时序列缓冲
+   （Ichimoku 剩余 2 条）；
+2. HTF / 多标的 `security()` 真取值（含 `lookahead` 语义）；
+3. 逐 bar 标量跟踪数组的 O(n²) 优化（按 bar 增量计算，长周期回测提速）；
+4. `map.*` 命名空间与 `matrix.*` 的重型算子（逆 / 特征值 / 分解）；
+5. 条件赋值身位下的环形缓冲语义（当前按「写入时推入」，与 Pine 的「每 bar 值」存在偏差）。

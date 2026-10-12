@@ -21,6 +21,7 @@ import type {
   ForInStmt,
   ForStmt,
   FuncDeclStmt,
+  IfExpr,
   IfStmt,
   IndexExpr,
   MemberExpr,
@@ -35,14 +36,18 @@ import type {
 /* 常量表                                                              */
 /* ------------------------------------------------------------------ */
 
-const BUILTIN_SERIES = new Set(['open', 'high', 'low', 'close', 'volume', 'time', 'hl2', 'hlc3', 'ohlc4'])
+const BUILTIN_SERIES = new Set([
+  'open', 'high', 'low', 'close', 'volume', 'time', 'hl2', 'hlc3', 'ohlc4',
+  // v4 遗留：以开盘时间近似收盘 / 交易日时间
+  'time_close', 'time_tradingday',
+])
 /** 结果随 bar 演进的命名空间（不可在初始化阶段求值） */
 const BAR_VARYING_ROOTS = new Set([
   'ta', 'session', 'syminfo', 'strategy', 'barstate', 'timeframe', 'request', 'chart', 'ticker',
   'timeframe', 'dayofweek', 'currency', 'time',
 ])
 /** 允许在初始化阶段求值的调用根（要求所有实参也是初始化期可求值） */
-const CONST_CALL_ROOTS = new Set(['input', 'color', 'math', 'str', 'format', 'size', 'display'])
+const CONST_CALL_ROOTS = new Set(['input', 'color', 'math', 'str', 'format', 'size', 'display', 'timestamp'])
 
 /** 编译期常量成员（`size.tiny`、`plot.style_linebr`、`strategy.long`…） */
 const CONST_MEMBERS: Record<string, string> = {}
@@ -68,6 +73,8 @@ addMembers('label', [
 ])
 addMembers('text', ['align_left', 'align_center', 'align_right', 'align_top', 'align_bottom'])
 addMembers('display', ['none', 'all', 'pane', 'data_window', 'price_scale', 'status_line'])
+/** v4 的 `type=input.float` 等类型枚举（作为值出现在具名实参里） */
+addMembers('input', ['float', 'int', 'bool', 'string', 'color', 'source', 'time', 'symbol', 'price', 'session'])
 addMembers('extend', ['none', 'left', 'right', 'both'])
 addMembers('xloc', ['bar_index', 'bar_time'])
 addMembers('yloc', ['price', 'abovebar', 'belowbar'])
@@ -117,11 +124,37 @@ addMembers('table', [
   'position_bottom_left', 'position_bottom_center', 'position_bottom_right',
 ])
 
-/** `strategy.position_size` 等随 bar 演进的成员 */
+/** `strategy.position_size` 等随 bar 演进的成员 → 每 bar 由 step 写入的 __ctx 取值 */
 const CTX_MEMBERS: Record<string, string> = {
-  'strategy.position_size': 'ctx.positionSize',
-  'strategy.position_avg_price': 'ctx.avgPrice',
-  'strategy.opentrades': '(ctx.positionSize === 0 ? 0 : 1)',
+  'strategy.position_size': '__ctx.positionSize',
+  'strategy.position_avg_price': '__ctx.avgPrice',
+  'strategy.opentrades': '(__ctx.positionSize === 0 ? 0 : 1)',
+  // 回测引擎不向脚本暴露的账户量：按 na 降级（编译期给出警告，已记入文档）
+  'strategy.equity': 'NaN',
+  'strategy.initial_capital': 'NaN',
+  'strategy.netprofit': 'NaN',
+  'strategy.grossprofit': 'NaN',
+  'strategy.grossloss': 'NaN',
+  'strategy.openprofit': 'NaN',
+  'strategy.max_drawdown': 'NaN',
+  'strategy.closedtrades': 'NaN',
+  'strategy.wintrades': 'NaN',
+  'strategy.losstrades': 'NaN',
+  'strategy.eventrades': 'NaN',
+}
+
+/** 成员名 → 合法的变量名片段（`strategy.position_size` → `strategy_position_size`） */
+function memberRingName(path: string): string {
+  return path.replace(/[^\w]/g, '_')
+}
+
+/** 函数局部序列：模块级提升名与环形缓冲名 */
+function fnLocalName(fnName: string, local: string): string {
+  return `__fl_${fnName}_${local}`
+}
+
+function fnLocalRing(fnName: string, local: string): string {
+  return `__hf_${fnName}_${local}`
 }
 
 /** 已知命名空间根（用于把「无法映射的成员」报成诊断，而不是静默生成错误代码） */
@@ -134,6 +167,8 @@ const NAMESPACE_ROOTS = new Set([
 
 /** `input.*` 的形参顺序（用于把位置实参与具名实参统一成一份映射） */
 const INPUT_PARAMS = ['defval', 'title', 'minval', 'maxval', 'step', 'tooltip', 'inline', 'group', 'display', 'confirm']
+/** v4 裸 `input(defval, title, type, minval, maxval, step, options, …)`：type 在第 3 位 */
+const INPUT_PARAMS_V4 = ['defval', 'title', 'type', 'minval', 'maxval', 'step', 'options', 'tooltip', 'inline', 'group', 'display', 'confirm']
 /** `plot` 的形参顺序 */
 const PLOT_PARAMS = ['series', 'title', 'color', 'offset', 'style', 'linewidth', 'trackprice', 'histbase', 'join', 'editable', 'show_last', 'display', 'format', 'precision', 'force_overlay']
 /** `plotshape` 的形参顺序 */
@@ -180,6 +215,76 @@ const LEGACY_ARRAY_CTORS: Record<string, string> = {
   new_linefill: 'new',
 }
 
+/* ------------------------------------------------------------------ */
+/* v4 兼容层（裸内置函数 / 元组型 ta 函数 / 逐 bar 序列跟踪）              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * v4 的 `ta.*` 系列函数（无命名空间前缀），运行时同名实现可直接复用。
+ * 仅收录运行时确实提供实现的函数 —— 其余裸名仍旧按「无法映射的标识符」报诊断，
+ * 避免生成必然在运行期崩掉的代码。
+ */
+const V4_TA_FUNCS = new Set([
+  'sma', 'ema', 'rma', 'wma', 'hma', 'alma', 'atr', 'tr', 'highest', 'lowest',
+  'pivothigh', 'pivotlow', 'crossover', 'crossunder', 'cross',
+  'change', 'mom', 'roc', 'stdev', 'variance', 'dev', 'rsi',
+  'rising', 'falling', 'stoch', 'linreg', 'barssince', 'valuewhen', 'sar',
+])
+/** 返回「与输入等长数组」的 ta 函数（可作为 A 类预计算；其余如 macd 返回元组） */
+const TA_SERIES_FNS = new Set([
+  'sma', 'ema', 'rma', 'wma', 'hma', 'alma', 'atr', 'tr', 'highest', 'lowest',
+  'pivothigh', 'pivotlow', 'change', 'mom', 'roc', 'stdev', 'variance', 'dev', 'rsi',
+  'rising', 'falling', 'stoch', 'linreg', 'barssince', 'valuewhen', 'sar',
+])
+/** 源序列固定为内置 OHLC(V) 的 ta 函数（实参里不含序列） */
+const TA_OHLC_FNS = new Set(['dmi', 'mfi'])
+/** 返回元组的 ta 函数 → 元素个数（`[a, b, c] = macd(...)` 的解构） */
+const TA_TUPLE_FNS: Record<string, number> = { macd: 3, supertrend: 2, dmi: 3 }
+/** v4 裸名 → `math.*`（运行时 mathNs 已实现的子集） */
+const V4_MATH_FUNCS = new Set([
+  'abs', 'max', 'min', 'round', 'floor', 'ceil', 'pow', 'sqrt', 'sign',
+  'log', 'log10', 'exp', 'avg', 'sum', 'todegrees', 'toradians',
+])
+/** v4 裸名 → `str.*` */
+const V4_STR_FUNCS = new Set(['tostring', 'tonumber', 'toint', 'tochar'])
+/** 交叉函数（v4 裸名与 v6 `ta.*` 共用一条通路） */
+const CROSS_FUNCS = new Set(['crossover', 'crossunder', 'cross'])
+/** 支持「首参为序列 + 当前 bar 下标」变体（`smaAt` / `emaAt` …）的 ta 函数 */
+const SERIES_AT_FNS = new Set([
+  'sma', 'ema', 'rma', 'wma', 'hma', 'alma', 'highest', 'lowest',
+  'change', 'mom', 'roc', 'stdev', 'variance', 'dev', 'rsi',
+  'rising', 'falling', 'linreg', 'barssince',
+])
+/** v3/v4 的裸颜色常量（`plot(x, color=lime)`） */
+const BARE_COLORS = new Set([
+  'red', 'green', 'blue', 'white', 'black', 'gray', 'grey', 'yellow', 'orange',
+  'purple', 'lime', 'aqua', 'fuchsia', 'maroon', 'navy', 'olive', 'silver', 'teal',
+])
+/** 运行时确实提供的 input 通道 */
+const RUNTIME_INPUT_TYPES = new Set(['int', 'float', 'bool', 'color', 'string', 'source', 'time'])
+
+/** `dayofweek.monday` … `dayofweek.sunday`（枚举值 = 2..7 / 1） */
+const DAYOFWEEK_MEMBERS: Record<string, number> = {
+  sunday: 1, monday: 2, tuesday: 3, wednesday: 4, thursday: 5, friday: 6, saturday: 7,
+}
+
+/** 时间分量调用（`year(time)` / `month(time)` / `hour(time)` …，缺省用当前 bar 时间） */
+const TIME_PART_FNS = new Set(['year', 'month', 'dayofmonth', 'hour', 'minute', 'second', 'weekofyear'])
+
+/** `text.format_*` 等绘图枚举（回测不消费，按 0 占位） */
+function isTextEnumMember(path: string): boolean {
+  return path.startsWith('text.format_') || path.startsWith('text.style_')
+}
+
+/** JS 保留字：Pine 里允许当变量名（如 v3 的 `var = input(close)`），生成物里必须改名 */
+const JS_RESERVED = new Set([
+  'var', 'let', 'const', 'function', 'return', 'if', 'else', 'for', 'while', 'do', 'switch',
+  'case', 'break', 'continue', 'new', 'delete', 'in', 'instanceof', 'typeof', 'void', 'this',
+  'class', 'extends', 'super', 'import', 'export', 'default', 'try', 'catch', 'finally',
+  'throw', 'yield', 'await', 'enum', 'with', 'debugger', 'null', 'true', 'false',
+  'arguments', 'eval',
+])
+
 export interface CodegenOptions {
   /** 源码文件名，仅用于生成物头部的注释 */
   sourceName?: string
@@ -204,6 +309,8 @@ class Codegen {
 
   /** A 类：`ta.*` 预计算数组（名字 → 调用表达式） */
   private readonly precalc = new Map<string, CallExpr>()
+  /** A 类预计算的「归属语句」——同名多次赋值时只有注册它的那条语句产出声明 */
+  private readonly precalcOwner = new Map<string, Stmt>()
   /** B 类：初始化期求值的常量 */
   private readonly createConsts = new Set<string>()
   /** C 类：`step` 内逐 bar 求值的顶层标量 */
@@ -218,8 +325,30 @@ class Codegen {
   private readonly userFuncs = new Map<string, FuncDeclStmt>()
   /** 需要环形缓冲的 C 类标量（名字 → 最大引用深度） */
   private readonly histNeed = new Map<string, number>()
+  /** 被 `[k]` 引用的 ctx 成员路径（`strategy.position_size` → 最大深度） */
+  private readonly memberHist = new Map<string, number>()
   /** `strategy.entry` 的 id → `strategy.exit` 的 stop/limit 表达式 */
   private readonly exitMap = new Map<string, { stop?: Expr; limit?: Expr }>()
+  /** 顶层元组解构（`[a, b, c] = macd(...)`）：整体作为 A 类预计算元组 */
+  private readonly precalcTuples: { names: string[]; call: CallExpr }[] = []
+  /** 预计算元组的元素名（按单条数组引用） */
+  private readonly precalcTupleNames = new Set<string>()
+  /** 需要逐 bar 序列跟踪的顶层标量（`__s_<name>` 数组，供 ta `*At` 变体使用） */
+  private readonly serTrack = new Set<string>()
+  /** 用户函数中「被 [k] 引用的形参」→ 隐藏历史参数（调用点透传序列容器） */
+  private readonly fnHistParams = new Map<string, string[]>()
+  /** 用户函数中「被 [k] 引用的局部变量」：函数名 → (局部名 → 最大引用深度) */
+  private readonly fnLocalSeries = new Map<string, Map<string, number>>()
+  /** 正在生成函数体时的形参历史引用上下文 */
+  private histParamsInFn: Set<string> | null = null
+  /** 正在生成函数体时的函数局部序列上下文（局部名 → 提升名 + 环形缓冲名） */
+  private fnLocalCtx: Map<string, { name: string; ring: string }> | null = null
+  /** 脚本是否引用裸 `tr` / `ta.tr`（需要预计算 __a_tr） */
+  private wantsTr = false
+  /** 正在做初始化期代码生成（此时 ta 调用按整条数组求值，不生成 *At） */
+  private initPhase = false
+  /** 已发出过的警告（去重） */
+  private readonly warned = new Set<string>()
 
   private readonly meta: PineCompileMeta
 
@@ -280,18 +409,48 @@ class Codegen {
     lines.push('  const C = __pine.candles')
     lines.push('  const n = C.length')
     lines.push('  let __index = 0')
+    // 逐 bar 上下文（用户函数体内也要能读 strategy.*，故用模块级变量而非 step 形参）。
+    // 初始值给一份「空仓」快照，保证初始化阶段求值 `strategy.*` 常量不会抛错。
+    lines.push(
+      '  let __ctx = { flat: true, positionSize: 0, prevPositionSize: 0, avgPrice: NaN, side: null }',
+    )
     // 环形缓冲（历史引用）
     for (const [name, k] of this.histNeed) {
       lines.push(`  const __h_${name} = __pine.makeRing(${k + 1})`)
     }
+    // ctx 成员的历史引用（`strategy.position_size[1]` 等）
+    for (const [path, k] of this.memberHist) {
+      lines.push(`  const __hm_${memberRingName(path)} = __pine.makeRing(${k + 1})`)
+    }
+    // v4 裸 `tr`：按内置 OHLC 预计算整条真实波幅序列
+    if (this.wantsTr) {
+      lines.push('  const __a_tr = __pine.ta.trueRange(C.high, C.low, C.close)')
+    }
     // 顶层逐 bar 标量：声明在 __create 作用域（与 step、用户函数同级）。
     // Pine 的顶层变量本就是全局的 —— 用户函数会读到它们，若只声明在 step 内会 ReferenceError。
     for (const name of this.stepScalars) {
-      lines.push(`  let ${name} = NaN`)
+      lines.push(`  let ${this.jsVar(name)} = NaN`)
+    }
+    // 逐 bar 序列跟踪数组：让「派生序列」（如 sma(source) 中的 source）能作为
+    // 整条序列喂给 ta 的 *At 变体，而不是退化成标量。
+    for (const name of this.serTrack) {
+      lines.push(`  const __s_${name} = []`)
+    }
+    // 函数局部序列：提升为模块级状态（`__fl_<fn>_<name>`）并配环形缓冲
+    for (const [fnName, locals] of this.fnLocalSeries) {
+      for (const [local, k] of locals) {
+        lines.push(`  let ${fnLocalName(fnName, local)} = NaN`)
+        lines.push(`  const ${fnLocalRing(fnName, local)} = __pine.makeRing(${k + 1})`)
+      }
     }
     // 初始化期声明（保持源码顺序，保证「先声明后引用」）
-    for (const stmt of this.program.body) {
-      for (const l of this.emitInitStmt(stmt)) lines.push(`  ${l}`)
+    this.initPhase = true
+    try {
+      for (const stmt of this.program.body) {
+        for (const l of this.emitInitStmt(stmt)) lines.push(`  ${l}`)
+      }
+    } finally {
+      this.initPhase = false
     }
     // 元信息与图元容器
     lines.push(`  const meta = ${JSON.stringify(this.meta)}`)
@@ -334,8 +493,11 @@ class Codegen {
         this.vars.add(name)
         continue
       }
+      // `var` 状态的后续 `:=` 改写：不再重复分类（否则会同时声明 var 与逐 bar 标量）
+      if (this.vars.has(name)) continue
       if (this.isTaPrecalc(stmt.value)) {
         this.precalc.set(name, stmt.value as CallExpr)
+        this.precalcOwner.set(name, stmt)
         continue
       }
       if (!this.reassigned.has(name) && this.isCreateTime(stmt.value)) {
@@ -345,112 +507,277 @@ class Codegen {
       this.stepScalars.add(name)
     }
 
+    // 顶层元组解构：`[a, b, c] = macd(...)` 整体作为预计算元组；
+    // 其余顶层元组解构的名字与普通顶层赋值同级（用户函数会读到 → 进入 stepScalars）。
+    for (const stmt of this.program.body) {
+      if (stmt.kind !== 'tupleAssign') continue
+      const arity = this.tupleFnArity(stmt.value)
+      if (arity !== null && arity === stmt.names.length && stmt.op === '=') {
+        this.precalcTuples.push({ names: stmt.names, call: stmt.value as CallExpr })
+        for (const n of stmt.names) this.precalcTupleNames.add(n)
+        continue
+      }
+      for (const n of stmt.names) {
+        if (n !== '_' && !this.vars.has(n)) this.stepScalars.add(n)
+      }
+    }
+
+    // 顶层逐 bar 标量：仅对「会作为整条序列使用」的标量建立跟踪数组，
+    // 使派生序列可作为整体喂给 ta 的 *At 变体（避免无谓的逐 bar 记录开销）
+    this.collectSerTrack()
+
+    // 用户函数形参的历史引用（`data[n]`）→ 调用点透传序列容器
+    for (const [name, fn] of this.userFuncs) {
+      const hist = this.scanHistParams(fn)
+      if (hist.length) this.fnHistParams.set(name, hist)
+    }
+    // 用户函数局部变量的历史引用（`atr[1]`）→ 提升为模块级状态 + 环形缓冲
+    for (const [name, fn] of this.userFuncs) {
+      const locals = this.scanFnLocalSeries(fn)
+      if (locals.size) this.fnLocalSeries.set(name, locals)
+    }
+    this.wantsTr = this.detectTr()
+
     // 分类完成后再统计历史引用：此时才分得清 A 类数组 / var 状态 / C 类标量
     this.collectHistRefs(this.program.body)
     this.collectExits(this.program.body)
   }
 
-  private collectReassigned(stmts: Stmt[]): void {
-    for (const s of stmts) {
-      switch (s.kind) {
-        case 'assign':
-          if (s.op === ':=' && s.target.kind === 'ident') this.reassigned.add(s.target.name)
-          break
-        case 'if':
-          for (const br of s.branches) this.collectReassigned(br.body)
-          if (s.elseBody) this.collectReassigned(s.elseBody)
-          break
-        case 'for':
-          this.collectReassigned(s.body)
-          break
-        // while / for-in 里的 `:=` 同样要算作重赋值，否则会被误判成初始化期常量
-        case 'while':
-        case 'forIn':
-          this.collectReassigned(s.body)
-          break
-        case 'funcDecl':
-          this.collectReassigned(s.body)
-          break
-        default:
-          break
-      }
-    }
+  /** `[a, b, c] = ta.macd(...)` 这类元组型 ta 调用的元素个数；非元组调用返回 null */
+  private tupleFnArity(e: Expr): number | null {
+    if (e.kind !== 'call') return null
+    const path = this.calleePath(e.callee)
+    if (!path) return null
+    const fn = path.length === 2 && path[0] === 'ta' ? path[1] : path.length === 1 ? path[0] : null
+    if (!fn || TA_TUPLE_FNS[fn] === undefined) return null
+    if (!e.args.every((a) => this.isPureTaArg(a.value))) return null
+    return TA_TUPLE_FNS[fn]
   }
 
-  /** 记录 C 类标量的历史引用深度（内置变量与 A 类数组不需要环形缓冲） */
-  private collectHistRefs(stmts: Stmt[]): void {
-    const visitExpr = (e: Expr): void => {
-      switch (e.kind) {
-        case 'index': {
-          visitExpr(e.index)
-          if (e.object.kind === 'ident') {
-            const name = e.object.name
-            if (
-              !BUILTIN_SERIES.has(name) &&
-              !this.precalc.has(name) &&
-              !this.vars.has(name) &&
-              this.typeNames.has(name) === false
-            ) {
-              const k = e.index.kind === 'number' ? e.index.value : 1
-              this.histNeed.set(name, Math.max(this.histNeed.get(name) ?? 0, k))
-            }
-          }
-          visitExpr(e.object)
-          return
+  /** 扫描函数体，找出被 `[k]` 历史引用的形参名 */
+  private scanHistParams(fn: FuncDeclStmt): string[] {
+    const params = new Set(fn.params.map((p) => p.name))
+    const found = new Set<string>()
+    this.walkExprs(fn.body, (e) => {
+      if (e.kind === 'index' && e.object.kind === 'ident' && params.has(e.object.name)) {
+        found.add(e.object.name)
+      }
+    })
+    return [...found]
+  }
+
+  /**
+   * 扫描函数体，找出「在函数内被赋值、又被 `[k]` 引用」的局部变量 →
+   * 这些需要提升为模块级状态并配环形缓冲（Pine 的函数局部同样是序列）。
+   */
+  private scanFnLocalSeries(fn: FuncDeclStmt): Map<string, number> {
+    const params = new Set(fn.params.map((p) => p.name))
+    const assigned = new Set<string>()
+    this.walkExprs(
+      fn.body,
+      () => {},
+      (s) => {
+        if (s.kind === 'assign' && s.target.kind === 'ident' && !params.has(s.target.name)) {
+          assigned.add(s.target.name)
         }
-        case 'member':
-          visitExpr(e.object)
-          return
+        if (s.kind === 'tupleAssign' && s.op === '=') {
+          for (const n of s.names) if (!params.has(n)) assigned.add(n)
+        }
+      },
+    )
+    const out = new Map<string, number>()
+    this.walkExprs(fn.body, (e) => {
+      if (e.kind === 'index' && e.object.kind === 'ident' && assigned.has(e.object.name)) {
+        const k = e.index.kind === 'number' ? e.index.value : 1
+        out.set(e.object.name, Math.max(out.get(e.object.name) ?? 0, k))
+      }
+    })
+    return out
+  }
+
+  /**
+   * 收集需要逐 bar 记录序列的顶层标量：
+   * 出现在 ta `*At` 变体 / 交叉族 / 带历史形参的用户函数实参位置上的顶层标量。
+   */
+  private collectSerTrack(): void {
+    const atFns = new Set([...SERIES_AT_FNS, ...CROSS_FUNCS, 'atr', 'tr', 'pivothigh', 'pivotlow'])
+    this.walkExprs(this.program.body, (e) => {
+      if (e.kind !== 'call') return
+      const path = this.calleePath(e.callee)
+      if (!path) return
+      const fn = path.length === 2 && path[0] === 'ta' ? path[1] : path.length === 1 ? path[0] : null
+      if (!fn) return
+      if (!atFns.has(fn) && !this.userFuncs.has(fn)) return
+      for (const a of e.args) {
+        const name = this.seriesRefName(a.value)
+        if (name) this.serTrack.add(name)
+      }
+    })
+  }
+
+  /** 该表达式是否为「只能靠逐 bar 跟踪数组整体引用」的顶层标量（或其 `[k]` 形式） */
+  private seriesRefName(e: Expr): string | null {
+    if (e.kind === 'ident') {
+      const n = e.name
+      if (BUILTIN_SERIES.has(n) || this.precalc.has(n) || this.precalcTupleNames.has(n)) return null
+      return this.stepScalars.has(n) ? n : null
+    }
+    if (e.kind === 'index' && e.object.kind === 'ident') return this.seriesRefName(e.object)
+    return null
+  }
+
+  /** 脚本里是否引用了裸 `tr` / `ta.tr`（且没有被同名变量遮蔽） */
+  private detectTr(): boolean {
+    if (
+      this.stepScalars.has('tr') || this.precalc.has('tr') ||
+      this.createConsts.has('tr') || this.vars.has('tr')
+    ) {
+      return false
+    }
+    let used = false
+    this.walkExprs(this.program.body, (e) => {
+      if (used) return
+      if (e.kind === 'ident' && e.name === 'tr') used = true
+      else if (e.kind === 'member' && this.dottedPath(e) === 'ta.tr') used = true
+    })
+    return used
+  }
+
+  /** 递归遍历一组语句中的所有表达式（含嵌套块、函数体与 if 表达式分支） */
+  private walkExprs(
+    stmts: Stmt[],
+    visit: (e: Expr) => void,
+    onStmt?: (s: Stmt) => void,
+  ): void {
+    const go = (e: Expr): void => {
+      visit(e)
+      switch (e.kind) {
         case 'call':
-          visitExpr(e.callee)
-          for (const a of e.args) visitExpr(a.value)
+          go(e.callee)
+          for (const a of e.args) go(a.value)
+          return
+        case 'member':
+          go(e.object)
+          return
+        case 'index':
+          go(e.object)
+          go(e.index)
           return
         case 'unary':
-          visitExpr(e.operand)
+          go(e.operand)
           return
         case 'binary':
-          visitExpr(e.left)
-          visitExpr(e.right)
+          go(e.left)
+          go(e.right)
           return
         case 'ternary':
-          visitExpr(e.cond)
-          visitExpr(e.then)
-          visitExpr(e.else)
+          go(e.cond)
+          go(e.then)
+          go(e.else)
           return
         case 'array':
-          for (const it of e.items) visitExpr(it)
+          for (const it of e.items) go(it)
           return
         case 'switch':
-          visitExpr(e.subject)
-          for (const arm of e.arms) {
-            if (arm.cond) visitExpr(arm.cond)
-            visitExpr(arm.value)
+          go(e.subject)
+          for (const a of e.arms) {
+            if (a.cond) go(a.cond)
+            go(a.value)
           }
+          return
+        case 'ifExpr':
+          for (const br of e.branches) {
+            go(br.cond)
+            walk(br.body)
+          }
+          if (e.elseBody) walk(e.elseBody)
           return
         default:
           return
       }
     }
-    const visitStmts = (list: Stmt[]): void => {
+    const walk = (list: Stmt[]): void => {
       for (const s of list) {
-        if (s.kind === 'assign') {
-          visitExpr(s.target)
-          visitExpr(s.value)
-        } else if (s.kind === 'expr') visitExpr(s.expr)
-        else if (s.kind === 'if') {
-          for (const br of s.branches) {
-            visitExpr(br.cond)
-            visitStmts(br.body)
-          }
-          if (s.elseBody) visitStmts(s.elseBody)
-        } else if (s.kind === 'for') {
-          visitExpr(s.from)
-          visitExpr(s.to)
-          visitStmts(s.body)
-        } else if (s.kind === 'funcDecl') visitStmts(s.body)
+        onStmt?.(s)
+        switch (s.kind) {
+          case 'assign':
+            go(s.value)
+            if (s.target.kind === 'member' || s.target.kind === 'index') go(s.target)
+            break
+          case 'tupleAssign':
+            go(s.value)
+            break
+          case 'expr':
+            go(s.expr)
+            break
+          case 'if':
+            for (const br of s.branches) {
+              go(br.cond)
+              walk(br.body)
+            }
+            if (s.elseBody) walk(s.elseBody)
+            break
+          case 'for':
+            go(s.from)
+            go(s.to)
+            walk(s.body)
+            break
+          case 'while':
+            go(s.cond)
+            walk(s.body)
+            break
+          case 'forIn':
+            go(s.iterable)
+            walk(s.body)
+            break
+          case 'funcDecl':
+            walk(s.body)
+            break
+          default:
+            break
+        }
       }
     }
-    visitStmts(stmts)
+    walk(stmts)
+  }
+
+  /** 收集所有 `:=` 目标（须先于分类执行；含嵌套块与 if 表达式分支内的赋值） */
+  private collectReassigned(stmts: Stmt[]): void {
+    this.walkExprs(
+      stmts,
+      () => {},
+      (s) => {
+        if (s.kind === 'assign' && s.op === ':=' && s.target.kind === 'ident') {
+          this.reassigned.add(s.target.name)
+        }
+      },
+    )
+  }
+
+  /** 记录历史引用深度：C 类标量（环形缓冲）与 ctx 成员（成员环形缓冲） */
+  private collectHistRefs(stmts: Stmt[]): void {
+    this.walkExprs(stmts, (e) => {
+      if (e.kind !== 'index') return
+      const k = e.index.kind === 'number' ? e.index.value : 1
+      if (e.object.kind === 'ident') {
+        const name = e.object.name
+        if (
+          !BUILTIN_SERIES.has(name) &&
+          !this.precalc.has(name) &&
+          !this.precalcTupleNames.has(name) &&
+          !(name === 'tr' && this.wantsTr) &&
+          this.typeNames.has(name) === false
+        ) {
+          this.histNeed.set(name, Math.max(this.histNeed.get(name) ?? 0, k))
+        }
+      } else if (e.object.kind === 'member') {
+        // `strategy.position_size[1]` / `strategy.opentrades[k]`：成员环形缓冲
+        const path = this.dottedPath(e.object)
+        if (path && (path in CTX_MEMBERS || path.startsWith('strategy.'))) {
+          this.memberHist.set(path, Math.max(this.memberHist.get(path) ?? 0, k))
+        }
+      }
+    })
   }
 
   /** `strategy.exit(..., from_entry="Long", stop=…, limit=…)` → entry id → 出场价 */
@@ -486,8 +813,14 @@ class Codegen {
   private isTaPrecalc(e: Expr): boolean {
     if (e.kind !== 'call') return false
     const path = this.calleePath(e.callee)
-    if (!path || path.length !== 2 || path[0] !== 'ta') return false
-    return e.args.every((a) => this.isPureTaArg(a.value))
+    if (!path) return false
+    // v6 命名空间调用：`ta.sma(close, 20)`（保持既有行为，任何 ta.* 均按整数组预计算）
+    if (path.length === 2 && path[0] === 'ta') return e.args.every((a) => this.isPureTaArg(a.value))
+    // v4 裸名调用：仅限“返回等长数组”的 ta 函数
+    if (path.length === 1 && TA_SERIES_FNS.has(path[0])) {
+      return e.args.every((a) => this.isPureTaArg(a.value))
+    }
+    return false
   }
 
   private isPureTaArg(e: Expr): boolean {
@@ -542,9 +875,11 @@ class Codegen {
         const name = this.targetName(stmt)
         if (!name) return []
         if (stmt.isVar) {
-          return [`let ${name} = ${this.expr(stmt.value)}`]
+          return [`let ${this.jsVar(name)} = ${this.expr(stmt.value)}`]
         }
         if (this.precalc.has(name)) {
+          // 同名变量可能既有 `=` 初始化又有 `:=` 重赋值：只有注册归属的那条产出声明
+          if (this.precalcOwner.get(name) !== stmt) return []
           return [`const __a_${name} = ${this.taCall(this.precalc.get(name)!)}`]
         }
         if (this.createConsts.has(name)) {
@@ -553,9 +888,16 @@ class Codegen {
           this.currentAssignName = undefined
           // 后续还会被 `:=` 改写的话不能是 const（否则逐 bar 赋值会抛 TypeError）
           const kw = this.reassigned.has(name) ? 'let' : 'const'
-          return [`${kw} ${name} = ${code}`]
+          return [`${kw} ${this.jsVar(name)} = ${code}`]
         }
         return []
+      }
+      case 'tupleAssign': {
+        // 预计算元组：`const [__a_a, __a_b, __a_c] = __pine.ta.macd(...)`
+        const tuple = this.precalcTuples.find((t) => t.call === stmt.value)
+        if (!tuple) return []
+        const refs = stmt.names.map((n) => `__a_${n}`)
+        return [`const [${refs.join(', ')}] = ${this.taCall(tuple.call)}`]
       }
       case 'typeDecl':
         return this.typeClass(stmt)
@@ -588,18 +930,47 @@ class Codegen {
   }
 
   private userFunc(stmt: FuncDeclStmt): string[] {
-    const params = stmt.params.map((p) => p.name)
+    const params = stmt.params.map((p) => this.jsVar(p.name))
+    // 形参被 [k] 历史引用时追加隐藏参数（调用点透传整条序列容器）
+    const hist = this.fnHistParams.get(stmt.name) ?? []
+    const hidden = hist.map((p) => `__hr_${p}`)
     const body = stmt.body.slice()
     const last = body[body.length - 1]
+    // 隐式返回值：最后一条表达式；或最后一条 `if` 语句（Pine 里它就是 if 表达式）
     const implicitReturn = last && last.kind === 'expr' ? last : null
+    const implicitIf = !implicitReturn && last && last.kind === 'if' ? last : null
     const out: string[] = []
-    out.push(`function ${stmt.name}(${params.join(', ')}) {`)
-    this.pushScope(params)
+    out.push(`function ${stmt.name}(${[...params, ...hidden].join(', ')}) {`)
+    this.pushScope([...params, ...hidden])
+    const prevHist = this.histParamsInFn
+    this.histParamsInFn = new Set(hist)
+    const prevLocals = this.fnLocalCtx
+    const localSeries = this.fnLocalSeries.get(stmt.name)
+    this.fnLocalCtx = localSeries
+      ? new Map(
+          [...localSeries.keys()].map((n) => [
+            n,
+            { name: fnLocalName(stmt.name, n), ring: fnLocalRing(stmt.name, n) },
+          ]),
+        )
+      : null
     for (const s of body) {
-      if (s === implicitReturn) break
+      if (s === implicitReturn || s === implicitIf) break
       for (const l of this.emitBlockStmt(s)) out.push(`  ${l}`)
     }
     if (implicitReturn) out.push(`  return ${this.expr(implicitReturn.expr)}`)
+    if (implicitIf && implicitIf.kind === 'if') {
+      const asExpr: IfExpr = {
+        kind: 'ifExpr',
+        branches: implicitIf.branches,
+        elseBody: implicitIf.elseBody,
+        line: implicitIf.line,
+        col: implicitIf.col,
+      }
+      out.push(`  return ${this.ifExprCode(asExpr)}`)
+    }
+    this.fnLocalCtx = prevLocals
+    this.histParamsInFn = prevHist
     this.popScope()
     out.push('}')
     return out
@@ -644,7 +1015,15 @@ class Codegen {
   /* ---------------------------------------------------------------- */
 
   private stepPrologue(): string[] {
-    const out: string[] = []
+    const out: string[] = ['__ctx = ctx']
+    // 历史序列在第 i 根 bar **开始时**推入当根值：
+    //   ring[0] = 当前 bar，ring[k] = 前第 k 根；第 0 根时 `[1]` 自然为 na（无上一根）。
+    for (const path of this.memberHist.keys()) {
+      out.push(`__pine.push(__hm_${memberRingName(path)}, ${this.memberValueOf(path)})`)
+    }
+    for (const name of this.histNeed.keys()) {
+      if (this.vars.has(name)) out.push(`__pine.push(__h_${name}, ${this.jsVar(name)})`)
+    }
     if (this.meta.kind === 'strategy') {
       out.push('let __entryDir = null')
       out.push('let __exitStop = NaN')
@@ -660,8 +1039,10 @@ class Codegen {
   }
 
   private stepEpilogue(): string[] {
+    const pushes: string[] = []
     if (this.meta.kind === 'strategy') {
       return [
+        ...pushes,
         'const __obStop = __exitStop',
         'const __obTp = __exitLimit',
         'return {',
@@ -679,6 +1060,7 @@ class Codegen {
       ]
     }
     return [
+      ...pushes,
       'return {',
       '  imbaTrendLine: NaN,',
       '  tsotTrendValue: NaN,',
@@ -734,7 +1116,9 @@ class Codegen {
       case 'expr': {
         const code = this.exprStatement(stmt.expr)
         if (!code) return []
-        return [`${pad}${code}`]
+        // 前置分号：表达式以 `(` / `[` 开头时，避免与上一行发生 ASI 粘连
+        // （如 `let x = 3` 后跟 `(a + b)` 会被解析成 `3(a + b)`）
+        return [`${pad};${code}`]
       }
       case 'if':
         return this.ifCode(stmt, depth)
@@ -760,20 +1144,29 @@ class Codegen {
     if (stmt.target.kind === 'ident') {
       const name = stmt.target.name
       if (name === '_') return null
+      // 函数局部序列（提升为模块级状态 + 环形缓冲）
+      const hoisted = this.fnLocalCtx?.get(name)
+      if (hoisted) {
+        return `${hoisted.name} = ${rhs}; __pine.push(${hoisted.ring}, ${hoisted.name})`
+      }
+      const js = this.jsVar(name)
       const lines: string[] = []
       if (stmt.op === '=') {
         if (this.stepScalars.has(name)) {
           // 顶层逐 bar 标量已在 __create 作用域声明，这里只做赋值
-          lines.push(`${name} = ${rhs}`)
+          lines.push(`${js} = ${rhs}`)
         } else {
-          lines.push(`let ${name} = ${rhs}`)
+          lines.push(`let ${js} = ${rhs}`)
           this.declareLocal(name)
         }
       } else {
-        lines.push(`${name} = ${rhs}`)
+        lines.push(`${js} = ${rhs}`)
       }
-      if (this.histNeed.has(name)) {
-        lines.push(`__pine.push(__h_${name}, ${name})`)
+      if (this.histNeed.has(name) && !this.vars.has(name)) {
+        lines.push(`__pine.push(__h_${name}, ${js})`)
+      }
+      if (this.serTrack.has(name)) {
+        lines.push(`__pine.serSet(__s_${name}, __index, ${js})`)
       }
       return lines.join('; ')
     }
@@ -783,18 +1176,38 @@ class Codegen {
 
   /**
    * 元组解构：`[a, b] = f()` → 先取一次返回值再按位置落到各个名字。
-   * `=` 形式按 Pine 语义就地引入新名字（块级 let），`:=` 形式写给已存在的名字。
+   * `=` 形式按 Pine 语义就地引入新名字；顶层（depth 0）的名字与普通顶层赋值同级，
+   * 已在 `__create` 作用域声明（用户函数可见），这里只做赋值 + 序列跟踪。
+   * `:=` 形式写给已存在的名字。
    */
   private tupleAssignCode(stmt: TupleAssignStmt, depth: number): string[] {
+    // 预计算元组（`[a, b, c] = macd(...)`）已在初始化期整体算好
+    if (stmt.names.every((n) => this.precalcTupleNames.has(n))) return []
     const pad = '  '.repeat(depth)
     const tmp = `__tup${this.tupleSeq++}`
     const out: string[] = [`${pad}const ${tmp} = ${this.expr(stmt.value)}`]
     stmt.names.forEach((name, i) => {
-      if (stmt.op === '=') {
-        out.push(`${pad}let ${name} = ${tmp}[${i}]`)
-        this.declareLocal(name)
+      if (name === '_') return
+      const hoistedLocal = this.fnLocalCtx?.get(name)
+      if (hoistedLocal) {
+        out.push(`${pad}${hoistedLocal.name} = ${tmp}[${i}]`)
+        out.push(`${pad}__pine.push(${hoistedLocal.ring}, ${hoistedLocal.name})`)
+        return
+      }
+      const js = this.jsVar(name)
+      if (stmt.op !== '=') {
+        out.push(`${pad}${js} = ${tmp}[${i}]`)
+      } else if (depth === 0 && this.stepScalars.has(name)) {
+        out.push(`${pad}${js} = ${tmp}[${i}]`)
       } else {
-        out.push(`${pad}${name} = ${tmp}[${i}]`)
+        out.push(`${pad}let ${js} = ${tmp}[${i}]`)
+        this.declareLocal(name)
+      }
+      if (this.histNeed.has(name) && !this.vars.has(name)) {
+        out.push(`${pad}__pine.push(__h_${name}, ${js})`)
+      }
+      if (this.serTrack.has(name)) {
+        out.push(`${pad}__pine.serSet(__s_${name}, __index, ${js})`)
       }
     })
     return out
@@ -976,10 +1389,25 @@ class Codegen {
     const direction = dir === 'short' ? 'short' : 'long'
     // 关键：entry 当根 `strategy.exit` 所在的 if 分支不会执行，
     // 必须在 entry 处把止损 / 止盈快照下来，引擎才拿得到 obStopLoss / obTakeProfit。
+    // 但 exit 的表达式可能引用 entry 处不可见的局部变量（如 if 块内的 entryPrice），
+    // 此时按「尽力而为」处理：跳过内联（用 na），由 exit 分支自己执行时赋值。
     const exits = id ? this.exitMap.get(id) : undefined
-    const stop = exits?.stop ? this.expr(exits.stop) : 'NaN'
-    const limit = exits?.limit ? this.expr(exits.limit) : 'NaN'
-    return `__entryDir = '${direction}'; __exitStop = ${stop}; __exitLimit = ${limit}`
+    const stop = exits?.stop ? this.tryInline(exits.stop) : null
+    const limit = exits?.limit ? this.tryInline(exits.limit) : null
+    return `__entryDir = '${direction}'; __exitStop = ${stop ?? 'NaN'}; __exitLimit = ${limit ?? 'NaN'}`
+  }
+
+  /**
+   * 在「当前作用域之外」的位置尽力求值一段表达式：
+   * 若产生新的 error 诊断（引用了不可见的名字），回滚诊断并返回 null。
+   */
+  private tryInline(e: Expr): string | null {
+    const before = this.diags.length
+    const code = this.expr(e)
+    const added = this.diags.splice(before)
+    if (added.some((d) => d.severity === 'error')) return null
+    this.diags.push(...added)
+    return code
   }
 
   private exitStatement(call: CallExpr): string {
@@ -1036,9 +1464,16 @@ class Codegen {
         }
         return out
       }
+      case 'ifExpr':
+        return this.ifExprCode(e)
       default:
         return 'NaN'
     }
+  }
+
+  /** 用户变量名 → 合法 JS 名（保留字加前缀） */
+  private jsVar(name: string): string {
+    return JS_RESERVED.has(name) ? `__v_${name}` : name
   }
 
   private ident(name: string, node: Expr): string {
@@ -1067,13 +1502,39 @@ class Codegen {
         return '(n - 1)'
       case 'last_bar_time':
         return 'C.timestamp[n - 1]'
+      // `timenow`：回测以最后一根 bar 的时间近似
+      case 'timenow':
+        return 'C.timestamp[n - 1]'
+      // v4 遗留：time_close / time_tradingday 以开盘时间近似（无逐 bar 收盘时间）
+      case 'time_close':
+      case 'time_tradingday':
+        return 'C.timestamp[__index]'
+      // v4 遗留：hlcc4 = (high + low + close * 2) / 4
+      case 'hlcc4':
+        return '((C.high[__index] + C.low[__index] + C.close[__index] * 2) / 4)'
       default:
         break
     }
-    if (this.precalc.has(name)) return `__a_${name}[__index]`
-    if (this.vars.has(name) || this.createConsts.has(name) || this.stepScalars.has(name)) return name
+    if (this.precalc.has(name) || this.precalcTupleNames.has(name)) return `__a_${name}[__index]`
+    // 函数局部序列（已提升为模块级状态）：局部遮蔽同名全局
+    const hoisted = this.fnLocalCtx?.get(name)
+    if (hoisted) return hoisted.name
+    if (this.vars.has(name) || this.createConsts.has(name) || this.stepScalars.has(name)) {
+      return this.jsVar(name)
+    }
     if (this.userFuncs.has(name) || this.typeNames.has(name)) return name
-    if (this.isLocal(name)) return name
+    if (this.isLocal(name)) return this.jsVar(name)
+    // v4 裸 `tr`：整条真实波幅序列在当前 bar 的值
+    if (name === 'tr' && this.wantsTr) return '__a_tr[__index]'
+    // v3/v4 遗留：裸周期字符串（未被子用户声明遮蔽时）
+    if (name === 'period' || name === 'resolution') return '__pine.timeframe.period'
+    // v5 变化：裸 `year` / `month` / `hour` … 取当前 bar 的时间分量
+    if (TIME_PART_FNS.has(name)) return `__pine.timePart(${JSON.stringify(name)}, C.timestamp[__index])`
+    if (name === 'dayofweek') return `__pine.dayofweek(C.timestamp[__index])`
+    // v3/v4 遗留：裸标的 id
+    if (name === 'tickerid' || name === 'ticker') return "''"
+    // v3/v4 裸颜色常量（`plot(close, color=lime)`）
+    if (BARE_COLORS.has(name)) return `__pine.color.${name}`
     this.diags.push({
       line: node.line,
       column: node.col,
@@ -1086,8 +1547,31 @@ class Codegen {
   private member(e: MemberExpr): string {
     const path = this.dottedPath(e)
     if (path) {
-      if (path in CTX_MEMBERS) return CTX_MEMBERS[path]
+      if (path in CTX_MEMBERS) {
+        if (CTX_MEMBERS[path] === 'NaN') {
+          this.warn(`回测引擎不提供的策略成员 "${path}" 已按 na 降级`, e)
+        }
+        return CTX_MEMBERS[path]
+      }
+      // 其余 `strategy.*` 成员（如 strategy.closedtrades.entry_price）：一律按 na 降级
+      if (path.startsWith('strategy.')) {
+        this.warn(`回测引擎不支持的策略成员 "${path}" 已按 na 降级`, e)
+        return 'NaN'
+      }
       if (path in CONST_MEMBERS) return CONST_MEMBERS[path]
+      // v5 `dayofweek.friday` 等枚举
+      if (path.startsWith('dayofweek.') && DAYOFWEEK_MEMBERS[e.property] !== undefined) {
+        return String(DAYOFWEEK_MEMBERS[e.property])
+      }
+      // `text.format_bold` / `text.style_*` 等绘图枚举：按 0 占位
+      if (isTextEnumMember(path)) return '0'
+      // v4 裸 `tr` 的命名空间写法：`ta.tr`
+      if (path === 'ta.tr' && this.wantsTr) return '__a_tr[__index]'
+      // 图表可见区间：回测里就是全部 K 线的首尾
+      if (path === 'chart.left_visible_bar_time') return 'C.timestamp[0]'
+      if (path === 'chart.right_visible_bar_time') return 'C.timestamp[n - 1]'
+      // `chart.point.*`：绘图坐标对象（回测不消费，给个同形状占位）
+      if (path.startsWith('chart.point.')) return `({ __pt: ${JSON.stringify(path)} })`
       if (path === 'session.isfirstbar') return '(__index === 0)'
       if (path === 'session.islastbar') return '(__index === n - 1)'
       if (path === 'syminfo.mintick') return '__pine.ctx.mintick'
@@ -1123,15 +1607,28 @@ class Codegen {
   private index(e: IndexExpr): string {
     const base = e.object
     const k = this.expr(e.index)
-    if (base.kind === 'ident') {
-      const name = base.name
-      if (BUILTIN_SERIES.has(name)) return `__pine.at(${this.seriesArrayOf(name)}, __index, ${k})`
-      if (this.precalc.has(name)) return `__pine.at(__a_${name}, __index, ${k})`
-      if (this.histNeed.has(name)) return `__pine.hist(__h_${name}, ${k})`
+    if (base.kind === 'ident' || base.kind === 'index' || base.kind === 'call') {
+      if (base.kind === 'ident') {
+        const name = base.name
+        // 用户函数形参的历史引用：容器由调用点透传（形参遮蔽同名全局）
+        if (this.histParamsInFn?.has(name)) return `__pine.histOf(__hr_${name}, __index, ${k})`
+        // 函数局部序列：提升后的环形缓冲
+        const hoisted = this.fnLocalCtx?.get(name)
+        if (hoisted) return `__pine.hist(${hoisted.ring}, ${k})`
+        // 逐 bar 标量的环形缓冲（不能被跟踪数组替代：条件赋值时环形缓冲更保守）
+        if (this.histNeed.has(name)) return `__pine.hist(__h_${name}, ${k})`
+      }
+      // 内置序列 / 预计算数组 / 跟踪标量 / 嵌套 ta 调用：整条数组 + 下标回看
+      const ref = this.seriesRef(base)
+      if (ref) {
+        const idx = ref.offset === 0 ? '__index' : `(__index - ${ref.offset})`
+        return `__pine.at(${ref.arr}, ${idx}, ${k})`
+      }
     }
     if (base.kind === 'member') {
       const path = this.dottedPath(base)
-      if (path === 'strategy.position_size') return `(__index === 0 ? 0 : ctx.prevPositionSize)`
+      if (path && this.memberHist.has(path)) return `__pine.hist(__hm_${memberRingName(path)}, ${k})`
+      if (path === 'ta.tr' && this.wantsTr) return `__pine.at(__a_tr, __index, ${k})`
     }
     this.diags.push({
       line: e.line,
@@ -1145,6 +1642,8 @@ class Codegen {
   private seriesArrayOf(name: string): string {
     switch (name) {
       case 'time':
+      case 'time_close':
+      case 'time_tradingday':
         return 'C.timestamp'
       case 'hl2':
       case 'hlc3':
@@ -1153,6 +1652,37 @@ class Codegen {
       default:
         return `C.${name}`
     }
+  }
+
+  private ifExprCode(e: IfExpr): string {
+    const parts: string[] = ['(() => {']
+    e.branches.forEach((br, i) => {
+      parts.push(`${i === 0 ? 'if' : 'else if'} (${this.expr(br.cond)}) {`)
+      parts.push(this.branchReturn(br.body, e))
+      parts.push('}')
+    })
+    parts.push('else {')
+    parts.push(e.elseBody ? this.branchReturn(e.elseBody, e) : 'return NaN;')
+    parts.push('}')
+    parts.push('})()')
+    return parts.join(' ')
+  }
+
+  /** if 表达式分支块：前面的语句照常生成，最后一条表达式作为返回值 */
+  private branchReturn(body: Stmt[], node: IfExpr): string {
+    const lines: string[] = []
+    this.pushScope()
+    const last = body[body.length - 1]
+    const value = last && last.kind === 'expr' ? last : null
+    if (!value) this.warn('if 表达式分支的最后一条语句不是表达式，已按 na 处理', node)
+    for (const s of body) {
+      if (s === value) break
+      // 同一行内拼接，必须显式补分号（ASI 不生效）
+      for (const l of this.emitBlockStmt(s, 1)) lines.push(`${l};`)
+    }
+    lines.push(`  return ${value ? this.expr(value.expr) : 'NaN'};`)
+    this.popScope()
+    return lines.join(' ')
   }
 
   private binary(op: string, l: string, r: string): string {
@@ -1193,10 +1723,31 @@ class Codegen {
     const name = path ? path.join('.') : ''
 
     if (name === 'nz') return this.nzCall(e)
+    // v3 `time(resolution)` / v5 `dayofweek(time[, tz])` 等时间函数
+    if (path && path.length === 1 && path[0] === 'time') return 'C.timestamp[__index]'
+    if (path && path.length === 1 && path[0] === 'dayofweek') {
+      const args = this.positionalArgs(e).map((a) => this.expr(a.value))
+      return `__pine.dayofweek(${args.join(', ')})`
+    }
+    // v5 `year(time)` / `month(time)` / `hour(time)` …（缺省取当前 bar 时间）
+    if (path && path.length === 1 && TIME_PART_FNS.has(path[0])) {
+      const args = this.positionalArgs(e).map((a) => this.expr(a.value))
+      const src = args.length ? args.join(', ') : 'C.timestamp[__index]'
+      return `__pine.timePart(${JSON.stringify(path[0])}, ${src})`
+    }
+    // 绘图语句作为值使用（`p = hline(...)` / `f = fill(...)`）：na 占位
+    if (path && path.length === 1 && (path[0] === 'hline' || path[0] === 'fill' || path[0] === 'bgcolor')) {
+      return 'NaN'
+    }
     // 类型转换：float(x) / int(x) / bool(x) / string(x) / color(x)
     if (path && path.length === 1 && CAST_FNS.has(path[0])) {
       return `__pine.cast.${path[0]}(${e.args[0] ? this.expr(e.args[0].value) : 'NaN'})`
     }
+    // 交叉族（v6 `ta.crossover` 与 v4 裸 `crossover` 共用）：需要整条序列才能判定穿越
+    if (path && path.length === 2 && path[0] === 'ta' && CROSS_FUNCS.has(path[1])) {
+      return this.crossCall(e, path[1])
+    }
+    if (path && path.length === 1 && CROSS_FUNCS.has(path[0])) return this.crossCall(e, path[0])
     if (path && path[0] === 'ta') return this.taCall(e)
     if (path && path[0] === 'math') return this.mathCall(e)
     if (path && path[0] === 'str') return this.strCall(e)
@@ -1206,6 +1757,15 @@ class Codegen {
     if (path && path[0] === 'array' && path[1]) {
       const fn = LEGACY_ARRAY_CTORS[path[1]] ?? path[1]
       return `__pine.array.${fn}(${this.callArgs(e).join(', ')})`
+    }
+    // matrix.* ：运行时实现常见矩阵运算（回测用不到的重型算子按 na 降级）
+    if (path && path[0] === 'matrix' && path[1]) {
+      return `__pine.matrix.${path[1]}(${this.callArgs(e).join(', ')})`
+    }
+    // `chart.point.from_time/from_index/new(...)`：绘图坐标对象（回测不消费）
+    if (path && path[0] === 'chart' && path[1] === 'point') {
+      const args = e.args.map((a) => this.expr(a.value)).join(', ')
+      return `({ __pt: ${JSON.stringify(path.join('.'))}, args: [${args}] })`
     }
     // 绘图命名空间（line / table / polyline / linefill / box / label）：执行但不出图
     if (path && DRAWING_NS.has(path[0])) {
@@ -1221,10 +1781,13 @@ class Codegen {
     if (path && path[0] === 'request' && path[1] === 'currency_rate') return '1'
     if (path && path[0] === 'timeframe' && path[1] === 'in_seconds') return '__pine.timeframe.in_seconds()'
 
-    // 用户函数 / 方法调用
+    // 用户函数 / 方法调用（形参含 [k] 历史引用时追加隐藏的序列容器实参）
     if (path && path.length === 1 && this.userFuncs.has(path[0])) {
       const fn = this.userFuncs.get(path[0])!
-      return `${path[0]}(${this.namedToPositional(e, fn.params.map((p) => p.name))})`
+      const params = fn.params.map((p) => p.name)
+      const args = this.namedToPositional(e, params)
+      const hidden = this.hiddenHistArgs(e, params, path[0])
+      return `${path[0]}(${[args, ...hidden].filter(Boolean).join(', ')})`
     }
 
     // `Type.new(...)` → `new Type(...)`
@@ -1244,6 +1807,31 @@ class Codegen {
     if (path && path.length === 1 && path[0] === 'plotshape') return this.plotshapeStatement(e)
     if (path && path.length === 1 && path[0] === 'barcolor') return this.barcolorStatement(e)
 
+    // ---- v4 兼容层：裸内置函数（无命名空间前缀，运行时提供同名实现） ----
+    if (path && path.length === 1) {
+      const bare = path[0]
+      if (bare === 'security') return this.securityCall(e)
+      if (bare === 'timestamp') return this.timestampCall(e)
+      // v3/v4 的 Heikin-Ashi 数据包装：单标的回测下等价于原标的
+      if (bare === 'heikinashi' || bare === 'heikenashi') {
+        const first = this.positionalArgs(e)[0]
+        return first ? this.expr(first.value) : "''"
+      }
+      if (V4_TA_FUNCS.has(bare)) return this.taCall(e)
+      if (V4_MATH_FUNCS.has(bare)) return this.mathCall(e)
+      if (V4_STR_FUNCS.has(bare)) return this.strCall(e)
+    }
+    // `request.security(...)` 与 v4 `security()` 同口径降级
+    if (path && path.length === 2 && path[0] === 'request' && path[1] === 'security') {
+      return this.securityCall(e)
+    }
+    // v4 `macd(...)` / v6 `ta.macd(...)` 作为值（非元组解构）时返回元组数组
+    if (path && TA_TUPLE_FNS[path[path.length - 1]] && (path.length === 1 || path[0] === 'ta')) {
+      const fn = path[path.length - 1]
+      const args = this.positionalArgs(e).map((a) => this.taArg(a.value)).join(', ')
+      return `__pine.ta.${fn}(${args})`
+    }
+
     // 其余未知调用：直译
     const callee = e.callee.kind === 'member' ? this.member(e.callee) : this.expr(e.callee)
     return `${callee}(${this.callArgs(e).join(', ')})`
@@ -1254,29 +1842,242 @@ class Codegen {
     return `__pine.nz(${args.join(', ')})`
   }
 
-  /** A 类数组：`ta.atr(atrLen)` → `__pine.ta.atr(C.high, C.low, C.close, atrLen, 'RMA')` */
+  /** ta 调用：初始化期按整条数组求值；`step` 内优先用 `*At` 变体取当前 bar 标量 */
   private taCall(e: CallExpr): string {
     const path = this.calleePath(e.callee)!
     const fn = path[1] ?? path[0]
+    if (!this.initPhase) {
+      const at = this.taAtCall(e, fn)
+      if (at) return at
+    }
+    return this.taArrayCall(e, fn)
+  }
+
+  /** ta 调用的「整条数组」形式（初始化期 / 作为其它 ta 函数的序列实参时使用） */
+  private taArrayCall(e: CallExpr, fn?: string): string {
+    const name = fn ?? this.calleePath(e.callee)![1] ?? this.calleePath(e.callee)![0]
     const args = this.positionalArgs(e).map((a) => this.taArg(a.value))
-    if (fn === 'atr') {
+    if (name === 'atr') {
       if (args.length === 1) return `__pine.ta.atr(C.high, C.low, C.close, ${args[0]}, 'RMA')`
       if (args.length === 3) return `__pine.ta.atr(${args[0]}, ${args[1]}, ${args[2]}, 14, 'RMA')`
       return `__pine.ta.atr(${args.join(', ')})`
     }
-    if (fn === 'tr') {
-      if (args.length === 0) return '__pine.ta.trueRange(C.high, C.low, C.close)'
-      return `__pine.ta.trueRange(${args.join(', ')})`
+    if (name === 'supertrend') {
+      // `ta.supertrend(factor, atrPeriod)`：源序列固定为内置 OHLC（hl2 在实现内取）
+      if (args.length === 2) {
+        return `__pine.ta.supertrend(C.high, C.low, C.close, ${args[0]}, ${args[1]})`
+      }
+      return `__pine.ta.supertrend(C.high, C.low, C.close, ${args[args.length - 2]}, ${args[args.length - 1]})`
+    }
+    if (name === 'sar') {
+      // `ta.sar(start, inc, max)`：高低价固定为内置序列
+      return `__pine.ta.sar(C.high, C.low, ${args.join(', ')})`
+    }
+    if (name === 'dmi') {
+      // `ta.dmi(diLength, adxSmoothing)`：OHLC 固定为内置序列
+      return `__pine.ta.dmi(C.high, C.low, C.close, ${args.join(', ')})`
+    }
+    if (name === 'mfi') {
+      // `ta.mfi(series, length)`：OHLCV 固定为内置序列，series 仅占位
+      return `__pine.ta.mfi(C.high, C.low, C.close, C.volume, ${args[args.length - 1]})`
+    }
+    if (name === 'valuewhen') {
+      // Pine 顺序 `(condition, source, occurrence)` → 运行时的 `(src, cond, occ)`
+      return `__pine.ta.valuewhen(${args[1] ?? 'NaN'}, ${args[0] ?? 'NaN'}, ${args[2] ?? '0'})`
+    }
+    if (name === 'tr') {
+      if (args.length >= 3) return `__pine.ta.trueRange(${args.slice(0, 3).join(', ')})`
+      return '__pine.ta.trueRange(C.high, C.low, C.close)'
     }
     // `ta.pivothigh(leftbars, rightbars)` 两参形式默认以 high / low 为源
-    if (fn === 'pivothigh' || fn === 'pivotlow') {
+    if (name === 'pivothigh' || name === 'pivotlow') {
       if (args.length === 2) {
-        const src = fn === 'pivothigh' ? 'C.high' : 'C.low'
-        return `__pine.ta.${fn}(${src}, ${args[0]}, ${args[1]})`
+        const src = name === 'pivothigh' ? 'C.high' : 'C.low'
+        return `__pine.ta.${name}(${src}, ${args[0]}, ${args[1]})`
       }
+      return `__pine.ta.${name}(${args.join(', ')})`
+    }
+    return `__pine.ta.${name}(${args.join(', ')})`
+  }
+
+  /**
+   * `step` 内的 ta 调用：把序列实参解析成整条数组，用 `*At` 变体取当前 bar 值。
+   * 返回 null 表示无法映射（调用方回退到整数组形式）。
+   */
+  private taAtCall(e: CallExpr, fn: string): string | null {
+    const pos = this.positionalArgs(e)
+    if (fn === 'atr') {
+      // v4 `atr(len)` / v6 `ta.atr(len)`：以内置 OHLC 为源
+      if (pos.length <= 1) {
+        const len = pos[0] ? this.expr(pos[0].value) : '14'
+        return `__pine.ta.atrAt(C.high, C.low, C.close, __index, ${len}, 'RMA')`
+      }
+      // v6 `ta.atr(high, low, close, len)`
+      if (pos.length >= 4) {
+        const hs = this.seriesRef(pos[0].value)
+        const ls = this.seriesRef(pos[1].value)
+        const cs = this.seriesRef(pos[2].value)
+        if (hs && ls && cs) {
+          return `__pine.ta.atrAt(${hs.arr}, ${ls.arr}, ${cs.arr}, __index, ${this.expr(pos[3].value)}, 'RMA')`
+        }
+      }
+      return null
+    }
+    if (fn === 'tr') return '__pine.ta.trAt(C.high, C.low, C.close, __index)'
+    // 源序列固定为内置 OHLC(V)：直接走整数组形式（结果再按下标取）
+    if (TA_OHLC_FNS.has(fn)) {
+      const extra = pos.map((p) => this.expr(p.value))
+      return `__pine.ta.${fn}At(C.high, C.low, C.close, __index, ${extra.join(', ')})`
+    }
+    // `ta.sar(start, inc, max)`：高低价固定为内置序列
+    if (fn === 'sar') {
+      if (pos.length < 3) return null
+      const a = pos.map((p) => this.expr(p.value))
+      return `__pine.ta.sarAt(C.high, C.low, __index, ${a[0]}, ${a[1]}, ${a[2]})`
+    }
+    // `ta.valuewhen(condition, source, occurrence)` → `valuewhenAt(src, i, cond, occ)`
+    if (fn === 'valuewhen') {
+      const condRef = pos[0] ? this.seriesRef(pos[0].value) : null
+      const srcRef = pos[1] ? this.seriesRef(pos[1].value) : null
+      if (condRef && srcRef && condRef.offset === 0 && srcRef.offset === 0) {
+        const occ = pos[2] ? this.expr(pos[2].value) : '0'
+        return `__pine.ta.valuewhenAt(${srcRef.arr}, __index, ${condRef.arr}, ${occ})`
+      }
+      return null
+    }
+    // v3/v4 `stoch(series, high, low, length)`：三个序列实参
+    if (fn === 'stoch') {
+      const srcRef = pos[0] ? this.seriesRef(pos[0].value) : null
+      const hiRef = pos[1] ? this.seriesRef(pos[1].value) : null
+      const loRef = pos[2] ? this.seriesRef(pos[2].value) : null
+      if (srcRef && hiRef && loRef && pos[3]) {
+        return `__pine.ta.stochAt(${srcRef.arr}, __index, ${hiRef.arr}, ${loRef.arr}, ${this.expr(pos[3].value)})`
+      }
+      return null
+    }
+    if (fn === 'pivothigh' || fn === 'pivotlow') {
+      const two = pos.length === 2
+      const srcRef = two
+        ? fn === 'pivothigh' ? 'C.high' : 'C.low'
+        : pos[0]
+          ? this.seriesRef(pos[0].value)?.arr ?? null
+          : null
+      const left = pos[two ? 0 : 1]
+      const right = pos[two ? 1 : 2]
+      if (srcRef && left && right) {
+        return `__pine.ta.${fn}At(${srcRef}, __index, ${this.expr(left.value)}, ${this.expr(right.value)})`
+      }
+      return null
+    }
+    if (!SERIES_AT_FNS.has(fn)) return null
+    const first = pos[0] ? this.seriesRef(pos[0].value) : null
+    if (!first) return null
+    const idx = first.offset === 0 ? '__index' : `(__index - ${first.offset})`
+    const rest = pos.slice(1).map((a) => this.expr(a.value))
+    const tail = rest.length ? `, ${rest.join(', ')}` : ''
+    return `__pine.ta.${fn}At(${first.arr}, ${idx}${tail})`
+  }
+
+  /**
+   * 交叉族：`crossover(a, b)` 需要 a / b 各自的整条序列与偏移才能判定穿越。
+   * 参数无法映射为序列时退化为当前 bar 的数值比较（并给出一次警告）。
+   */
+  private crossCall(e: CallExpr, fn: string): string {
+    const pos = this.positionalArgs(e)
+    if (this.initPhase) {
+      const args = pos.map((a) => this.taArg(a.value))
       return `__pine.ta.${fn}(${args.join(', ')})`
     }
-    return `__pine.ta.${fn}(${args.join(', ')})`
+    const ra = pos[0] ? this.seriesRef(pos[0].value) : null
+    const rb = pos[1] ? this.seriesRef(pos[1].value) : null
+    if (ra && rb) {
+      return `__pine.ta.${fn}At(${ra.arr}, ${rb.arr}, __index, ${ra.offset}, ${rb.offset})`
+    }
+    const a = pos[0] ? this.expr(pos[0].value) : 'NaN'
+    const b = pos[1] ? this.expr(pos[1].value) : 'NaN'
+    this.warn(`${fn}() 的参数无法映射为序列，已按当前 bar 的数值比较近似`, e)
+    if (fn === 'crossover') return `__pine.gt(${a}, ${b})`
+    if (fn === 'crossunder') return `__pine.lt(${a}, ${b})`
+    return `(__pine.gt(${a}, ${b}) || __pine.lt(${a}, ${b}))`
+  }
+
+  /** v4 `security()` / `request.security()`：多标的取值未实现，降级为「取当前序列」 */
+  private securityCall(e: CallExpr): string {
+    const pos = this.positionalArgs(e)
+    const src = pos[2] ?? pos[1]
+    this.warn('security()/request.security() 已降级为当前序列取值（忽略 symbol 与 timeframe 参数）', e)
+    return src ? this.expr(src.value) : 'NaN'
+  }
+
+  /** Pine 的 `timestamp()`：v4 位置参数形式与字符串形式均交由运行时处理 */
+  private timestampCall(e: CallExpr): string {
+    const args = this.positionalArgs(e).map((a) => this.expr(a.value))
+    return `__pine.timestamp(${args.join(', ')})`
+  }
+
+  /** 用户函数的隐藏历史参数实参：按调用点实参解析出的序列容器 */
+  private hiddenHistArgs(e: CallExpr, params: string[], fnName: string): string[] {
+    const hist = this.fnHistParams.get(fnName)
+    if (!hist || hist.length === 0) return []
+    const m = this.normalizeArgs(e, params)
+    return hist.map((p) => {
+      const arg = m.get(p)
+      const ref = arg ? this.seriesRef(arg) : null
+      if (ref && ref.offset === 0) return ref.arr
+      this.warn(
+        `函数 "${fnName}" 的形参 "${p}" 使用了 [k] 历史引用，但调用点实参无法映射为序列，已按 na 处理`,
+        e,
+      )
+      return 'null'
+    })
+  }
+
+  /**
+   * 把表达式解析成「整条序列数组 + 偏移」引用：
+   * 内置序列 / 预计算数组 / 预计算元组元素 / 逐 bar 跟踪标量，以及它们的 `[k]` 形式。
+   */
+  private seriesRef(e: Expr): { arr: string; offset: number } | null {
+    if (e.kind === 'ident') {
+      const n = e.name
+      if (BUILTIN_SERIES.has(n)) return { arr: this.seriesArrayOf(n), offset: 0 }
+      if (this.precalc.has(n) || this.precalcTupleNames.has(n)) return { arr: `__a_${n}`, offset: 0 }
+      if (n === 'tr' && this.wantsTr) return { arr: '__a_tr', offset: 0 }
+      if (this.serTrack.has(n)) return { arr: `__s_${n}`, offset: 0 }
+      return null
+    }
+    if (e.kind === 'index') {
+      // 形如 `x[1]` / `ta.change(x)[1]` / `x[1][2]`：偏移可叠加
+      const k = e.index.kind === 'number' ? e.index.value : null
+      if (k === null || !Number.isInteger(k) || k < 0) return null
+      const base = this.seriesRef(e.object)
+      return base ? { arr: base.arr, offset: base.offset + k } : null
+    }
+    // 嵌套的 ta 调用：整体按整条数组引用（偏移 0）
+    if (e.kind === 'call') {
+      const path = this.calleePath(e.callee)
+      const fn = path
+        ? path.length === 2 && path[0] === 'ta'
+          ? path[1]
+          : path.length === 1
+            ? path[0]
+            : null
+        : null
+      if (fn && TA_SERIES_FNS.has(fn)) return { arr: this.taArrayCall(e, fn), offset: 0 }
+      return null
+    }
+    return null
+  }
+
+  /** 同一类警告每个编译单元只报一次 */
+  private warn(message: string, node: { line: number; col: number }): void {
+    if (this.warned.has(message)) return
+    this.warned.add(message)
+    this.diags.push({ line: node.line, column: node.col, severity: 'warning', message })
+  }
+
+  /** ctx 成员的取值表达式（未知的 `strategy.*` 成员一律按 na 降级） */
+  private memberValueOf(path: string): string {
+    return CTX_MEMBERS[path] ?? 'NaN'
   }
 
   /**
@@ -1287,13 +2088,27 @@ class Codegen {
     if (e.kind === 'ident') {
       if (BUILTIN_SERIES.has(e.name)) return this.seriesArrayOf(e.name)
       if (this.precalc.has(e.name)) return `__a_${e.name}`
+      // 逐 bar 标量：整条跟踪数组（供派生序列参与窗口函数计算）
+      if (this.serTrack.has(e.name)) return `__s_${e.name}`
+    }
+    // 嵌套的 ta 调用（如 `sma(stoch(close, high, low, len), k)`）：必须按整条数组求值
+    if (e.kind === 'call') {
+      const path = this.calleePath(e.callee)
+      const fn = path
+        ? path.length === 2 && path[0] === 'ta'
+          ? path[1]
+          : path.length === 1
+            ? path[0]
+            : null
+        : null
+      if (fn && TA_SERIES_FNS.has(fn)) return this.taArrayCall(e, fn)
     }
     return this.expr(e)
   }
 
   private mathCall(e: CallExpr): string {
     const path = this.calleePath(e.callee)!
-    const fn = path[1] ?? ''
+    const fn = path[1] ?? path[0]
     const args = this.positionalArgs(e).map((a) => this.expr(a.value))
     const direct = new Set(['abs', 'max', 'min', 'round', 'floor', 'ceil', 'pow', 'sqrt', 'sign', 'log', 'log10', 'exp'])
     if (direct.has(fn)) {
@@ -1305,7 +2120,7 @@ class Codegen {
 
   private strCall(e: CallExpr): string {
     const path = this.calleePath(e.callee)!
-    const fn = path[1] ?? ''
+    const fn = path[1] ?? path[0]
     const args = this.positionalArgs(e).map((a) => this.expr(a.value))
     if (fn === 'tostring') return `__pine.str.tostring(${args.join(', ')})`
     return `__pine.str.${fn}(${args.join(', ')})`
@@ -1314,8 +2129,10 @@ class Codegen {
   /** `input.*`：把默认值 / 标题 / 分组等收集进 meta，并生成可由请求覆盖的初始化调用 */
   private inputCall(e: CallExpr): string {
     const path = this.calleePath(e.callee)!
-    const type = path[1] ?? 'float'
-    const m = this.normalizeArgs(e, INPUT_PARAMS)
+    // v4 的裸 `input()` 形参顺序与 v5/v6 的 `input.*` 不同（type 在第 3 位）
+    const bare = path.length === 1
+    const m = this.normalizeArgs(e, bare ? INPUT_PARAMS_V4 : INPUT_PARAMS)
+    const type = this.inputTypeOf(path, m)
     const def = m.get('defval')
     const defaultCode = def ? this.expr(def) : 'NaN'
     const opts: string[] = []
@@ -1347,7 +2164,39 @@ class Codegen {
       step: step ? (this.literalOf(step) as number | undefined) : undefined,
       default: def ? this.literalOf(def) : undefined,
     })
-    return `__pine.input.${type}(${JSON.stringify(name)}, ${defaultCode}, { ${opts.join(', ')} })`
+    return `__pine.input.${RUNTIME_INPUT_TYPES.has(type) ? type : this.runtimeInputFallback(type)}(${JSON.stringify(name)}, ${defaultCode}, { ${opts.join(', ')} })`
+  }
+
+  /** 运行时没有对应通道的 input 类型（resolution / symbol / session …）按字符串处理 */
+  private runtimeInputFallback(type: string): string {
+    if (type === 'resolution' || type === 'symbol' || type === 'session' || type === 'timeframe') {
+      return 'string'
+    }
+    return 'float'
+  }
+
+  /**
+   * input 的类型：显式 `type=input.float` > 命名空间（`input.int`）> 由默认值推断。
+   * v4 的 `input(true)` / `input(9, minval=1)` 都靠这一层落到正确的运行时通道。
+   */
+  private inputTypeOf(path: string[], m: Map<string, Expr>): string {
+    const typeArg = m.get('type')
+    if (typeArg) {
+      if (typeArg.kind === 'ident') {
+        // v4：`input(14, "len", integer)` —— 类型名直接作为实参
+        return typeArg.name === 'integer' ? 'int' : typeArg.name
+      }
+      const p = this.dottedPath(typeArg)
+      if (p && p.startsWith('input.')) return p.slice('input.'.length)
+    }
+    if (path.length > 1 && path[1]) return path[1]
+    const def = m.get('defval')
+    if (def) {
+      if (def.kind === 'bool') return 'bool'
+      if (def.kind === 'string') return 'string'
+      if (def.kind === 'color') return 'color'
+    }
+    return 'float'
   }
 
   private colorCall(e: CallExpr): string {

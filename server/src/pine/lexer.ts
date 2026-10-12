@@ -55,7 +55,7 @@ export function tokenize(source: string): LexResult {
     }
     if (text.trim() === '') continue
 
-    const indent = countIndent(text, lineNo, diagnostics)
+    const indent = countIndent(text)
     const tokens = scanLine(text, lineNo, indent, diagnostics)
     if (tokens.length === 0) continue
     phys.push({ line: lineNo, indent, tokens })
@@ -269,20 +269,14 @@ function scanNumber(text: string, start: number): { text: string; end: number } 
   return { text: text.slice(start, i), end: i }
 }
 
-function countIndent(text: string, line: number, diags: PineDiagnostic[]): number {
+/** 统计行首缩进：Tab 按 4 空格折算（TradingView 编辑器允许 Tab 缩进） */
+function countIndent(text: string): number {
   let n = 0
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]
     if (ch === ' ') n++
-    else if (ch === '\t') {
-      diags.push({
-        line,
-        column: n + 1,
-        severity: 'error',
-        message: '缩进请使用空格（Pine 不允许 Tab）',
-      })
-      n += 4
-    } else break
+    else if (ch === '\t') n += 4
+    else break
   }
   return n
 }

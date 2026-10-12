@@ -13,7 +13,13 @@ import type { PineDiagnostic } from '../../../shared/types'
 import type { Expr, Program, Stmt } from './ast'
 
 /** 具备历史序列的内置变量（`close[1]` 合法） */
-const BUILTIN_HIST = new Set(['open', 'high', 'low', 'close', 'volume', 'time', 'hl2', 'hlc3', 'ohlc4'])
+const BUILTIN_HIST = new Set([
+  'open', 'high', 'low', 'close', 'volume', 'time', 'hl2', 'hlc3', 'ohlc4',
+  // v4 遗留（以开盘时间近似）
+  'time_close', 'time_tradingday',
+  // v4 裸 tr（codegen 会预计算整条序列）
+  'tr',
+])
 /** 可用作裸标识符的内置量 */
 const BUILTIN_IDENTS = new Set([
   ...BUILTIN_HIST,
@@ -28,6 +34,15 @@ const BUILTIN_IDENTS = new Set([
   'na',
   'true',
   'false',
+  // v3/v4 遗留：当前周期 / 标的 id
+  'period',
+  'resolution',
+  'tickerid',
+  // v5 时间函数（`dayofweek(time[, tz])` / `year(time)` …）
+  'dayofweek', 'year', 'month', 'dayofmonth', 'hour', 'minute', 'second', 'weekofyear',
+  // v3/v4 裸颜色常量
+  'red', 'green', 'blue', 'white', 'black', 'gray', 'grey', 'yellow', 'orange',
+  'purple', 'lime', 'aqua', 'fuchsia', 'maroon', 'navy', 'olive', 'silver', 'teal',
 ])
 /** 命名空间根（`ta.* / math.* / strategy.* …`），无需事先声明 */
 const NAMESPACE_ROOTS = new Set([
@@ -48,6 +63,20 @@ const BUILTIN_FUNCS = new Set([
   'timestamp', 'ticker', 'timeframe', 'input', 'request', 'color',
   // 类型转换函数与类型名本身
   'float', 'int', 'bool', 'string',
+  // v4 兼容：裸 `ta.*`（与 codegen 的 V4_TA_FUNCS 保持一致）
+  'sma', 'ema', 'rma', 'wma', 'hma', 'alma', 'atr', 'highest', 'lowest',
+  'pivothigh', 'pivotlow', 'crossover', 'crossunder', 'cross',
+  'change', 'mom', 'roc', 'stdev', 'variance', 'dev', 'macd', 'rsi',
+  'rising', 'falling', 'stoch', 'linreg', 'barssince', 'valuewhen', 'sar', 'supertrend',
+  'dmi',
+  // v4 兼容：裸 `math.*` / `str.*`
+  'abs', 'max', 'min', 'round', 'floor', 'ceil', 'pow', 'sqrt', 'sign',
+  'log', 'log10', 'exp', 'avg', 'sum', 'todegrees', 'toradians',
+  'tostring', 'tonumber', 'toint', 'tochar',
+  // v4 兼容：security() 与 Heikin-Ashi 数据包装（单标的降级为原标的）
+  'security', 'heikinashi', 'heikenashi',
+  // v4 input 的类型实参可以是类型名标识符
+  'integer',
 ])
 
 export function check(program: Program): PineDiagnostic[] {
@@ -55,6 +84,8 @@ export function check(program: Program): PineDiagnostic[] {
 
   const topLevelScalars = new Set<string>()
   const topLevelPrecalc = new Set<string>()
+  /** 顶层 `var` 状态变量（其 [k] 由每 bar 推入的环形缓冲支持） */
+  const topLevelVars = new Set<string>()
   const globals = new Set<string>()
   const funcArity = new Map<string, number>()
 
@@ -67,6 +98,8 @@ export function check(program: Program): PineDiagnostic[] {
       if (!stmt.isVar) {
         topLevelScalars.add(name)
         if (isTaCall(stmt.value)) topLevelPrecalc.add(name)
+      } else {
+        topLevelVars.add(name)
       }
     } else if (stmt.kind === 'typeDecl') {
       globals.add(stmt.name)
@@ -78,6 +111,10 @@ export function check(program: Program): PineDiagnostic[] {
 
   const scope = new Set<string>(globals)
   const locals = new Set<string>()
+  /** 当前正在检查的用户函数形参（形参的 [k] 由 codegen 透传序列容器实现） */
+  let fnParams: Set<string> | null = null
+  /** 当前函数体内被赋值的局部名（其 [k] 由 codegen 提升为模块级序列实现） */
+  let fnAssigned: Set<string> | null = null
 
   const err = (e: { line: number; col: number }, message: string) => {
     diags.push({ line: e.line, column: e.col, severity: 'error', message })
@@ -104,6 +141,11 @@ export function check(program: Program): PineDiagnostic[] {
         if (base.kind === 'ident') {
           if (BUILTIN_HIST.has(base.name) || topLevelPrecalc.has(base.name)) return
           if (topLevelScalars.has(base.name)) return
+          if (topLevelVars.has(base.name)) return
+          // 用户函数形参：历史容器由调用点透传（见 codegen 的隐藏历史参数）
+          if (fnParams?.has(base.name)) return
+          // 函数内被赋值的局部序列：由 codegen 提升为模块级状态 + 环形缓冲
+          if (fnAssigned?.has(base.name)) return
           if (locals.has(base.name)) {
             err(
               e,
@@ -114,8 +156,10 @@ export function check(program: Program): PineDiagnostic[] {
           err(e, `无法对 "${base.name}" 进行 [k] 历史引用`)
           return
         }
-        if (isStrategyPosition(base)) return
-        err(e, '[k] 历史引用的目标必须是变量或 strategy.position_size')
+        if (isStrategyMember(base)) return
+        // 调用结果（`change(macd)[1]` 等）：ta 调用整体按整条数组支持，交由 codegen 判定
+        if (base.kind === 'call') return
+        err(e, '[k] 历史引用的目标必须是变量或 strategy.* 成员')
         return
       }
       case 'call': {
@@ -151,6 +195,14 @@ export function check(program: Program): PineDiagnostic[] {
           checkExpr(arm.value)
         }
         return
+      case 'ifExpr':
+        // if 表达式的分支块就是普通语句块（可含局部变量与 `:=`）
+        for (const br of e.branches) {
+          checkExpr(br.cond)
+          walk(br.body, true)
+        }
+        if (e.elseBody) walk(e.elseBody, true)
+        return
       default:
         return
     }
@@ -161,6 +213,7 @@ export function check(program: Program): PineDiagnostic[] {
       switch (s.kind) {
         case 'assign': {
           checkExpr(s.value)
+          if (s.target.kind === 'ident' && fnAssigned) fnAssigned.add(s.target.name)
           if (s.op === ':=') {
             if (s.target.kind === 'member') checkExpr(s.target.object)
             else if (s.target.kind === 'ident' && !scope.has(s.target.name)) {
@@ -208,17 +261,26 @@ export function check(program: Program): PineDiagnostic[] {
           if (s.op === '=') {
             for (const n of s.names) {
               scope.add(n)
-              locals.add(n)
+              // 顶层元组解构与普通顶层赋值同级（用户函数可见，允许 [k] 引用）
+              if (nested) locals.add(n)
+              else topLevelScalars.add(n)
             }
           }
           break
-        case 'funcDecl':
+        case 'funcDecl': {
+          const prev = fnParams
+          const prevAssigned = fnAssigned
+          fnParams = new Set(s.params.map((p) => p.name))
+          fnAssigned = new Set<string>()
           for (const p of s.params) {
             scope.add(p.name)
             locals.add(p.name)
           }
           walk(s.body, true)
+          fnParams = prev
+          fnAssigned = prevAssigned
           break
+        }
         case 'typeDecl':
         case 'break':
         case 'continue':
@@ -249,11 +311,6 @@ function isTaCall(e: Expr): boolean {
   )
 }
 
-function isStrategyPosition(e: Expr): boolean {
-  return (
-    e.kind === 'member' &&
-    e.property === 'position_size' &&
-    e.object.kind === 'ident' &&
-    e.object.name === 'strategy'
-  )
+function isStrategyMember(e: Expr): boolean {
+  return e.kind === 'member' && e.object.kind === 'ident' && e.object.name === 'strategy'
 }

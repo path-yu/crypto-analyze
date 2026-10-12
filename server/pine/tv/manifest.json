@@ -1,0 +1,114 @@
+[
+  {
+    "file": "01-flawless-victory-strategy.pine",
+    "name": "Flawless Victory Strategy - 15min BTC Machine Learning Strategy",
+    "author": "Trebor_Namor",
+    "version": "4",
+    "lines": 136
+  },
+  {
+    "file": "02-autoview-build-a-bot.pine",
+    "name": "P2-V2 - BTC Strategy",
+    "author": "CryptoRox",
+    "version": "3",
+    "lines": 290
+  },
+  {
+    "file": "03-automated-bitcoin-btc-investment-strategy.pine",
+    "name": "Automated Bitcoin (BTC) Investment Strategy from Wunderbit ",
+    "author": "WunderTrading",
+    "version": "5",
+    "lines": 125
+  },
+  {
+    "file": "04-btcusd-supertrend-ema-trend-filter-1h.pine",
+    "name": "Bitcoin SuperFlip | Supertrend EMA Trend-Following Strategy",
+    "author": "blitz_locked",
+    "version": "6",
+    "lines": 154
+  },
+  {
+    "file": "05-macdrsi.pine",
+    "name": "Momentum Strategy (BTC/USDT; 1h) - MACD (with source code)",
+    "author": "Drun30",
+    "version": "4",
+    "lines": 112
+  },
+  {
+    "file": "06-supertrend-strategy-with-rsi-filter-for-btcusd-4.pine",
+    "name": "Simple SuperTrend Strategy for BTCUSD 4H",
+    "author": "StrategiesForEveryone",
+    "version": "5",
+    "lines": 221
+  },
+  {
+    "file": "07-btc-candle-correlation-strategy.pine",
+    "name": "BTC Candle Correlation Strategy ",
+    "author": "exlux",
+    "version": "4",
+    "lines": 114
+  },
+  {
+    "file": "08-momentum-strategy-v7b4.pine",
+    "name": "Momentum Strategy (BTC/USDT; 30m) - STOCH RSI (with source code)",
+    "author": "Drun30",
+    "version": "4",
+    "lines": 208
+  },
+  {
+    "file": "09-bitlinc-entry-strategy-btc-bitmex---30-minute-v1.pine",
+    "name": "Moving Average Cross Strategy ",
+    "author": "Charts_and_Such_1",
+    "version": "3",
+    "lines": 155
+  },
+  {
+    "file": "10-btc_long_only_tv01_200507.pine",
+    "name": "BTC and ETH Long strategy - version 2",
+    "author": "philipina",
+    "version": "4",
+    "lines": 138
+  },
+  {
+    "file": "11-optimized-keltner-channels-sltp-strategy-for-btc.pine",
+    "name": "Optimized Keltner Channels SL/TP Strategy for BTC",
+    "author": "chanu_lev10k",
+    "version": "4",
+    "lines": 55
+  },
+  {
+    "file": "12-best-supertrend-btcusd.pine",
+    "name": "DEMA Double Exponential Moving Average Strategy",
+    "author": "moneros",
+    "version": "?",
+    "lines": 45
+  },
+  {
+    "file": "13-btc-long-strategy.pine",
+    "name": "BTC and ETH Long strategy - version 1",
+    "author": "philipina",
+    "version": "4",
+    "lines": 139
+  },
+  {
+    "file": "14-opv1---up-down-trend-trading-strategy---btcusdt-.pine",
+    "name": "Up & Down Trend following trading strategy for BTC/USDT 3h",
+    "author": "pcooma",
+    "version": "5",
+    "lines": 914
+  },
+  {
+    "file": "15-crypto-btc-correlation-scalper-gaps-strategy.pine",
+    "name": "Crypto BTC Correlation Scalper Gaps Strategy",
+    "author": "exlux",
+    "version": "5",
+    "lines": 117
+  },
+  {
+    "file": "16-my-ethbtc-5-min-strategy.pine",
+    "name": "My ETH/BTC 5 min Strategy",
+    "author": "cyatophilum",
+    "version": "3",
+    "lines": 47
+  }
+]
