@@ -148,6 +148,34 @@ scripts/                     开发启动与诊断脚本
 6. **订单块策略的固定语义**（切换策略时自动套用，可在「资金与杠杆」覆盖）：初始资金 10,000、手续费单边 0.05%、下单量 = 权益 10%（1 倍杠杆）、滑点 2 tick、同时只持有一仓（不加仓、无分批止盈）；离场为 OCO（区域止损 / 固定盈亏比限价）+ 保本移动 + 时间止损（下一根开盘市价平仓）。
 7. **订单块策略的信号依赖持仓**：原脚本的区域扫描带 `strategy.position_size == 0` 条件，持仓期间触及区域既不产生信号也不消耗区域。因此该策略的信号由引擎在每根 K 线收盘、撮合完成后逐 bar 计算（`signalProvider`），而不是一次性算好。
 
+## 网络与代理
+
+Node **不会**自动使用系统的 Internet 选项代理（浏览器会使用），所以在受限网络下直连 okx / binance 常见两种表现：
+
+- DNS 被劫持：`www.okx.com` 解析到 `169.254.x.x`（链路本地黑洞地址），请求一直挂到超时；
+- TLS 握手被重置：`curl` 报 `Recv failure: Connection was reset`。
+
+于是出现「浏览器能打开交易所接口，程序却超时」的现象。本服务的 ccxt 接入层会自动解析代理并使用：
+
+优先级：`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` 环境变量 → Windows 系统代理（WinINET，即浏览器用的那个）。
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:7890 npm run dev   # 显式指定
+DISABLE_PROXY=1 npm run dev                     # 强制直连（本地代理未启动时）
+```
+
+启动日志会打印当前生效的代理：
+
+```
+  ● 行情代理:      http://127.0.0.1:7890（ccxt 走代理；Binance 归档直连）
+```
+
+几点说明：
+
+- 只有 ccxt 的接口请求走代理；Binance Data Vision 归档（`data.binance.vision`）等全局 `fetch` 保持直连（实测该域名一般可直连，避开代理还能更快）。
+- 代理不可用（进程没启动、端口写错）时会自动回退直连并打印警告，不会因为本地代理没开导致整体不可用。
+- ccxt 使用 `httpsProxy` 前需要 `http-proxy-agent` 与 `https-proxy-agent`（已在依赖中，二者缺一 ccxt 都会判定为"未安装"）。
+
 ## 数据源说明
 
 行情按「ccxt 实时接口 → Binance Vision 归档 → 本地缓存」的顺序获取，缓存位于 `.cache/klines/`（已在 .gitignore 中忽略，属运行时数据、**故意不进版本库**）。全程只使用公开行情接口，无需 API Key。
