@@ -38,10 +38,29 @@ export interface StrategySignalCore {
   obTakeProfit?: number
   /** 信号风险（用于计算保本触发价） */
   obRisk?: number
+  /** Pine 的 `strategy.close_all` → 本根收盘后排队、下一根开盘市价平仓 */
+  forceClose?: boolean
 }
 
 export interface StrategySeriesCore {
   signals: ReadonlyArray<StrategySignalCore>
+}
+
+/**
+ * 逐 bar 信号回调的上下文。
+ *
+ * `flat` 供订单块策略使用；其余字段供 Pine 脚本还原
+ * `strategy.position_size` / `strategy.position_size[1]` / `strategy.position_avg_price`。
+ */
+export interface SignalProviderCtx {
+  flat: boolean
+  /** `strategy.position_size`：多 +1 / 空 -1 / 平 0 */
+  positionSize: number
+  /** 上一根收盘时的仓位方向（对应 `strategy.position_size[1]`） */
+  prevPositionSize: number
+  /** `strategy.position_avg_price`（空仓时为 NaN） */
+  avgPrice: number
+  side: TradeSide | null
 }
 
 export interface BacktestInput {
@@ -62,7 +81,7 @@ export interface BacktestInput {
    * 必须在每根 K 线**收盘、挂单撮合之后**才知道 flat 与否，
    * 因此由引擎逐 bar 回调，由调用方把结果写回 signals[index]。
    */
-  signalProvider?: (index: number, ctx: { flat: boolean }) => void
+  signalProvider?: (index: number, ctx: SignalProviderCtx) => void
   /** 合约最小变动价位（syminfo.mintick），配合 slippageTicks 计算滑点 */
   tickSize?: number
 }
@@ -185,10 +204,12 @@ class BacktestEngine {
   private readonly dir: StrategyParams['tradeDirection']
   private readonly tradeFromIndex: number
   /** 位置相关信号源（订单块策略），见 BacktestInput.signalProvider */
-  private readonly signalProvider?: (index: number, ctx: { flat: boolean }) => void
+  private readonly signalProvider?: (index: number, ctx: SignalProviderCtx) => void
 
   private cash: number
   private position: Position | null = null
+  /** 上一根收盘时的仓位方向（多 +1 / 空 -1 / 平 0），供 Pine 的 `strategy.position_size[1]` 使用 */
+  private prevPositionSize = 0
   private tradeSeq = 0
 
   /**
@@ -229,7 +250,9 @@ class BacktestEngine {
     // 0 表示不限；至少允许 1 笔（即基础开仓）
     this.maxPyramiding = Math.max(1, Math.trunc(input.params.pyramiding ?? 1))
     this.fillNextBarOpen =
-      input.params.strategy === 'supertrend' || input.params.strategy === 'order-block'
+      input.params.strategy === 'supertrend' ||
+      input.params.strategy === 'order-block' ||
+      input.params.strategy === 'pine'
 
     const tick = Number.isFinite(input.tickSize) ? (input.tickSize as number) : 0
     this.slippageAbs = tick > 0 ? tick * Math.max(0, input.params.slippageTicks ?? 0) : 0
@@ -676,6 +699,8 @@ class BacktestEngine {
 
     for (let i = 0; i < n; i++) {
       const bar = candles[i]
+      // Pine 的 `strategy.position_size[1]`：本根开盘前（= 上一根收盘时）的仓位方向
+      this.prevPositionSize = this.position ? (this.position.side === 'long' ? 1 : -1) : 0
 
       // A0. 上一根 K 线排队的市价单：在本根开盘成交
       //     （时间止损的市价平仓、以及 supertrend / 订单块的下一根开盘开仓）
@@ -687,8 +712,28 @@ class BacktestEngine {
 
       // A1. 位置相关信号（订单块策略）：在收盘、撮合完成之后计算，
       //     这样 flat 才等于原 Pine 中 `strategy.position_size == 0`
-      if (this.signalProvider) this.signalProvider(i, { flat: this.position === null })
+      if (this.signalProvider) {
+        const pos = this.position
+        const live = pos ? pos.subs.filter((s) => this.isAlive(s)) : []
+        const totalQty = live.reduce((a, s) => a + s.initialQty * s.remaining, 0)
+        const avgPrice =
+          totalQty > 0
+            ? live.reduce((a, s) => a + s.entryPrice * s.initialQty * s.remaining, 0) / totalQty
+            : NaN
+        this.signalProvider(i, {
+          flat: pos === null,
+          positionSize: pos ? (pos.side === 'long' ? 1 : -1) : 0,
+          prevPositionSize: this.prevPositionSize,
+          avgPrice,
+          side: pos ? pos.side : null,
+        })
+      }
       const sig = series.signals[i]
+
+      // Pine：strategy.close_all(comment="Time stop") → 收盘判定、下一根开盘市价平仓
+      if (params.strategy === 'pine' && sig.forceClose && this.position && !this.pendingExit) {
+        this.pendingExit = 'TimeStop'
+      }
 
       // A2. 订单块：保本触发（等价于 Pine 在收盘时更新 longStop/shortStop）
       if (params.exitStrategy === 'Zone OCO' && this.position) this.armBreakEven(bar)

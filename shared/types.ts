@@ -67,7 +67,51 @@ export type ExitStrategy =
 export type AtrSmoothing = 'RMA' | 'SMA' | 'EMA' | 'WMA'
 
 /** 支持的回测策略 */
-export type StrategyKind = 'fib-trend' | 'supertrend' | 'order-block'
+export type StrategyKind = 'fib-trend' | 'supertrend' | 'order-block' | 'pine'
+
+/** Pine 编译器返回的一条诊断（带行列号，供编辑器内联展示） */
+export interface PineDiagnostic {
+  /** 1 起的行号 */
+  line: number
+  /** 1 起的列号 */
+  column: number
+  severity: 'error' | 'warning'
+  message: string
+}
+
+/** Pine 编译产物元信息（脚本声明、可覆盖输入项、绘图标题等） */
+export interface PineCompileMeta {
+  /** 脚本种类：strategy() / indicator() */
+  kind: 'strategy' | 'indicator'
+  /** strategy() 声明的原始具名实参（v1 仅记录，不覆盖 params） */
+  config: Record<string, string | number | boolean>
+  /** input.* 声明，供前端渲染可覆盖项 */
+  inputs: {
+    name: string
+    type: 'int' | 'float' | 'bool' | 'color' | 'string'
+    title: string
+    group?: string
+    minval?: number
+    maxval?: number
+    step?: number
+    default: unknown
+  }[]
+  /** plot() 的 title 列表 */
+  plotTitles: string[]
+  /** alertcondition 收集 */
+  alerts: { title: string; message: string }[]
+}
+
+/** 保存到本地缓存的 Pine 脚本（`.cache/pine-scripts.json`） */
+export interface SavedPineScript {
+  id: string
+  /** 脚本名：下拉菜单展示用，同名保存视为更新 */
+  name: string
+  /** 原始 Pine 源码 */
+  source: string
+  createdAt: number
+  updatedAt: number
+}
 
 /** Volume Order Block Retest 策略参数（Pine v6 原版一一对应） */
 export interface OrderBlockConfig {
@@ -501,6 +545,17 @@ export interface BacktestResult {
     cached: boolean
     /** 本次回测使用的策略 */
     strategy: StrategyKind
+  }
+  /** Pine 脚本回测时附带的编译产物（未使用 pine 策略时为 undefined） */
+  pine?: {
+    /** 原始 Pine 源码 */
+    source: string
+    /** 编译生成的 TypeScript 源码 */
+    ts: string
+    /** 编译诊断 */
+    diagnostics: PineDiagnostic[]
+    /** 编译元信息 */
+    meta: PineCompileMeta
   }
 }
 

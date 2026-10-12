@@ -17,7 +17,10 @@
 - **绩效报告**：收益率、最大回撤、胜率、盈亏比、Sharpe、连盈连亏、多空分解、月度收益
 - **可视化**：K 线图 + 指标叠加（SuperTrend 上下轨、IMBA 趋势线、ATR 止损线）+ 买卖点标记 + 权益曲线
 - **导出**：交易明细 CSV、HTML 回测报告
-- **CLI 回测** 与一批诊断脚本（`npm run diag:*`）
+- **Pine 脚本策略（`pine`）**：粘贴 / 载入 `.pine` 源码，后端实时编译为 TypeScript 并在沙箱中执行，逐根 K 线产出信号后交给同一套撮合引擎；支持 `strategy.entry/exit` 与 `indicator` + `plotshape` 两种驱动方式
+- **脚本编辑器**：CodeMirror 6 + 自写 Pine v6 语法高亮（注释 / 字符串 / 颜色字面量 / 关键字 / 类型 / 内置命名空间 / 运算符），可在右侧 Drawer 弹窗中放大编辑
+- **脚本本地保存**：编辑器内命名保存，落盘到 `.cache/pine-scripts.json`；已保存脚本直接出现在「策略」下拉菜单里，选中即载入并实时编译
+- **CLI 回测** 与一批诊断脚本（`npm run diag:*`、`npm run pine`、`npm run compare:pinets`）
 
 ## 技术栈
 
@@ -99,6 +102,10 @@ scripts/                     开发启动与诊断脚本
 | GET | `/api/price?exchange=&symbol=` | 最新价 |
 | GET | `/api/klines?exchange=&symbol=&timeframe=&since=&until=` | K 线 |
 | POST | `/api/backtest` | 运行回测（body：`exchange/symbol/timeframe/since/until/params`） |
+| POST | `/api/pine/compile` | 实时编译 Pine 源码，返回 TS 产物、诊断与元信息（编辑器打字时调用） |
+| POST | `/api/pine/backtest` | Pine 脚本回测（额外携带 `source` / `inputs`） |
+| GET | `/api/pine/examples` | 内置示例脚本（`server/pine/*.pine`） |
+| GET / POST / DELETE | `/api/pine/scripts` | 已保存脚本的列表 / 保存（同名即更新）/ 删除 |
 
 ## 策略参数
 

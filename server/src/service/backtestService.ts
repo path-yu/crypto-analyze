@@ -6,6 +6,8 @@ import type {
   BacktestResult,
   Candle,
   ExchangeId,
+  PineCompileMeta,
+  PineDiagnostic,
   StrategyParams,
   Timeframe,
   Trade,
@@ -18,7 +20,9 @@ import {
   OrderBlockTracker,
   type OrderBlockSignal,
 } from '../indicators/orderBlock'
-import { runBacktest } from '../backtest/engine'
+import { compilePineCached } from '../pine/cache'
+import { emptyPineSignal, runPineProgram, type PineSignal } from '../pine/execute'
+import { runBacktest, type SignalProviderCtx } from '../backtest/engine'
 import { computeReport } from '../backtest/metrics'
 import { fetchKlines, MarketError } from '../market/exchange'
 
@@ -48,6 +52,15 @@ export interface BacktestRequest {
   useCache?: boolean
   /** 合约最小变动价位（syminfo.mintick），用于把 slippageTicks 换算成价格 */
   tickSize?: number
+  /** Pine 脚本（strategy = 'pine' 时必填） */
+  pine?: {
+    /** 原始 Pine 源码 */
+    source: string
+    /** 覆盖脚本内 input.* 默认值（键 = 顶层变量名） */
+    inputs?: Record<string, number | boolean | string>
+    /** 源文件名（诊断展示用） */
+    name?: string
+  }
 }
 
 export class ValidationError extends Error {
@@ -93,7 +106,12 @@ export function normalizeParams(input?: Partial<StrategyParams>): StrategyParams
   p.slippageTicks = Math.round(clamp(p.slippageTicks ?? 0, 0, 200, 0))
 
   // 策略选择与 SuperTrend 参数
-  if (p.strategy !== 'fib-trend' && p.strategy !== 'supertrend' && p.strategy !== 'order-block') {
+  if (
+    p.strategy !== 'fib-trend' &&
+    p.strategy !== 'supertrend' &&
+    p.strategy !== 'order-block' &&
+    p.strategy !== 'pine'
+  ) {
     p.strategy = d.strategy
   }
   const st = p.supertrend ?? d.supertrend
@@ -137,7 +155,7 @@ export function normalizeParams(input?: Partial<StrategyParams>): StrategyParams
 
   // 订单块策略的固定语义（原脚本 strategy() 声明：pyramiding = 0、
   // 无分批止盈、方向由 allowLong / allowShort 决定、离场为区域止损 + 固定盈亏比）
-  if (p.strategy === 'order-block') {
+  if (p.strategy === 'order-block' || p.strategy === 'pine') {
     p.exitStrategy = 'Zone OCO'
     p.partialTp = false
     p.tradeDirection = 'Both'
@@ -224,13 +242,17 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
   }
   if (tradeFromIndex >= allCandles.length - 1) tradeFromIndex = 0
 
-  let series: FibTrendSeries | SupertrendSeries | { signals: OrderBlockSignal[] }
+  let series: FibTrendSeries | SupertrendSeries | { signals: OrderBlockSignal[] } | { signals: PineSignal[] }
   /**
    * 订单块策略的信号依赖持仓（原脚本的区域扫描带 `position_size == 0` 条件），
    * 因此不能提前算好：由引擎在每根 K 线收盘、挂单撮合之后回调这里，
    * 再把结果写回 signals[index]，图表标记与统计都读同一份数组。
    */
-  let signalProvider: ((index: number, ctx: { flat: boolean }) => void) | undefined
+  let signalProvider: ((index: number, ctx: SignalProviderCtx) => void) | undefined
+  /** Pine 编译产物（源码 / TS / 诊断 / 元信息），仅在 strategy = 'pine' 时返回 */
+  let pineArtifact:
+    | { source: string; ts: string; diagnostics: PineDiagnostic[]; meta: PineCompileMeta }
+    | undefined
 
   if (params.strategy === 'supertrend') {
     series = computeSupertrendSeries(allCandles, params.supertrend)
@@ -241,6 +263,34 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
       signals[index] = tracker.step(index, ctx.flat)
     }
     series = { signals }
+  } else if (params.strategy === 'pine') {
+    const source = req.pine?.source
+    if (!source || typeof source !== 'string') {
+      throw new ValidationError('缺少 Pine 脚本源码（req.pine.source）')
+    }
+    const comp = compilePineCached(source, { sourceName: req.pine?.name })
+    if (!comp.ok) {
+      const first = comp.diagnostics.find((d) => d.severity === 'error')
+      throw new ValidationError(
+        `Pine 脚本编译失败：第 ${first?.line ?? 0} 行第 ${first?.column ?? 0} 列 · ${first?.message ?? '未知错误'}`,
+      )
+    }
+    // 与 order-block 一致：脚本只产信号，撮合仍由引擎的 Zone OCO 通路完成。
+    const program = runPineProgram(comp.ts, allCandles, {
+      inputs: req.pine?.inputs,
+      tickSize,
+    })
+    const signals = allCandles.map(() => emptyPineSignal())
+    signalProvider = (index, ctx) => {
+      signals[index] = program.step(index, ctx)
+    }
+    series = { signals }
+    pineArtifact = {
+      source,
+      ts: comp.ts,
+      diagnostics: comp.diagnostics,
+      meta: program.meta,
+    }
   } else {
     series = computeFibTrendSeries(allCandles, {
       sensitivity: params.sensitivity,
@@ -334,6 +384,7 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
       cached,
       strategy: params.strategy,
     },
+    pine: pineArtifact,
   }
 }
 

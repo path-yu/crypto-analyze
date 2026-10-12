@@ -3,6 +3,9 @@
  */
 
 import { Router, type Request, type Response } from 'express'
+import fs from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { ExchangeId, Timeframe } from '../../../shared/types'
 import { EXCHANGES, TIMEFRAMES } from '../../../shared/types'
 import {
@@ -16,8 +19,18 @@ import {
   ValidationError,
   type BacktestRequest,
 } from '../service/backtestService'
+import { compilePineCached } from '../pine/cache'
+import {
+  deletePineScript,
+  listPineScripts,
+  normalizeScriptName,
+  savePineScript,
+} from '../pine/store'
 
 export const apiRouter: Router = Router()
+
+/** server/pine 目录（存放示例脚本） */
+const PINE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../pine')
 
 function asExchange(v: unknown, fallback: ExchangeId = 'binanceusdm'): ExchangeId {
   const s = String(v ?? '') as ExchangeId
@@ -126,6 +139,22 @@ apiRouter.get('/klines', async (req: Request, res: Response) => {
   }
 })
 
+/** 把请求体整理为 runBacktestService 需要的 payload（/backtest 与 /pine/backtest 共用） */
+function buildBacktestPayload(body: Record<string, unknown>): BacktestRequest {
+  return {
+    exchange: asExchange(body.exchange as string),
+    symbol: typeof body.symbol === 'string' ? body.symbol : undefined,
+    timeframe: asTimeframe(body.timeframe as string),
+    since: toNumber(body.since),
+    until: toNumber(body.until),
+    bars: toNumber(body.bars),
+    useCache: body.useCache as boolean | undefined,
+    tickSize: toNumber(body.tickSize),
+    params: (body.params ?? {}) as BacktestRequest['params'],
+    pine: body.pine as BacktestRequest['pine'],
+  }
+}
+
 /**
  * 回测接口。
  * POST /api/backtest
@@ -140,19 +169,115 @@ apiRouter.get('/klines', async (req: Request, res: Response) => {
  */
 apiRouter.post('/backtest', async (req: Request, res: Response) => {
   try {
-    const body = (req.body ?? {}) as BacktestRequest & { params?: Record<string, unknown> }
-    const payload: BacktestRequest = {
-      exchange: asExchange(body.exchange),
-      symbol: typeof body.symbol === 'string' ? body.symbol : undefined,
-      timeframe: asTimeframe(body.timeframe),
-      since: toNumber(body.since),
-      until: toNumber(body.until),
-      bars: toNumber(body.bars),
-      useCache: body.useCache,
-      params: (body.params ?? {}) as BacktestRequest['params'],
+    const result = await runBacktestService(buildBacktestPayload((req.body ?? {}) as Record<string, unknown>))
+    res.json({ ok: true, data: result })
+  } catch (err) {
+    fail(res, err)
+  }
+})
+
+/**
+ * Pine 实时编译。
+ * POST /api/pine/compile  { source, name? }
+ *
+ * 语法 / 语义错误仍返回 200 且 ok:true，诊断放进 diagnostics，编辑器可一边打字一边显示。
+ */
+apiRouter.post('/pine/compile', (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { source?: unknown; name?: unknown }
+    const source = typeof body.source === 'string' ? body.source : ''
+    if (!source.trim()) throw new ValidationError('缺少 Pine 源码（source）')
+    const name = typeof body.name === 'string' ? body.name : undefined
+    const comp = compilePineCached(source, { sourceName: name })
+    res.json({
+      ok: true,
+      data: { ts: comp.ts, diagnostics: comp.diagnostics, meta: comp.meta, ok: comp.ok },
+    })
+  } catch (err) {
+    fail(res, err)
+  }
+})
+
+/**
+ * Pine 回测：结构与 /api/backtest 相同，额外要求 params.strategy = 'pine' 与 pine.source。
+ * POST /api/pine/backtest  { source, inputs?, ...其余同 /api/backtest }
+ */
+apiRouter.post('/pine/backtest', async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>
+    const source = typeof body.source === 'string' ? body.source : undefined
+    const payload = buildBacktestPayload(body)
+    if (source) {
+      payload.pine = {
+        source,
+        inputs: body.inputs as Record<string, number | boolean | string> | undefined,
+        name: typeof body.name === 'string' ? body.name : undefined,
+      }
     }
+    payload.params = { ...(payload.params ?? {}), strategy: 'pine' }
     const result = await runBacktestService(payload)
     res.json({ ok: true, data: result })
+  } catch (err) {
+    fail(res, err)
+  }
+})
+
+/** 内置示例脚本：GET /api/pine/examples */
+apiRouter.get('/pine/examples', (_req: Request, res: Response) => {
+  try {
+    const read = (file: string): string => fs.readFileSync(path.join(PINE_DIR, file), 'utf8')
+    res.json({
+      ok: true,
+      data: [
+        { name: '策略脚本 · Volume Order Block', file: 'test.pine', source: read('test.pine') },
+        { name: '指标脚本 · Signal Suite', file: 'test1.pine', source: read('test1.pine') },
+      ],
+    })
+  } catch (err) {
+    fail(res, err)
+  }
+})
+
+/* ------------------------------------------------------------------ */
+/* Pine 脚本本地保存                                                    */
+/* ------------------------------------------------------------------ */
+
+/** 已保存脚本列表（最近保存的在前）：GET /api/pine/scripts */
+apiRouter.get('/pine/scripts', (_req: Request, res: Response) => {
+  try {
+    res.json({ ok: true, data: listPineScripts() })
+  } catch (err) {
+    fail(res, err)
+  }
+})
+
+/**
+ * 保存脚本：POST /api/pine/scripts  { name, source }
+ * 同名视为更新（就地覆盖），换名即新增；写入后立即落盘，重启服务仍在。
+ */
+apiRouter.post('/pine/scripts', (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as { name?: unknown; source?: unknown }
+    const source = typeof body.source === 'string' ? body.source : ''
+    if (!source.trim()) throw new ValidationError('缺少 Pine 源码（source）')
+    let name: string
+    try {
+      name = normalizeScriptName(body.name)
+    } catch (e) {
+      throw new ValidationError(e instanceof Error ? e.message : '脚本名不合法')
+    }
+    res.json({ ok: true, data: savePineScript(name, source) })
+  } catch (err) {
+    fail(res, err)
+  }
+})
+
+/** 删除脚本：DELETE /api/pine/scripts/:id */
+apiRouter.delete('/pine/scripts/:id', (req: Request, res: Response) => {
+  try {
+    const id = String(req.params.id ?? '')
+    if (!deletePineScript(id)) throw new ValidationError('脚本不存在（可能已被删除）')
+    res.json({ ok: true, data: { id } })
   } catch (err) {
     fail(res, err)
   }

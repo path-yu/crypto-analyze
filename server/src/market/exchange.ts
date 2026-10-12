@@ -15,13 +15,13 @@ import ccxt, { type Exchange as CcxtExchange } from 'ccxt'
 
 import type { Candle, ExchangeId, Instrument, Timeframe } from '../../../shared/types'
 import { TIMEFRAME_MS } from '../../../shared/types'
-import {
-  fetchVisionKlines,
-  isVisionAvailable,
-  supportsTimeframe as visionSupports,
-  toVisionSymbol,
-  VISION_EARLIEST_MS,
-} from './binanceVision'
+// import {
+//   fetchVisionKlines,
+//   isVisionAvailable,
+//   supportsTimeframe as visionSupports,
+//   toVisionSymbol,
+//   VISION_EARLIEST_MS,
+// } from './binanceVision'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const CACHE_DIR = path.resolve(__dirname, '../../../.cache/klines')
@@ -523,42 +523,6 @@ export async function fetchKlines(opts: FetchKlinesOptions): Promise<FetchKlines
     }
   }
 
-  /**
-   * Binance Vision 全历史源的成功收尾。
-   *
-   * 这里的交易所标记仍写作 `binanceusdm`，因为对使用者而言
-   * 「Binance 系数据」是一个整体概念；差异通过 sourceLabel 与
-   * warnings 明确告知，且价格本身就是同源的现货价。
-   */
-  const doneVision = (candles: Candle[]): FetchKlinesResult => {
-    const visionPrefix = cachePrefixFor('vision', opts.symbol, opts.timeframe)
-    const finalKey = `${visionPrefix}${alignFloor(since, tfMs)}_${alignFloor(until, tfMs)}`
-    memoryCache.set(finalKey, { expires: Date.now() + MEMORY_TTL_MS, data: candles })
-    writeDiskCache(visionPrefix, since, until, tfMs, candles)
-
-    const from = candles[0].timestamp
-    const to = candles[candles.length - 1].timestamp
-    const days = Math.round((to - from) / 86400_000)
-    let note =
-      `行情取自 Binance Data Vision 全历史镜像（${toVisionSymbol(opts.symbol)} 现货，` +
-      `覆盖 ${new Date(from).toISOString().slice(0, 10)} 至 ${new Date(to).toISOString().slice(0, 10)}，` +
-      `共 ${candles.length.toLocaleString()} 根 / ${days} 天），` +
-      `不受交易所「最近 N 根」限制，交易样本更完整。`
-    if (truncatedFuture) {
-      const extra = `结束时间晚于当前时间，已按当前时刻截断到 ${new Date(until).toISOString().slice(0, 16).replace('T', ' ')} UTC。`
-      note = `${note} ${extra}`
-      truncatedFuture = false
-    }
-
-    return {
-      candles,
-      cached: false,
-      exchange: opts.exchange,
-      clampNote: note,
-      sourceLabel: 'Binance Data Vision（全历史现货）',
-    }
-  }
-
   const attempt = async (exId: ExchangeId): Promise<Candle[]> => {
     clampToLookback(exId)
     try {
@@ -601,25 +565,7 @@ export async function fetchKlines(opts: FetchKlinesOptions): Promise<FetchKlines
     MAX_LOOKBACK_BARS[opts.exchange] ?? 20_000,
     MAX_LOOKBACK_BARS[effectiveExchange] ?? 20_000,
   )
-  const visionEligible =
-    requiredBars > effectiveCap * 0.9 &&
-    visionSupports(opts.timeframe) &&
-    since >= VISION_EARLIEST_MS - 86400_000
-
-  if (visionEligible && (await isVisionAvailable())) {
-    try {
-      const candles = await fetchVisionKlines({
-        symbol: opts.symbol,
-        timeframe: opts.timeframe,
-        since,
-        until,
-      })
-      if (candles.length >= 200) return doneVision(candles)
-      errors.push(`binance-vision: 仅返回 ${candles.length} 根，不足以计算指标`)
-    } catch (err) {
-      errors.push(`binance-vision: ${err instanceof Error ? err.message : String(err)}`)
-    }
-  }
+ 
 
   // 1) 再单独尝试用户指定的交易所
   const [primary, ...rest] = chain

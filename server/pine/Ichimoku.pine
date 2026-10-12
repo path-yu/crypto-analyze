@@ -1,0 +1,1095 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © AxeAlgo
+//@version=6
+// ═════════════════════════════════════════════════════════════════════════════════
+//  ICHIMOKU CLOUD PRO [AxeAlgo Core]
+//  Ichimoku Kinko Hyo with breakout scoring, Hosoda wave, price and time theory, and a plain-language panel
+// ═════════════════════════════════════════════════════════════════════════════════
+//  The classic five lines (Tenkan, Kijun, Senkou Span A/B, Chikou) plus:
+//
+//   1. PRESETS ............. traditional (9, 26, 52, 26), crypto 24/7, forex 5-day, fast and futures lengths,
+//                            or custom. Presets are starting points, not tested optima.
+//   2. KUMO TWIST .......... ● on the candle where Span A crosses Span B. The cloud is drawn ahead, so the panel
+//                            counts the bars until the drawn cloud changes colour.
+//   3. TK CROSS / KIJUN BOUNCE  Tenkan/Kijun crosses; Kijun bounce = price above (below) the cloud tests Kijun
+//                            and closes back above (below) it.
+//   4. BREAKOUT SCORE ...... a 0-100 weighted checklist for closes through the whole cloud: cloud thickness,
+//                            Chikou, Tenkan/Kijun, close-through margin, higher timeframes, volume, RSI, with a
+//                            chop filter. Hover a badge for its breakdown. The score is a checklist, not a
+//                            probability.
+//   5. KANZEN .............. price, Tenkan, Kijun, cloud and Chikou all in order ("perfect alignment").
+//   6. HOSODA THEORIES ..... from confirmed swings:
+//                            wave theory: I, V, N, P, Y, W wave types at each swing;
+//                            price theory: V, N, E, NT, 2E, 3E targets from each N wave pullback (A → B → C), ✓ when
+//                            reached, removed when price closes beyond C;
+//                            time theory: Kihon Sūchi (9 … 257) from the last 1-3 swings and Taito Sūchi (equal
+//                            time), gold where they agree; kasanari boxes where those meet a price target.
+//   7. FLAT SPAN B LEVELS .. Span B unchanged for many bars marks a level price held around; drawn as a ray.
+//   8. CHIKOU OPEN AIR ..... Chikou clear of the cloud and of the candles around and ahead of it.
+//   9. KIJUN STRETCH ....... price more than N ATR from Kijun (describes stretch; does not predict a pullback).
+//  10. PANEL ............... bias in plain words, chart and two higher timeframes (last confirmed HTF bar only),
+//                            the cloud ahead, next Hosoda target and time window, last signal; chart key.
+//
+//  Every signal is decided at bar close and never moves afterwards. Projections ahead of price (target lines,
+//  time windows, kasanari) update as new swings confirm.
+// ═════════════════════════════════════════════════════════════════════════════════
+
+indicator("Ichimoku Cloud Pro [AxeAlgo]", "Ichimoku Pro [AxeAlgo]", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500, max_bars_back = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────────
+//  INPUTS: everyday settings first, fine-tuning in the two Advanced sections at the bottom
+// ─────────────────────────────────────────────────────────────────────────────────
+
+// ── Ichimoku
+gI = "Ichimoku"
+presetMode       = input.string("Traditional (9, 26, 52, 26)", "Settings", options = ["Traditional (9, 26, 52, 26)", "Crypto 24/7 (20, 60, 120, 30)", "Forex 5-Day (8, 22, 44, 22)", "Fast / Scalp (7, 22, 44, 22)", "Futures Intraday (12, 36, 72, 36)", "Custom"], group = gI, tooltip = "Line lengths for different markets (Tenkan, Kijun, Span B, shift). Traditional suits most charts. Custom uses the four numbers below. Presets are starting points, not tested optima.")
+customTenkan     = input.int(9,  "Custom: Tenkan", minval = 1, inline = "cu1", group = gI)
+customKijun      = input.int(26, "Kijun", minval = 1, inline = "cu1", group = gI)
+customSenkouB    = input.int(52, "Custom: Span B", minval = 1, inline = "cu2", group = gI)
+customDisplace   = input.int(26, "Shift", minval = 2, maxval = 100, inline = "cu2", group = gI, tooltip = "Used only when Settings is 'Custom'. Shift is how far the cloud is drawn ahead (displacement).")
+showTenkanKijun  = input.bool(true, "Tenkan & Kijun lines", inline = "ln", group = gI)
+showChikou       = input.bool(false, "Chikou line", inline = "ln", group = gI, tooltip = "Chikou is off by default to keep the chart clean; it is still used by the signals and the panel.")
+showCloudBorders = input.bool(true, "Cloud edges", inline = "ce", group = gI)
+colorCandles     = input.bool(false, "Colour candles by trend", inline = "ce", group = gI, tooltip = "Candles turn green above the cloud with Tenkan over Kijun, red in the mirror case, slate otherwise.")
+
+// ── Signals on the chart
+gS = "Signals on the Chart"
+showBreakoutBadges = input.bool(true, "Cloud breakouts  ▲75", inline = "bo", group = gS)
+minScoreToShow     = input.int(75, "min. score", minval = 0, maxval = 100, inline = "bo", group = gS, tooltip = "A close through the whole cloud, scored 0-100 by a checklist (hover a badge for the breakdown). Only breakouts at or above this score get a badge and an alert.")
+showPerfectAlign   = input.bool(true, "Perfect alignment  ◆", group = gS, tooltip = "Kanzen: price, Tenkan, Kijun, the cloud and Chikou all in order. Marked once when it begins.")
+showTwistGhost     = input.bool(true, "Cloud colour change  ●", group = gS, tooltip = "● above (below) the candle on which Senkou Span A crosses above (below) Span B, so the cloud turns bullish (bearish). The cloud itself is drawn ahead, so its colour changes there a cloud-shift later; the panel's Cloud row counts the bars to it.")
+showKijunBounce    = input.bool(false, "Kijun bounces  ●", inline = "kb", group = gS)
+showTkCross        = input.bool(false, "Tenkan/Kijun crosses  ✕", inline = "kb", group = gS, tooltip = "Kijun bounce: in a trend, a candle dips to Kijun and closes back with the trend. TK cross: Tenkan crosses Kijun.")
+showChikouFreeSpace = input.bool(false, "Chikou open air  ✦", inline = "ca", group = gS)
+showKijunStretch   = input.bool(false, "Price far from Kijun  ⚠", inline = "ca", group = gS, tooltip = "Open air: Chikou clear of the cloud and of the candles in its path. Far from Kijun: price more than the Advanced threshold (ATR) away; it describes stretch, it does not predict a pullback.")
+showFlatSpanB      = input.bool(false, "Flat Span B levels", inline = "fl", group = gS)
+showKijunTrailing  = input.bool(false, "Kijun stop dots", inline = "fl", group = gS, tooltip = "Flat Span B: dotted rays where Span B stayed flat for many bars. Kijun dots: Kijun marked while trending, as a stop reference (it is not a trailing stop).")
+
+// ── Hosoda theories
+gH = "Hosoda Theories"
+showWaves          = input.bool(true, "Wave structure", inline = "wv", group = gH)
+waveKeep           = input.int(8, "swings shown", minval = 4, maxval = 60, inline = "wv", group = gH, tooltip = "Lines between confirmed swings with the wave type at each swing: I, V, N▲ / N▼ (continuation), P (narrowing), Y (widening), W (double top / bottom). Hover a letter for its meaning.")
+showHosodaTargets  = input.bool(true, "Price targets", inline = "pt", group = gH)
+hosodaMode         = input.string("Primary Targets (N, E)", "", options = ["All Targets (V, N, E, NT, 2E, 3E)", "Extended (N, E, 2E, 3E)", "Primary Targets (N, E)", "Conservative (V, N)", "Key Equilibrium (N Target Only)"], inline = "pt", group = gH, tooltip = "When a pullback C confirms between A and B, targets are projected: V = B + (B − C), N = C + (B − A), E = B + (B − A), NT = C + (C − A), 2E = B + 2(B − A), 3E = B + 3(B − A). ✓ when reached; removed if price closes beyond C first.")
+showTimeCycles     = input.bool(true, "Time windows ahead", inline = "tc", group = gH)
+tcShowMax          = input.int(5, "shown", minval = 1, maxval = 30, inline = "tc", group = gH, tooltip = "Future bars where Hosoda's numbers (9, 17, 26, 33, 42, 65, 76 … 257) counted from recent swings fall, plus T (the last leg's length repeated). Gold ◆ = two or more counts agree. Gold windows within 150 bars are always shown. Reference points, not forecasts.")
+showKasanari       = input.bool(true, "Time × price boxes (kasanari)", group = gH, tooltip = "A small gold box where a gold time window meets the nearest open price target.")
+swingLen           = input.int(10, "Swing size", minval = 3, maxval = 50, group = gH, tooltip = "Bars on each side that make a swing high / low. Higher = fewer, bigger swings. Waves, targets and time windows all start from these swings, which are confirmed this many bars after they form.")
+
+// ── Panel and chart key
+gP = "Panel & Chart Key"
+showMtfDashboard = input.bool(true, "Panel", inline = "pa", group = gP)
+panelMode        = input.string("Simple", "", options = ["Simple", "Detailed"], inline = "pa", group = gP, tooltip = "Simple: bias in plain words, higher timeframes, the cloud ahead, next price target and time window, last signal. Detailed: adds Kijun, Chikou, market state and wave type.")
+dashPos          = input.string("Top Right", "Position", options = ["Top Right", "Bottom Right", "Top Left", "Bottom Left"], inline = "pp", group = gP)
+dashSize         = input.string("Small", "Text", options = ["Tiny", "Small", "Normal"], inline = "pp", group = gP)
+showKey          = input.bool(true, "Chart key", inline = "ck", group = gP)
+chartTxtOpt      = input.string("Small", "Chart text", options = ["Tiny", "Small", "Normal"], inline = "ck", group = gP, tooltip = "Chart key: a small legend of every mark, bottom left; turn it off once you know them. Chart text: size of wave letters, target labels and time numbers.")
+htfMode          = input.string("Auto (4× and 16× chart)", "Higher timeframes", options = ["Auto (4× and 16× chart)", "Manual"], group = gP)
+htf1In           = input.timeframe("60",  "Manual", inline = "hm", group = gP)
+htf2In           = input.timeframe("240", "", inline = "hm", group = gP, tooltip = "Auto: 4× and 16× the chart timeframe (5m → 20m and 80m, 1h → 4h and 16h). Manual: the two timeframes here. Read from their last closed bar.")
+// ── Alerts
+gA = "Alerts"
+alBreakout = input.bool(true,  "Breakouts", inline = "a1", group = gA)
+alKanzen   = input.bool(true,  "Perfect alignment", inline = "a1", group = gA, tooltip = "Create one alert with the condition \"Any alert() function call\" to receive every event ticked here, with score, price and targets in the message. Single events are also available as separate alert conditions.")
+alTwist    = input.bool(true,  "Cloud colour change", inline = "a2", group = gA)
+alHosoda   = input.bool(true,  "Target reached", inline = "a2", group = gA)
+alBounce   = input.bool(true,  "Kijun bounces", inline = "a3", group = gA)
+alWave     = input.bool(false, "New price targets", inline = "a3", group = gA)
+alTime     = input.bool(false, "Gold time window", inline = "a4", group = gA)
+alMtf      = input.bool(false, "Timeframes align / split", inline = "a4", group = gA)
+alTk       = input.bool(false, "TK crosses", inline = "a5", group = gA)
+alOther    = input.bool(false, "Span B, Chikou, stretch", inline = "a5", group = gA)
+
+// ── Colours
+gC = "Colours"
+colCloudBull  = input.color(#D4AF37, "Cloud", inline = "c1", group = gC)
+colCloudBear  = input.color(#9F1239, "", inline = "c1", group = gC)
+cloudOpacity  = input.int(92, "fill transparency", minval = 50, maxval = 98, inline = "c1", group = gC)
+borderOpacity = input.int(75, "Cloud edge transparency", minval = 0, maxval = 100, step = 5, group = gC)
+colTenkan     = input.color(#34D399, "Tenkan", inline = "c2", group = gC)
+colKijun      = input.color(#FB7185, "Kijun", inline = "c2", group = gC)
+tkTransp      = input.int(35, "transparency", minval = 0, maxval = 100, step = 5, inline = "c2", group = gC)
+colChikou     = input.color(#C9B37E, "Chikou", inline = "c3", group = gC)
+chikouTransp  = input.int(60, "transparency", minval = 0, maxval = 100, step = 5, inline = "c3", group = gC)
+colHosodaBull = input.color(#34D399, "Price targets", inline = "c4", group = gC)
+colHosodaBear = input.color(#FB7185, "", inline = "c4", group = gC)
+colTimeCycle  = input.color(#C9B37E, "Time windows", inline = "c5", group = gC)
+colConfl      = input.color(#FFD400, "gold", inline = "c5", group = gC)
+colFlatSpanB  = input.color(#C9B37E, "Flat Span B", group = gC)
+colTwistBull  = #FFD400
+colTwistBear  = #FF3B6B
+colBuyBadge   = #34D399
+colSellBadge  = #FB7185
+colPerfect    = #E8DFC8   // ivory: neutral against the gold / crimson palette
+
+// ── Advanced: breakout score
+gB = "Advanced · Breakout Score"
+requireFullCross = input.bool(true, "Count only closes through the whole cloud", group = gB, tooltip = "On: a bullish breakout must come from below the cloud; a dip into the cloud from above and back out does not count. Mirror for bearish.")
+minBreakoutGap   = input.int(30, "Bars between badges", minval = 0, maxval = 200, inline = "b0", group = gB)
+atrLen           = input.int(14, "ATR length", minval = 2, inline = "b0", group = gB)
+w_thickness = input.int(30, "Weights: cloud thickness", minval = 0, maxval = 100, inline = "b1", group = gB)
+w_chikou    = input.int(30, "Chikou", minval = 0, maxval = 100, inline = "b1", group = gB)
+w_tk        = input.int(20, "Tenkan/Kijun", minval = 0, maxval = 100, inline = "b2", group = gB)
+w_margin    = input.int(20, "close margin", minval = 0, maxval = 100, inline = "b2", group = gB)
+w_htf       = input.int(15, "Higher timeframes", minval = 0, maxval = 100, inline = "b3", group = gB)
+w_vol       = input.int(10, "volume", minval = 0, maxval = 100, inline = "b3", group = gB)
+w_mom       = input.int(10, "RSI", minval = 0, maxval = 100, inline = "b3", group = gB, tooltip = "Points for: a thick cloud crossed (full at 2× ATR), Chikou clear, Tenkan on the breakout side of Kijun, close margin beyond the cloud (full at 0.5× ATR), higher timeframes agreeing, volume above average (full at 1.5×), RSI with the move (full at 65 / 35). Scaled to 100 over the parts that apply; 0 removes a part.")
+chopMode     = input.string("Penalty", "Choppy market", options = ["Off", "Penalty", "Suppress"], inline = "b4", group = gB)
+chopPenalty  = input.int(15, "penalty", minval = 0, maxval = 100, inline = "b4", group = gB, tooltip = "Choppy = at least 2 of: ADX below the level below, flat Kijun, cloud thinner than 0.5× ATR. Penalty subtracts points (badge tagged CH); Suppress skips breakouts while choppy.")
+adxLen       = input.int(14, "ADX length", minval = 2, inline = "b5", group = gB)
+adxChopLevel = input.float(20.0, "choppy below", minval = 5.0, maxval = 40.0, step = 1.0, inline = "b5", group = gB)
+volLen       = input.int(20, "Volume average", minval = 2, inline = "b6", group = gB)
+rsiLen       = input.int(14, "RSI length", minval = 2, inline = "b6", group = gB)
+
+// ── Advanced: fine tuning
+gF = "Advanced · Fine Tuning"
+minTwistGap      = input.int(40, "Cloud change: bars apart", minval = 0, maxval = 200, inline = "f1", group = gF)
+minTwistStrength = input.float(0.6, "min speed (ATR)", minval = 0.0, maxval = 3.0, step = 0.1, inline = "f1", group = gF, tooltip = "Span A and B can cross back and forth in sideways markets. A colour change is marked only this many bars after the last one, and only if the lines converged by this many ATR over 5 bars.")
+minKijunGap      = input.int(15, "Bars apart: Kijun bounces", minval = 0, maxval = 200, inline = "f2", group = gF)
+minTkGap         = input.int(20, "TK crosses", minval = 0, maxval = 200, inline = "f2", group = gF)
+minPerfectGap    = input.int(60, "perfect alignment", minval = 0, maxval = 300, inline = "f2", group = gF)
+waveTolAtr       = input.float(0.5, "Double top / bottom tolerance (ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = gF, tooltip = "Two highs (lows) closer than this count as a W wave.")
+hosodaExtendBars = input.int(20, "Target line length", minval = 5, maxval = 60, inline = "f4", group = gF)
+tcAnchors        = input.int(2, "Time: count from last", minval = 1, maxval = 3, inline = "f4", group = gF)
+showTaito        = input.bool(true, "swings + T", inline = "f4", group = gF, tooltip = "Target lines: minimum length in bars (open targets keep extending). Time windows: counted from the last 1-3 swings; T adds Taito Sūchi (the last leg's length repeated).")
+flatSpanMinBars  = input.int(10, "Flat Span B: min bars", minval = 3, maxval = 30, inline = "f5", group = gF)
+maxFlatRays      = input.int(4, "max rays", minval = 1, maxval = 10, inline = "f5", group = gF)
+flatRayMaxAge    = input.int(300, "expiry", minval = 20, maxval = 2000, inline = "f5", group = gF)
+kijunStretchAtr  = input.float(2.5, "Far from Kijun (ATR)", minval = 1.0, maxval = 5.0, step = 0.1, group = gF)
+
+// ── Branding
+g10 = " A X E A L G O "
+showWatermark = input.bool(true, "AxeAlgo Watermark", group = g10)
+
+chartTxt = chartTxtOpt == "Normal" ? size.normal : chartTxtOpt == "Small" ? size.small : size.tiny
+dSz   = dashSize == "Normal" ? size.normal : dashSize == "Small" ? size.small : size.tiny
+dSzUp = dashSize == "Normal" ? size.large : dashSize == "Small" ? size.normal : size.small
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  CORE ICHIMOKU CALCULATIONS
+// ═════════════════════════════════════════════════════════════════════════════════
+tenkanLen = presetMode == "Futures Intraday (12, 36, 72, 36)" ? 12 :
+             presetMode == "Crypto 24/7 (20, 60, 120, 30)" ? 20 :
+             presetMode == "Forex 5-Day (8, 22, 44, 22)"    ? 8  :
+             presetMode == "Fast / Scalp (7, 22, 44, 22)"   ? 7  :
+             presetMode == "Custom"                         ? customTenkan : 9
+
+kijunLen = presetMode == "Futures Intraday (12, 36, 72, 36)" ? 36 :
+             presetMode == "Crypto 24/7 (20, 60, 120, 30)" ? 60 :
+             presetMode == "Forex 5-Day (8, 22, 44, 22)"    ? 22 :
+             presetMode == "Fast / Scalp (7, 22, 44, 22)"   ? 22 :
+             presetMode == "Custom"                         ? customKijun : 26
+
+senkouBLen = presetMode == "Futures Intraday (12, 36, 72, 36)" ? 72 :
+              presetMode == "Crypto 24/7 (20, 60, 120, 30)" ? 120 :
+              presetMode == "Forex 5-Day (8, 22, 44, 22)"    ? 44  :
+              presetMode == "Fast / Scalp (7, 22, 44, 22)"   ? 44  :
+              presetMode == "Custom"                         ? customSenkouB : 52
+
+displacement = presetMode == "Futures Intraday (12, 36, 72, 36)" ? 36 :
+                 presetMode == "Crypto 24/7 (20, 60, 120, 30)" ? 30 :
+                 presetMode == "Forex 5-Day (8, 22, 44, 22)"    ? 22 :
+                 presetMode == "Fast / Scalp (7, 22, 44, 22)"   ? 22 :
+                 presetMode == "Custom"                         ? customDisplace : 26
+
+tenkan = (ta.highest(high, tenkanLen) + ta.lowest(low, tenkanLen)) / 2
+kijun  = (ta.highest(high, kijunLen) + ta.lowest(low, kijunLen)) / 2
+
+// "Today's" values of the lines plotted `displacement - 1` bars forward: the future cloud, already known now.
+senkouA = (tenkan + kijun) / 2
+senkouB = (ta.highest(high, senkouBLen) + ta.lowest(low, senkouBLen)) / 2
+
+chikou = close
+atr    = ta.atr(atrLen)
+
+// Kijun slope over 3 bars, normalized by ATR so "flat" means the same thing on any instrument.
+kijunDiff = kijun - kijun[3]
+kijunEps  = atr * 0.05
+kijunDir  = kijunDiff > kijunEps ? 1 : kijunDiff < -kijunEps ? -1 : 0
+
+[_diPlus, _diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+rsiVal    = ta.rsi(close, rsiLen)
+volAvg    = ta.sma(volume, volLen)
+hasVolume = nz(volAvg) > 0
+relVol    = hasVolume ? volume / volAvg : na
+
+cloudTopNow = math.max(senkouA[displacement - 1], senkouB[displacement - 1])
+cloudBotNow = math.min(senkouA[displacement - 1], senkouB[displacement - 1])
+curRegime   = close > cloudTopNow and tenkan > kijun ? 1 : close < cloudBotNow and tenkan < kijun ? -1 : 0
+
+bullCandleCol = close >= open ? color.new(#34D399, 10) : color.new(#059669, 10)
+bearCandleCol = close >= open ? color.new(#FB7185, 10) : color.new(#E11D48, 10)
+chopCandleCol = color.new(#64748B, 30)
+barcolor(colorCandles ? (curRegime == 1 ? bullCandleCol : curRegime == -1 ? bearCandleCol : chopCandleCol) : na, title = "Regime Candle Color")
+
+f_px(float p) => str.tostring(p, format.mintick)
+f_where() => " on " + syminfo.ticker + " (" + timeframe.period + ")"
+
+// ─── Higher-timeframe regimes (last CONFIRMED HTF bar: [1] + lookahead_on, same on history & realtime) ───
+f_ichimokuRegime() =>
+    t = (ta.highest(high, tenkanLen) + ta.lowest(low, tenkanLen)) / 2
+    k = (ta.highest(high, kijunLen) + ta.lowest(low, kijunLen)) / 2
+    sA = (t + k) / 2
+    sB = (ta.highest(high, senkouBLen) + ta.lowest(low, senkouBLen)) / 2
+    cTop = math.max(sA[displacement - 1], sB[displacement - 1])
+    cBot = math.min(sA[displacement - 1], sB[displacement - 1])
+    regime = close > cTop and t > k ? 1 : close < cBot and t < k ? -1 : 0
+    regime
+
+chartSec = timeframe.in_seconds()
+autoHtf  = htfMode == "Auto (4× and 16× chart)"
+htf1     = autoHtf ? timeframe.from_seconds(chartSec * 4) : htf1In
+htf2     = autoHtf ? timeframe.from_seconds(chartSec * 16) : htf2In
+
+htf1Regime = request.security(syminfo.tickerid, htf1, f_ichimokuRegime()[1], lookahead = barmerge.lookahead_on, gaps = barmerge.gaps_off)
+htf2Regime = request.security(syminfo.tickerid, htf2, f_ichimokuRegime()[1], lookahead = barmerge.lookahead_on, gaps = barmerge.gaps_off)
+
+htf1Valid = timeframe.in_seconds(htf1) > chartSec
+htf2Valid = timeframe.in_seconds(htf2) > chartSec
+
+// Short timeframe name: "20m", "4h", "1D"
+f_tfTxt(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s < 60 ? str.tostring(s) + "s" : s < 3600 ? str.tostring(s / 60, "#") + "m" : s < 86400 and s % 3600 == 0 ? str.tostring(s / 3600, "#") + "h" : s < 86400 ? str.tostring(s / 60, "#") + "m" : tf
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  1. CLASSIC PLOTTING
+// ═════════════════════════════════════════════════════════════════════════════════
+plot(showTenkanKijun ? tenkan : na, "Tenkan-sen", color = color.new(colTenkan, tkTransp), linewidth = 1)
+plot(showTenkanKijun ? kijun  : na, "Kijun-sen",  color = color.new(colKijun, tkTransp),  linewidth = 1)
+plot(showChikou ? chikou : na, "Chikou Span", color = color.new(colChikou, chikouTransp), linewidth = 1, offset = -(displacement - 1))
+
+senkouAColor = senkouA >= senkouB ? colCloudBull : colCloudBear
+borderColor = showCloudBorders ? color.new(senkouAColor, borderOpacity) : na
+pA = plot(senkouA, "Senkou Span A", color = borderColor, offset = displacement - 1)
+pB = plot(senkouB, "Senkou Span B", color = borderColor, offset = displacement - 1)
+fill(pA, pB, color = color.new(senkouAColor, cloudOpacity), title = "Kumo")
+
+plot(showKijunTrailing and curRegime != 0 ? kijun : na, "Kijun Stop Reference", color = curRegime == 1 ? color.new(colBuyBadge, 25) : color.new(colSellBadge, 25), style = plot.style_circles, linewidth = 2)
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  2. KUMO TWIST
+//     senkouA/senkouB computed on THIS bar are plotted at bar_index + displacement - 1, so a cross detected
+//     here is a twist that becomes visible on the cloud `displacement - 1` bars from now. The chart mark sits on
+//     the candle where the cross happened (no offset); the panel counts the bars until the drawn cloud turns.
+// ═════════════════════════════════════════════════════════════════════════════════
+twistBullishRaw = ta.crossover(senkouA, senkouB)
+twistBearishRaw = ta.crossunder(senkouA, senkouB)
+
+// How fast the Span A/B gap changed over the last 5 bars, relative to ATR
+twistStrength   = math.abs((senkouA - senkouB) - (senkouA[5] - senkouB[5]))
+twistStrengthOk = atr > 0 ? twistStrength >= atr * minTwistStrength : true
+
+var int lastTwistBar = -999999
+twistGapOk   = (bar_index - lastTwistBar) >= minTwistGap
+twistBullish = twistBullishRaw and twistGapOk and twistStrengthOk
+twistBearish = twistBearishRaw and twistGapOk and twistStrengthOk
+
+if (twistBullish or twistBearish) and barstate.isconfirmed
+    lastTwistBar := bar_index
+
+// ● under / over the candle on which Span A crossed Span B (no offset; not an arrow: it describes the cloud,
+// not a trade direction)
+plotshape(showTwistGhost and twistBullish and barstate.isconfirmed ? high + atr * 0.8 : na, title = "Cloud Turns Bullish", style = shape.circle, location = location.absolute, color = color.new(colCloudBull, 10), size = size.tiny)
+plotshape(showTwistGhost and twistBearish and barstate.isconfirmed ? low - atr * 0.8 : na, title = "Cloud Turns Bearish", style = shape.circle, location = location.absolute, color = color.new(colCloudBear, 0), size = size.tiny)
+
+alertcondition(twistBullish and barstate.isconfirmed, title = "AxeAlgo: Bullish Kumo Twist", message = "AxeAlgo: Senkou Span A crossed above Span B (cloud turns bullish) on {{ticker}} ({{interval}}).")
+alertcondition(twistBearish and barstate.isconfirmed, title = "AxeAlgo: Bearish Kumo Twist", message = "AxeAlgo: Senkou Span A crossed below Span B (cloud turns bearish) on {{ticker}} ({{interval}}).")
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  3. TENKAN/KIJUN CROSS & KIJUN BOUNCE
+// ═════════════════════════════════════════════════════════════════════════════════
+tkCrossBullRaw = ta.crossover(tenkan, kijun)
+tkCrossBearRaw = ta.crossunder(tenkan, kijun)
+
+var int lastTkBar = -999999
+tkGapOk      = (bar_index - lastTkBar) >= minTkGap
+tkCrossBull  = tkCrossBullRaw and tkGapOk
+tkCrossBear  = tkCrossBearRaw and tkGapOk
+
+if (tkCrossBull or tkCrossBear) and barstate.isconfirmed
+    lastTkBar := bar_index
+
+plotshape(showTkCross and tkCrossBull and barstate.isconfirmed ? low - atr * 0.5 : na, title = "TK Cross Up", style = shape.xcross, location = location.absolute, color = colTenkan, size = size.tiny)
+plotshape(showTkCross and tkCrossBear and barstate.isconfirmed ? high + atr * 0.5 : na, title = "TK Cross Down", style = shape.xcross, location = location.absolute, color = colKijun, size = size.tiny)
+
+alertcondition(tkCrossBull and barstate.isconfirmed, title = "AxeAlgo: Bullish TK Cross", message = "AxeAlgo: Tenkan-sen crossed above Kijun-sen on {{ticker}} ({{interval}}).")
+alertcondition(tkCrossBear and barstate.isconfirmed, title = "AxeAlgo: Bearish TK Cross", message = "AxeAlgo: Tenkan-sen crossed below Kijun-sen on {{ticker}} ({{interval}}).")
+
+// Kijun bounce. Trend context is price vs. cloud + Kijun slope, not Tenkan > Kijun: a real pullback to Kijun
+// usually drags Tenkan across it first and would suppress exactly the setups wanted.
+var int lastKijunBounceBar = -999999
+kijunBounceGapOk = (bar_index - lastKijunBounceBar) >= minKijunGap
+
+bullKijunBounceRaw = close[1] > cloudTopNow[1] and kijun > cloudTopNow and kijunDir >= 0 and low <= kijun and low >= kijun - atr * 0.75 and close > kijun and close > open
+bearKijunBounceRaw = close[1] < cloudBotNow[1] and kijun < cloudBotNow and kijunDir <= 0 and high >= kijun and high <= kijun + atr * 0.75 and close < kijun and close < open
+
+bullKijunBounce = bullKijunBounceRaw and kijunBounceGapOk
+bearKijunBounce = bearKijunBounceRaw and kijunBounceGapOk
+
+if (bullKijunBounce or bearKijunBounce) and barstate.isconfirmed
+    lastKijunBounceBar := bar_index
+
+plotshape(showKijunBounce and bullKijunBounce and barstate.isconfirmed ? low - atr * 0.6 : na, title = "Kijun Bounce Bull", style = shape.circle, location = location.absolute, color = colBuyBadge, size = size.tiny)
+plotshape(showKijunBounce and bearKijunBounce and barstate.isconfirmed ? high + atr * 0.6 : na, title = "Kijun Bounce Bear", style = shape.circle, location = location.absolute, color = colSellBadge, size = size.tiny)
+
+alertcondition(bullKijunBounce and barstate.isconfirmed, title = "AxeAlgo: Bullish Kijun Bounce", message = "AxeAlgo: price tested Kijun-sen and closed back above it on {{ticker}} ({{interval}}).")
+alertcondition(bearKijunBounce and barstate.isconfirmed, title = "AxeAlgo: Bearish Kijun Bounce", message = "AxeAlgo: price tested Kijun-sen and closed back below it on {{ticker}} ({{interval}}).")
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  4. BREAKOUT SCORE
+//     Price today meets the cloud computed `displacement - 1` bars ago, plotted at this bar.
+// ═════════════════════════════════════════════════════════════════════════════════
+bullCrossRaw = ta.crossover(close, cloudTopNow)
+bearCrossRaw = ta.crossunder(close, cloudBotNow)
+
+// Side of the cloud of the last close outside it, as of the previous bar (1 above, -1 below)
+var int outSide = 0
+int prevOutSide = outSide
+if close > cloudTopNow
+    outSide := 1
+else if close < cloudBotNow
+    outSide := -1
+
+bullBreakout = bullCrossRaw and (not requireFullCross or prevOutSide == -1)
+bearBreakout = bearCrossRaw and (not requireFullCross or prevOutSide == 1)
+
+cloudThickness = math.abs(senkouA[displacement - 1] - senkouB[displacement - 1])
+thicknessScore = math.min(1.0, atr > 0 ? cloudThickness / (atr * 2.0) : 0.0) * w_thickness
+
+// Chikou (today's close, drawn `displacement - 1` bars back) clear of the price and the cloud at that position
+chikouRefHigh = high[displacement - 1]
+chikouRefLow  = low[displacement - 1]
+chikouRefCloudTop = displacement * 2 - 2 < bar_index ? math.max(senkouA[displacement * 2 - 2], senkouB[displacement * 2 - 2]) : na
+chikouRefCloudBot = displacement * 2 - 2 < bar_index ? math.min(senkouA[displacement * 2 - 2], senkouB[displacement * 2 - 2]) : na
+chikouBullClear = not na(chikouRefCloudTop) and close > chikouRefHigh and close > chikouRefCloudTop
+chikouBearClear = not na(chikouRefCloudBot) and close < chikouRefLow and close < chikouRefCloudBot
+chikouScore = (bullBreakout and chikouBullClear) or (bearBreakout and chikouBearClear) ? w_chikou : 0
+
+tkScore = (bullBreakout and tenkan > kijun) or (bearBreakout and tenkan < kijun) ? w_tk : 0
+
+marginDist  = bullBreakout ? close - cloudTopNow : bearBreakout ? cloudBotNow - close : 0.0
+marginScore = atr > 0 ? math.min(1.0, marginDist / (atr * 0.5)) * w_margin : 0.0
+
+htfDir       = bullBreakout ? 1 : bearBreakout ? -1 : 0
+htfValidCnt  = (htf1Valid ? 1 : 0) + (htf2Valid ? 1 : 0)
+htfAgreeCnt  = (htf1Valid and htf1Regime == htfDir ? 1 : 0) + (htf2Valid and htf2Regime == htfDir ? 1 : 0)
+htfOpposeCnt = (htf1Valid and htf1Regime == -htfDir ? 1 : 0) + (htf2Valid and htf2Regime == -htfDir ? 1 : 0)
+htfScore     = htfDir != 0 and htfValidCnt > 0 ? (htfAgreeCnt / htfValidCnt) * w_htf : 0.0
+counterTrend = htfDir != 0 and htfValidCnt > 0 and htfOpposeCnt == htfValidCnt
+
+volScore = hasVolume and htfDir != 0 ? math.min(1.0, math.max(0.0, (relVol - 1.0) / 0.5)) * w_vol : 0.0
+momScore = htfDir != 0 ? math.min(1.0, math.max(0.0, (htfDir * (rsiVal - 50.0)) / 15.0)) * w_mom : 0.0
+
+chopCount = (adxVal < adxChopLevel ? 1 : 0) + (kijunDir == 0 ? 1 : 0) + (atr > 0 and cloudThickness < atr * 0.5 ? 1 : 0)
+isChop    = chopMode != "Off" and chopCount >= 2
+
+breakoutScore = thicknessScore + chikouScore + tkScore + marginScore + htfScore + volScore + momScore
+maxScore = w_thickness + w_chikou + w_tk + w_margin + (htfValidCnt > 0 ? w_htf : 0) + (hasVolume ? w_vol : 0) + w_mom
+breakoutScorePctRaw = maxScore > 0 ? (breakoutScore / maxScore) * 100.0 : 0.0
+chopPenaltyApplied  = isChop and chopMode == "Penalty"
+breakoutScorePct    = chopPenaltyApplied ? math.max(0.0, breakoutScorePctRaw - chopPenalty) : breakoutScorePctRaw
+chopSuppressed      = isChop and chopMode == "Suppress"
+
+var int lastBreakoutBar = -999999
+breakoutGapOk = (bar_index - lastBreakoutBar) >= minBreakoutGap
+
+bullBreakoutEvent = bullBreakout and breakoutScorePct >= minScoreToShow and breakoutGapOk and not chopSuppressed
+bearBreakoutEvent = bearBreakout and breakoutScorePct >= minScoreToShow and breakoutGapOk and not chopSuppressed
+
+if (bullBreakoutEvent or bearBreakoutEvent) and barstate.isconfirmed
+    lastBreakoutBar := bar_index
+
+// "Cloud thickness 24 / 30" … one line per component, for the badge tooltip
+f_part(string name, float pts, int w) =>
+    "\n" + name + " " + str.tostring(pts, "0") + " / " + str.tostring(w)
+
+if (bullBreakoutEvent or bearBreakoutEvent) and showBreakoutBadges and barstate.isconfirmed
+    string badgeTxt = (bullBreakoutEvent ? "▲" : "▼") + str.tostring(math.round(breakoutScorePct)) + (counterTrend ? " CT" : "") + (chopPenaltyApplied ? " CH" : "")
+    string tip = (bullBreakoutEvent ? "Bullish" : "Bearish") + " cloud breakout · score " + str.tostring(math.round(breakoutScorePct)) + " / 100" + f_part("Cloud thickness", thicknessScore, w_thickness) + f_part("Chikou clear", chikouScore, w_chikou) + f_part("Tenkan / Kijun", tkScore, w_tk) + f_part("Close-through margin", marginScore, w_margin) + (htfValidCnt > 0 ? f_part("Higher timeframes", htfScore, w_htf) : "\nHigher timeframes n/a") + (hasVolume ? f_part("Relative volume", volScore, w_vol) : "\nVolume n/a") + f_part("RSI momentum", momScore, w_mom) + (chopPenaltyApplied ? "\nChop penalty −" + str.tostring(chopPenalty) : "") + (counterTrend ? "\nCT: against every higher timeframe" : "") + "\nPoints are scaled to 100 over the components that apply. A checklist, not a probability."
+    float badgePrice = bullBreakoutEvent ? low - atr * 1.0 : high + atr * 1.0
+    // The main mark on the chart: a dark badge pointing at the breakout candle
+    label.new(bar_index, badgePrice, badgeTxt, style = bullBreakoutEvent ? label.style_label_up : label.style_label_down, color = color.new(#14110B, 0), textcolor = bullBreakoutEvent ? colCloudBull : #FB7185, size = size.small, text_formatting = text.format_bold, tooltip = tip)
+
+alertcondition(bullBreakoutEvent and barstate.isconfirmed, title = "AxeAlgo: Scored Bullish Cloud Breakout", message = "AxeAlgo: bullish cloud breakout with score above threshold on {{ticker}} ({{interval}}).")
+alertcondition(bearBreakoutEvent and barstate.isconfirmed, title = "AxeAlgo: Scored Bearish Cloud Breakout", message = "AxeAlgo: bearish cloud breakout with score above threshold on {{ticker}} ({{interval}}).")
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  5. PERFECT ALIGNMENT ("KANZEN") — marked once on entry into the state
+// ═════════════════════════════════════════════════════════════════════════════════
+perfectBullNow = close > tenkan and tenkan > kijun and kijun > cloudTopNow and chikouBullClear
+perfectBearNow = close < tenkan and tenkan < kijun and kijun < cloudBotNow and chikouBearClear
+
+var bool wasPerfectBull = false
+var bool wasPerfectBear = false
+var int  lastPerfectBar = -999999
+perfectGapOk      = (bar_index - lastPerfectBar) >= minPerfectGap
+perfectBullEvent  = perfectBullNow and not wasPerfectBull and perfectGapOk
+perfectBearEvent  = perfectBearNow and not wasPerfectBear and perfectGapOk
+
+if (perfectBullEvent or perfectBearEvent) and barstate.isconfirmed
+    lastPerfectBar := bar_index
+
+wasPerfectBull := perfectBullNow
+wasPerfectBear := perfectBearNow
+
+plotchar(showPerfectAlign and perfectBullEvent and barstate.isconfirmed ? low - atr * 1.2 : na, title = "Perfect Bullish Alignment", char = "◆", location = location.absolute, color = colPerfect, size = size.tiny)
+plotchar(showPerfectAlign and perfectBearEvent and barstate.isconfirmed ? high + atr * 1.2 : na, title = "Perfect Bearish Alignment", char = "◆", location = location.absolute, color = colPerfect, size = size.tiny)
+
+alertcondition(perfectBullEvent and barstate.isconfirmed, title = "AxeAlgo: Perfect Bullish Ichimoku Alignment", message = "AxeAlgo: perfect bullish Ichimoku alignment on {{ticker}} ({{interval}}): price, Tenkan, Kijun, cloud and Chikou all agree.")
+alertcondition(perfectBearEvent and barstate.isconfirmed, title = "AxeAlgo: Perfect Bearish Ichimoku Alignment", message = "AxeAlgo: perfect bearish Ichimoku alignment on {{ticker}} ({{interval}}): price, Tenkan, Kijun, cloud and Chikou all agree.")
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  6. HOSODA THEORIES: confirmed swings → wave theory (波動論), price theory (値幅観測論), time theory (時間論)
+// ═════════════════════════════════════════════════════════════════════════════════
+// Confirmed swings, alternating high / low, oldest first. A more extreme swing of the same kind that confirms
+// before the opposite one replaces the last swing (the usual zigzag rule).
+var array<float> swPx    = array.new<float>()
+var array<int>   swBar   = array.new<int>()
+var array<bool>  swHi    = array.new<bool>()
+var array<label> swLbl   = array.new<label>()     // wave-type label at each swing (na when not drawn)
+var array<line>  zzLines = array.new<line>()
+
+var array<int> kihon = array.from(9, 17, 26, 33, 42, 65, 76, 129, 172, 200, 226, 257)   // Kihon Sūchi
+
+swPh = ta.pivothigh(high, swingLen, swingLen)
+swPl = ta.pivotlow(low, swingLen, swingLen)
+
+f_waveTip(string t) =>
+    t == "I" ? "I wave: a single leg." : t == "V" ? "V wave: the move reversed; no continuation structure yet." : t == "N" ? "N wave: continuation. A higher low then a higher high (▲), or a lower high then a lower low (▼)." : t == "P" ? "P wave: contracting. Lower highs and higher lows; the range is narrowing." : t == "Y" ? "Y wave: expanding. Higher highs and lower lows; the range is widening." : "W wave: double top or bottom. The last two highs (lows) are within the tolerance of each other."
+
+// Hosoda's wave type at the newest swing, from the last four swings
+f_waveType() =>
+    int    n = array.size(swPx)
+    string t = n == 2 ? "I" : "V"
+    if n >= 4
+        bool  hi  = array.last(swHi)
+        float x2  = array.get(swPx, n - 1)     // newest swing
+        float x1  = array.get(swPx, n - 3)     // previous swing of the same kind
+        float y2  = array.get(swPx, n - 2)     // the opposite swings between and before them
+        float y1  = array.get(swPx, n - 4)
+        float tol = waveTolAtr * atr
+        t := math.abs(x2 - x1) <= tol ? "W" : (hi ? x2 < x1 and y2 > y1 : x2 > x1 and y2 < y1) ? "P" : (hi ? x2 > x1 and y2 < y1 : x2 < x1 and y2 > y1) ? "Y" : (hi ? x2 > x1 and y2 > y1 : x2 < x1 and y2 < y1) ? "N" : "V"
+    t
+
+f_drawWaveLabel() =>
+    int n = array.size(swPx)
+    if showWaves and n >= 2
+        string t   = f_waveType()
+        bool   hi  = array.last(swHi)
+        string txt = t == "N" ? (hi ? "N▲" : "N▼") : t
+        color  col = t == "N" ? (hi ? colCloudBull : #FB7185) : color.new(#E8DFC8, 45)
+        label  lb  = array.last(swLbl)
+        if na(lb)
+            array.set(swLbl, n - 1, label.new(array.last(swBar), array.last(swPx), txt, style = hi ? label.style_label_down : label.style_label_up, color = color.new(color.black, 100), textcolor = col, size = chartTxt, tooltip = f_waveTip(t)))
+        else
+            label.set_xy(lb, array.last(swBar), array.last(swPx))
+            label.set_text(lb, txt)
+            label.set_textcolor(lb, col)
+            label.set_tooltip(lb, f_waveTip(t))
+    true
+
+// New confirmed swing: 1 = appended, 2 = replaced the last swing, 0 = ignored (less extreme than the last one)
+f_addSwing(bool isHi, float px, int b) =>
+    int res = 0
+    int n   = array.size(swPx)
+    if n > 0 and array.last(swHi) == isHi
+        if isHi ? px > array.last(swPx) : px < array.last(swPx)
+            array.set(swPx, n - 1, px)
+            array.set(swBar, n - 1, b)
+            if n > 1 and array.size(zzLines) > 0
+                line.set_xy2(array.last(zzLines), b, px)
+            res := 2
+    else
+        if n > 0 and showWaves
+            array.push(zzLines, line.new(array.last(swBar), array.last(swPx), b, px, color = color.new(#C9B37E, 62), width = 1))
+            while array.size(zzLines) > waveKeep - 1
+                line.delete(array.shift(zzLines))
+        array.push(swPx, px)
+        array.push(swBar, b)
+        array.push(swHi, isHi)
+        array.push(swLbl, label(na))
+        // only the latest waveKeep swings keep their letter
+        int nNew = array.size(swLbl)
+        if nNew > waveKeep
+            label.delete(array.get(swLbl, nNew - 1 - waveKeep))
+            array.set(swLbl, nNew - 1 - waveKeep, label(na))
+        while array.size(swPx) > 150
+            array.shift(swPx)
+            array.shift(swBar)
+            array.shift(swHi)
+            array.shift(swLbl)
+        res := 1
+    if res != 0
+        f_drawWaveLabel()
+    res
+
+// ─── Time theory ───
+// Anchors with a Kihon number within ±1 bar of bar b, counting from swing iA and up to tcAnchors - 1 swings before it
+f_kihonCount(int b, int iA) =>
+    int cnt = 0
+    for j = 0 to tcAnchors - 1
+        int idx = iA - j
+        if idx < 0
+            break
+        int a = array.get(swBar, idx)
+        for k in kihon
+            if math.abs(b - (a + k)) <= 1
+                cnt += 1
+                break
+    cnt
+
+// Taito Sūchi: the duration of the leg ending at swing iA, repeated once or twice from it, within ±1 bar of b
+f_onTaito(int b, int iA) =>
+    bool on = false
+    if iA >= 1
+        int a = array.get(swBar, iA)
+        int L = a - array.get(swBar, iA - 1)
+        if L > 0
+            on := math.abs(b - (a + L)) <= 1 or math.abs(b - (a + 2 * L)) <= 1
+    on
+
+// Time sources agreeing on bar b, counted from the newest swing (each anchor and Taito count once)
+f_timeScore(int b) =>
+    int n = array.size(swBar)
+    n == 0 ? 0 : f_kihonCount(b, n - 1) + (showTaito and f_onTaito(b, n - 1) ? 1 : 0)
+
+// ─── Price theory: V, N, E, NT, 2E, 3E from a developing N wave (A → B → pullback C), tracked until reached or failed ───
+type HTarget
+    float px
+    int   dir            // 1 bullish, -1 bearish
+    int   k              // 0 V, 1 N, 2 E, 3 NT, 4 2E, 5 3E
+    int   bar            // bar the projection was made
+    float inv            // swing C: a close beyond it fails the projection
+    line  ln             // drawing, na once retired or never drawn
+    label lb
+
+var array<HTarget> hOpen  = array.new<HTarget>()      // targets not decided yet (drawn or not)
+var array<HTarget> hDrawn = array.new<HTarget>()      // drawn targets, oldest first
+var array<int>     hSets  = array.new<int>()          // drawn targets per projection, so whole sets retire together
+var array<int>     hLast  = array.new<int>(1, -1)     // bar of the latest projection
+
+f_hName(int k) => k == 0 ? "V" : k == 1 ? "N" : k == 2 ? "E" : k == 3 ? "NT" : k == 4 ? "2E" : "3E"
+f_hInMode(int k) =>
+    (hosodaMode == "All Targets (V, N, E, NT, 2E, 3E)" and k <= 5) or (hosodaMode == "Extended (N, E, 2E, 3E)" and k >= 1 and k != 3 and k <= 5) or (hosodaMode == "Primary Targets (N, E)" and (k == 1 or k == 2)) or (hosodaMode == "Conservative (V, N)" and k <= 1) or (hosodaMode == "Key Equilibrium (N Target Only)" and k == 1)
+
+f_hosodaEvent(bool isBull, float pA, float pB, float pC, int cBar) =>
+    array<float> tg = array.from(2.0 * pB - pC, pC + (pB - pA), pB + (pB - pA), pC + (pC - pA), pB + 2.0 * (pB - pA), pB + 3.0 * (pB - pA))
+    array.set(hLast, 0, bar_index)
+    // Keep the drawings of the previous projection only; older sets are deleted (still tracked for ✓ and alerts)
+    if showHosodaTargets
+        while array.size(hSets) >= 2
+            int nOld = array.shift(hSets)
+            if nOld > 0
+                for _i = 1 to nOld
+                    HTarget o = array.shift(hDrawn)
+                    if not na(o.ln)
+                        line.delete(o.ln)
+                        label.delete(o.lb)
+                    o.ln := na
+                    o.lb := na
+    int drawn = 0
+    int dir   = isBull ? 1 : -1
+    for k = 0 to 5
+        float px = array.get(tg, k)
+        // only targets still ahead of price
+        if dir == 1 ? px > close : px < close
+            HTarget h = HTarget.new(px, dir, k, bar_index, pC)
+            array.push(hOpen, h)
+            if showHosodaTargets and f_hInMode(k)
+                color col    = isBull ? colHosodaBull : colHosodaBear
+                int   endBar = bar_index + hosodaExtendBars
+                h.ln := line.new(cBar, px, endBar, px, color = color.new(col, 25), style = line.style_dashed, width = 1)
+                h.lb := label.new(endBar, px, f_hName(k) + ": " + f_px(px), style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(col, 10), size = chartTxt, tooltip = "Hosoda " + f_hName(k) + " target of the " + (isBull ? "bullish" : "bearish") + " N wave A " + f_px(pA) + " → B " + f_px(pB) + " → C " + f_px(pC) + ". ✓ when reached; removed if price closes beyond C first.")
+                array.push(hDrawn, h)
+                drawn += 1
+    if drawn > 0
+        array.push(hSets, drawn)
+    while array.size(hOpen) > 200
+        array.shift(hOpen)
+    true
+
+// A newly appended swing C that pulls back between A and B starts a projection. Returns whether one was made.
+f_project() =>
+    bool made = false
+    int  n    = array.size(swPx)
+    if n >= 3
+        bool  cLow = not array.last(swHi)                // C is a low: bullish N in progress
+        float pC   = array.get(swPx, n - 1)
+        float pB   = array.get(swPx, n - 2)
+        float pA   = array.get(swPx, n - 3)
+        if cLow ? pA < pC and pC < pB : pA > pC and pC > pB
+            f_hosodaEvent(cLow, pA, pB, pC, array.get(swBar, n - 1))
+            made := true
+    made
+
+// Decide open targets on this closed bar: reached (✓), or failed on a close beyond C or after 500 bars.
+// Returns whether a target was reached and which.
+f_hStep() =>
+    bool   hitNow = false
+    string hitTxt = ""
+    int i = 0
+    while i < array.size(hOpen)
+        HTarget h = array.get(hOpen, i)
+        int res = 0
+        if bar_index > h.bar
+            if h.dir == 1 ? high >= h.px : low <= h.px
+                res := 1
+            else if (h.dir == 1 ? close < h.inv : close > h.inv) or bar_index - h.bar > 500
+                res := 2
+        if res != 0
+            if res == 1
+                hitNow := true
+                hitTxt := hitTxt + (hitTxt == "" ? "" : ", ") + f_hName(h.k) + " " + f_px(h.px)
+            if not na(h.ln)
+                if res == 1
+                    // reached: solid line ending at the touch, with ✓
+                    color col = h.dir == 1 ? colHosodaBull : colHosodaBear
+                    line.set_x2(h.ln, bar_index)
+                    line.set_color(h.ln, color.new(col, 30))
+                    line.set_style(h.ln, line.style_solid)
+                    label.set_x(h.lb, bar_index)
+                    label.set_text(h.lb, "✓ " + f_hName(h.k) + ": " + f_px(h.px))
+                else
+                    // failed: removed from the chart
+                    line.delete(h.ln)
+                    label.delete(h.lb)
+                    h.ln := na
+                    h.lb := na
+            array.remove(hOpen, i)
+        else
+            if not na(h.ln) and line.get_x2(h.ln) < bar_index + 3
+                line.set_x2(h.ln, bar_index + 3)
+                label.set_x(h.lb, bar_index + 3)
+            i += 1
+    [hitNow, hitTxt]
+
+// ─── Per closed bar: decide targets, then take in new swings ───
+bool   hosodaHitNow  = false
+string hosodaHitTxt  = ""
+bool   hosodaNewBull = false
+bool   hosodaNewBear = false
+if barstate.isconfirmed
+    [hn, ht] = f_hStep()
+    hosodaHitNow := hn
+    hosodaHitTxt := ht
+    int rHi = not na(swPh) ? f_addSwing(true, swPh, bar_index - swingLen) : 0
+    if rHi == 1
+        hosodaNewBear := f_project()
+    int rLo = not na(swPl) ? f_addSwing(false, swPl, bar_index - swingLen) : 0
+    if rLo == 1
+        hosodaNewBull := f_project()
+
+// Time window now: at least two time sources (anchors / Taito) agree on this bar, and they did not on the last one
+timeConfNow = barstate.isconfirmed and f_timeScore(bar_index) >= 2 and f_timeScore(bar_index - 1) < 2
+
+// ─── Time windows ahead and time × price confluence, redrawn on the last bar ───
+var array<line>  twLines  = array.new<line>()
+var array<label> twLabels = array.new<label>()
+var array<box>   kzBoxes  = array.new<box>()
+var int    tcNextIn  = na
+var string tcNextTxt = ""
+var int    tcConfIn  = na
+twLblY = ta.lowest(low, 150) - atr * 0.5
+
+// Future time windows: Kihon numbers from the last tcAnchors swings plus Taito, merged when within 1 bar of each other.
+// Returns the windows' bars, number of agreeing sources, and their numbers ("26+T").
+f_timeWindows() =>
+    array<int>    xs  = array.new<int>()
+    array<int>    src = array.new<int>()
+    array<string> txt = array.new<string>()
+    int n = array.size(swBar)
+    if n >= 1
+        for j = 0 to tcAnchors - 1
+            int idx = n - 1 - j
+            if idx < 0
+                break
+            int a = array.get(swBar, idx)
+            for k in kihon
+                int x = a + k
+                if x > bar_index and x - bar_index <= 480
+                    array.push(xs, x)
+                    array.push(src, j)
+                    array.push(txt, str.tostring(k))
+        if showTaito and n >= 2
+            int a = array.get(swBar, n - 1)
+            int L = a - array.get(swBar, n - 2)
+            if L > 0
+                for rep = 1 to 2
+                    int x = a + rep * L
+                    if x > bar_index and x - bar_index <= 480
+                        array.push(xs, x)
+                        array.push(src, 9)
+                        array.push(txt, rep == 1 ? "T" : "2T")
+    array<int>    wBar   = array.new<int>()
+    array<int>    wScore = array.new<int>()
+    array<string> wTxt   = array.new<string>()
+    int m = array.size(xs)
+    if m > 0
+        array<int> ord = array.sort_indices(xs, order.ascending)
+        int i = 0
+        while i < m
+            int    x0   = array.get(xs, array.get(ord, i))
+            int    last = x0
+            string t    = ""
+            array<int> srcs = array.new<int>()
+            int jj = i
+            while jj < m and array.get(xs, array.get(ord, jj)) - last <= 1
+                int o = array.get(ord, jj)
+                last := array.get(xs, o)
+                if not array.includes(srcs, array.get(src, o))
+                    array.push(srcs, array.get(src, o))
+                t := t + (t == "" ? "" : "+") + array.get(txt, o)
+                jj += 1
+            array.push(wBar, math.round((x0 + last) / 2))
+            array.push(wScore, array.size(srcs))
+            array.push(wTxt, t)
+            i := jj
+    [wBar, wScore, wTxt]
+
+if barstate.islast
+    while array.size(twLines) > 0
+        line.delete(array.pop(twLines))
+    while array.size(twLabels) > 0
+        label.delete(array.pop(twLabels))
+    while array.size(kzBoxes) > 0
+        box.delete(array.pop(kzBoxes))
+    [wBar, wScore, wTxt] = f_timeWindows()
+    tcNextIn  := na
+    tcNextTxt := ""
+    tcConfIn  := na
+    int nW = array.size(wBar)
+    if nW > 0
+        tcNextIn  := array.get(wBar, 0) - bar_index
+        tcNextTxt := array.get(wTxt, 0)
+        for i = 0 to nW - 1
+            if array.get(wScore, i) >= 2
+                tcConfIn := array.get(wBar, i) - bar_index
+                break
+    // Drawn: the next tcShowMax windows, plus gold ones within 150 bars. Gold windows get a dotted line; others only a
+    // number at the bottom, so the right side of the chart stays clear.
+    if showTimeCycles and nW > 0
+        int lastLblX = -100000
+        int row      = 0
+        for i = 0 to nW - 1
+            int  x    = array.get(wBar, i)
+            bool conf = array.get(wScore, i) >= 2
+            if not (i < tcShowMax or (conf and x - bar_index <= 150))
+                continue
+            // Labels closer than 10 bars would overlap: a plain one is skipped, a gold one moves down a row
+            // (up to three rows, then back to the top)
+            bool close2prev = x - lastLblX < 10
+            if not conf and close2prev
+                continue
+            row := close2prev ? (row + 1) % 3 : 0
+            if conf
+                array.push(twLines, line.new(x, close, x, close + atr, extend = extend.both, color = color.new(colConfl, 55), style = line.style_dotted, width = 1))
+            lastLblX := x
+            array.push(twLabels, label.new(x, twLblY - row * atr * 1.2, (conf ? "◆ " : "") + array.get(wTxt, i), style = label.style_label_up, color = color.new(color.black, 100), textcolor = conf ? color.new(colConfl, 10) : color.new(colTimeCycle, 40), size = chartTxt, tooltip = conf ? "Time confluence: " + str.tostring(array.get(wScore, i)) + " time counts land on this bar (±1). Kihon numbers from the latest swings, T = Taito (the last leg's duration repeated)." : "Hosoda time number " + array.get(wTxt, i) + " counted from a recent swing."))
+    // Kasanari: the next two gold time windows meet the open price target nearest to price
+    if showKasanari and nW > 0
+        float best = na
+        for h in hOpen
+            if not na(h.ln) and (na(best) or math.abs(h.px - close) < math.abs(best - close))
+                best := h.px
+        if not na(best)
+            int drawnKz = 0
+            for i = 0 to nW - 1
+                if array.get(wScore, i) >= 2 and drawnKz < 2
+                    int x = array.get(wBar, i)
+                    // box only: the target's own label already names the level, a second label would overlap it
+                    array.push(kzBoxes, box.new(x - 1, best + atr * 0.4, x + 1, best - atr * 0.4, border_color = color.new(colConfl, 25), bgcolor = color.new(colConfl, 82), border_width = 1))
+                    drawnKz += 1
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  7. FLAT SENKOU SPAN B LEVELS
+// ═════════════════════════════════════════════════════════════════════════════════
+var line[]  flatSpanBLines  = array.new_line()
+var label[] flatSpanBLabels = array.new_label()
+var float[] flatSpanBLevels = array.new_float()
+var int[]   flatSpanBBars   = array.new_int()
+
+var int flatBRun = 0
+spanBFlat = senkouB == senkouB[1]
+flatBRun := spanBFlat ? flatBRun + 1 : 1
+
+newFlatBQualified = flatBRun == flatSpanMinBars and barstate.isconfirmed
+
+while barstate.isconfirmed and array.size(flatSpanBBars) > 0 and bar_index - array.get(flatSpanBBars, 0) >= flatRayMaxAge
+    line.delete(array.shift(flatSpanBLines))
+    label.delete(array.shift(flatSpanBLabels))
+    array.shift(flatSpanBLevels)
+    array.shift(flatSpanBBars)
+
+if newFlatBQualified and showFlatSpanB
+    float newLvl = senkouB
+    bool alreadyExists = false
+    if array.size(flatSpanBLevels) > 0 and atr > 0
+        for i = 0 to array.size(flatSpanBLevels) - 1
+            if math.abs(array.get(flatSpanBLevels, i) - newLvl) < (atr * 0.25)
+                alreadyExists := true
+                break
+    if not alreadyExists
+        while array.size(flatSpanBLines) >= maxFlatRays
+            line.delete(array.shift(flatSpanBLines))
+            label.delete(array.shift(flatSpanBLabels))
+            array.shift(flatSpanBLevels)
+            array.shift(flatSpanBBars)
+        l = line.new(bar_index, newLvl, bar_index + 12, newLvl, extend = extend.right, color = color.new(colFlatSpanB, 45), style = line.style_dotted, width = 1)
+        lbl = label.new(bar_index + 12, newLvl, f_px(newLvl), style = label.style_none, textcolor = color.new(colFlatSpanB, 40), size = chartTxt, tooltip = "Flat Senkou Span B: unchanged for " + str.tostring(flatSpanMinBars) + "+ bars.")
+        array.push(flatSpanBLines, l)
+        array.push(flatSpanBLabels, lbl)
+        array.push(flatSpanBLevels, newLvl)
+        array.push(flatSpanBBars, bar_index)
+
+// Proximity, edge-triggered so it fires once per approach
+bool nearFlatSpanB = false
+if array.size(flatSpanBLevels) > 0 and atr > 0 and not newFlatBQualified
+    for i = 0 to array.size(flatSpanBLevels) - 1
+        if math.abs(close - array.get(flatSpanBLevels, i)) <= (atr * 0.20)
+            nearFlatSpanB := true
+            break
+nearFlatSpanBTrigger = nearFlatSpanB and not nearFlatSpanB[1]
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  8. CHIKOU OPEN AIR: Chikou clear of the cloud and of every candle from 5 bars behind it to Tenkan-length bars
+//     ahead of it (the candles it is about to move through)
+// ═════════════════════════════════════════════════════════════════════════════════
+chikouOff = displacement - 1
+caAhead   = math.max(1, chikouOff - tenkanLen)          // offset of the newest bar in the window
+caLen     = chikouOff + 5 - caAhead
+caHigh    = ta.highest(high, caLen)[caAhead]
+caLow     = ta.lowest(low, caLen)[caAhead]
+
+chikouOpenAirBull = not na(chikouRefCloudTop) and close > caHigh and close > chikouRefCloudTop and close > cloudTopNow
+chikouOpenAirBear = not na(chikouRefCloudBot) and close < caLow and close < chikouRefCloudBot and close < cloudBotNow
+
+chikouOpenAirBullTrigger = chikouOpenAirBull and not chikouOpenAirBull[1]
+chikouOpenAirBearTrigger = chikouOpenAirBear and not chikouOpenAirBear[1]
+
+plotchar(showChikouFreeSpace and chikouOpenAirBullTrigger and barstate.isconfirmed ? low - atr * 1.3 : na, title = "Chikou Open Air Bull", char = "✦", location = location.absolute, color = colBuyBadge, size = size.tiny)
+plotchar(showChikouFreeSpace and chikouOpenAirBearTrigger and barstate.isconfirmed ? high + atr * 1.3 : na, title = "Chikou Open Air Bear", char = "✦", location = location.absolute, color = colSellBadge, size = size.tiny)
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  8B. KIJUN SLOPE & STRETCH (price distance from Kijun in ATR)
+// ═════════════════════════════════════════════════════════════════════════════════
+kijunDistAtr  = atr > 0 ? (close - kijun) / atr : 0.0
+kijunSlopeTxt = kijunDir == 1 ? "Rising ▲" : kijunDir == -1 ? "Falling ▼" : "Flat ●"
+
+isKijunStretchedBull = kijunDistAtr >= kijunStretchAtr
+isKijunStretchedBear = kijunDistAtr <= -kijunStretchAtr
+
+kijunStretchTriggerBull = isKijunStretchedBull and not isKijunStretchedBull[1]
+kijunStretchTriggerBear = isKijunStretchedBear and not isKijunStretchedBear[1]
+
+plotchar(showKijunStretch and kijunStretchTriggerBull and barstate.isconfirmed ? high + atr * 1.1 : na, title = "Kijun Stretch Up", char = "⚠", location = location.absolute, color = color.new(#F59E0B, 0), size = size.tiny)
+plotchar(showKijunStretch and kijunStretchTriggerBear and barstate.isconfirmed ? low - atr * 1.1 : na, title = "Kijun Stretch Down", char = "⚠", location = location.absolute, color = color.new(#F59E0B, 0), size = size.tiny)
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  9. MULTI-TIMEFRAME ALIGNMENT
+// ═════════════════════════════════════════════════════════════════════════════════
+f_regimeCol(r) =>
+    r == 1 ? colBuyBadge : r == -1 ? colSellBadge : #C9B37E
+
+allAligned = curRegime != 0 and htf1Valid and htf2Valid and curRegime == htf1Regime and curRegime == htf2Regime
+
+var int lastAlignState = 0
+alignStateNow = allAligned ? curRegime : 0
+mtfBullGained = alignStateNow == 1  and lastAlignState != 1
+mtfBearGained = alignStateNow == -1 and lastAlignState != -1
+mtfLost       = alignStateNow == 0  and lastAlignState != 0
+lastAlignState := alignStateNow
+
+alertcondition(mtfBullGained and barstate.isconfirmed, title = "AxeAlgo: MTF Bullish Alignment Gained", message = "AxeAlgo: chart and both higher timeframes are in a bullish Ichimoku regime on {{ticker}} ({{interval}}).")
+alertcondition(mtfBearGained and barstate.isconfirmed, title = "AxeAlgo: MTF Bearish Alignment Gained", message = "AxeAlgo: chart and both higher timeframes are in a bearish Ichimoku regime on {{ticker}} ({{interval}}).")
+alertcondition(mtfLost and barstate.isconfirmed, title = "AxeAlgo: MTF Alignment Lost", message = "AxeAlgo: multi-timeframe Ichimoku alignment lost on {{ticker}} ({{interval}}).")
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  10. alert() MESSAGES (one "Any alert() function call" alert receives all ticked events)
+// ═════════════════════════════════════════════════════════════════════════════════
+if barstate.isconfirmed
+    if alBreakout and (bullBreakoutEvent or bearBreakoutEvent)
+        alert("Ichimoku Pro: " + (bullBreakoutEvent ? "bullish" : "bearish") + " cloud breakout, score " + str.tostring(math.round(breakoutScorePct)) + (counterTrend ? " (counter-trend)" : "") + (chopPenaltyApplied ? " (chop)" : "") + f_where() + ", close " + f_px(close), alert.freq_once_per_bar_close)
+    if alBounce and (bullKijunBounce or bearKijunBounce)
+        alert("Ichimoku Pro: " + (bullKijunBounce ? "bullish" : "bearish") + " Kijun bounce" + f_where() + ", Kijun " + f_px(kijun) + ", close " + f_px(close), alert.freq_once_per_bar_close)
+    if alKanzen and (perfectBullEvent or perfectBearEvent)
+        alert("Ichimoku Pro: perfect " + (perfectBullEvent ? "bullish" : "bearish") + " alignment" + f_where() + ", close " + f_px(close), alert.freq_once_per_bar_close)
+    if alTwist and (twistBullish or twistBearish)
+        alert("Ichimoku Pro: Span A crossed " + (twistBullish ? "above" : "below") + " Span B, cloud turns " + (twistBullish ? "bullish" : "bearish") + f_where() + ", close " + f_px(close), alert.freq_once_per_bar_close)
+    if alWave and (hosodaNewBull or hosodaNewBear)
+        alert("Ichimoku Pro: " + (hosodaNewBull ? "bullish" : "bearish") + " N wave pullback confirmed, Hosoda targets projected" + f_where(), alert.freq_once_per_bar_close)
+    if alTime and timeConfNow
+        alert("Ichimoku Pro: time confluence window on this bar" + f_where(), alert.freq_once_per_bar_close)
+    if alHosoda and hosodaHitNow
+        alert("Ichimoku Pro: Hosoda target reached (" + hosodaHitTxt + ")" + f_where(), alert.freq_once_per_bar_close)
+    if alMtf and (mtfBullGained or mtfBearGained or mtfLost)
+        alert("Ichimoku Pro: multi-timeframe alignment " + (mtfLost ? "lost" : mtfBullGained ? "gained (bullish)" : "gained (bearish)") + f_where(), alert.freq_once_per_bar_close)
+    if alTk and (tkCrossBull or tkCrossBear)
+        alert("Ichimoku Pro: Tenkan crossed " + (tkCrossBull ? "above" : "below") + " Kijun" + f_where() + ", close " + f_px(close), alert.freq_once_per_bar_close)
+    if alOther and nearFlatSpanBTrigger
+        alert("Ichimoku Pro: price near a flat Span B level" + f_where() + ", close " + f_px(close), alert.freq_once_per_bar_close)
+    if alOther and (chikouOpenAirBullTrigger or chikouOpenAirBearTrigger)
+        alert("Ichimoku Pro: Chikou in open air (" + (chikouOpenAirBullTrigger ? "bullish" : "bearish") + ")" + f_where(), alert.freq_once_per_bar_close)
+    if alOther and (kijunStretchTriggerBull or kijunStretchTriggerBear)
+        alert("Ichimoku Pro: price " + str.tostring(math.abs(kijunDistAtr), "0.0") + " ATR from Kijun" + f_where(), alert.freq_once_per_bar_close)
+
+// ─── Last-signal tracker (signals visible on the chart; priority: breakout > Kanzen > bounce > twist) ───
+var string lastSigTxt = "—"
+var color  lastSigCol = #64748B
+var int    lastSigBar = na
+
+if barstate.isconfirmed
+    if (bullBreakoutEvent or bearBreakoutEvent) and showBreakoutBadges
+        lastSigTxt := (bullBreakoutEvent ? "▲ Breakout " : "▼ Breakout ") + str.tostring(math.round(breakoutScorePct)) + (counterTrend ? " CT" : "") + (chopPenaltyApplied ? " CH" : "")
+        lastSigCol := bullBreakoutEvent ? colBuyBadge : colSellBadge
+        lastSigBar := bar_index
+    else if (perfectBullEvent or perfectBearEvent) and showPerfectAlign
+        lastSigTxt := perfectBullEvent ? "◆ Kanzen ▲" : "◆ Kanzen ▼"
+        lastSigCol := colPerfect
+        lastSigBar := bar_index
+    else if (bullKijunBounce or bearKijunBounce) and showKijunBounce
+        lastSigTxt := bullKijunBounce ? "● Kijun Bounce ▲" : "● Kijun Bounce ▼"
+        lastSigCol := bullKijunBounce ? colBuyBadge : colSellBadge
+        lastSigBar := bar_index
+    else if (twistBullish or twistBearish) and showTwistGhost
+        lastSigTxt := twistBullish ? "● Cloud turns ▲" : "● Cloud turns ▼"
+        lastSigCol := twistBullish ? colTwistBull : colTwistBear
+        lastSigBar := bar_index
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  PANEL
+// ═════════════════════════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 11, frame_color = color.new(#D4AF37, 0), frame_width = 2, border_color = color.new(#B8860B, 60), border_width = 1)
+var table keyT = table.new(position.bottom_left, 2, 7, frame_color = color.new(#B8860B, 60), frame_width = 1, border_width = 0)
+
+f_row(int r, string key, string val, color valCol, string tip) =>
+    table.cell(dash, 0, r, key, bgcolor = color.new(#0E171D, 15), text_color = color.new(#C9B37E, 10), text_size = dSz, text_halign = text.align_left, tooltip = tip)
+    table.cell(dash, 1, r, val, bgcolor = color.new(#0E171D, 15), text_color = valCol, text_size = dSz, text_halign = text.align_right, tooltip = tip)
+
+f_regSym(int r) => r == 1 ? "▲" : r == -1 ? "▼" : "●"
+
+f_chk(int v) => v == 1 ? "▲" : v == -1 ? "▼" : "●"
+
+// Overall bias: five classic Ichimoku checks, each +1 bullish, −1 bearish, 0 neutral
+bPrice  = close > cloudTopNow ? 1 : close < cloudBotNow ? -1 : 0
+bTk     = tenkan > kijun ? 1 : tenkan < kijun ? -1 : 0
+bChikou = chikouBullClear ? 1 : chikouBearClear ? -1 : 0
+bFuture = senkouA > senkouB ? 1 : senkouA < senkouB ? -1 : 0
+bKijun  = kijunDir
+biasSum = bPrice + bTk + bChikou + bFuture + bKijun
+
+if barstate.islast
+    table.clear(dash, 0, 0, 1, 10)
+    if showMtfDashboard
+        bool detailed = panelMode == "Detailed"
+        table.set_position(dash, dashPos == "Top Right" ? position.top_right : dashPos == "Bottom Right" ? position.bottom_right : dashPos == "Top Left" ? position.top_left : position.bottom_left)
+        table.cell(dash, 0, 0, "◆ ICHIMOKU PRO", bgcolor = color.new(#14110B, 0), text_color = color.new(#FFD400, 0), text_size = dSzUp, text_halign = text.align_left)
+        table.cell(dash, 1, 0, syminfo.ticker + " · " + f_tfTxt(timeframe.period), bgcolor = color.new(#14110B, 0), text_color = color.new(#E8DFC8, 0), text_size = dSzUp, text_halign = text.align_right)
+        int r = 1
+
+        // Bias in plain words
+        string biasTxt = biasSum >= 4 ? "▲ Bullish" : biasSum >= 2 ? "▲ Leaning bullish" : biasSum <= -4 ? "▼ Bearish" : biasSum <= -2 ? "▼ Leaning bearish" : "● Mixed, no clear trend"
+        color  biasCol = biasSum >= 2 ? colBuyBadge : biasSum <= -2 ? colSellBadge : #C9B37E
+        string biasTip = "Five classic Ichimoku checks (▲ bullish, ▼ bearish, ● neutral):\n" + f_chk(bPrice) + " price vs. the cloud\n" + f_chk(bTk) + " Tenkan vs. Kijun\n" + f_chk(bChikou) + " Chikou clear of price and cloud\n" + f_chk(bFuture) + " cloud ahead (Span A vs. Span B)\n" + f_chk(bKijun) + " Kijun slope\nNet " + str.tostring(biasSum) + " of ±5. A description of the current structure, not a forecast."
+        int bullN = (bPrice == 1 ? 1 : 0) + (bTk == 1 ? 1 : 0) + (bChikou == 1 ? 1 : 0) + (bFuture == 1 ? 1 : 0) + (bKijun == 1 ? 1 : 0)
+        int bearN = (bPrice == -1 ? 1 : 0) + (bTk == -1 ? 1 : 0) + (bChikou == -1 ? 1 : 0) + (bFuture == -1 ? 1 : 0) + (bKijun == -1 ? 1 : 0)
+        f_row(r, "Bias", biasTxt + " · " + str.tostring(bullN) + "▲ " + str.tostring(bearN) + "▼", biasCol, biasTip)
+        r += 1
+
+        // Higher timeframes
+        string htfTxt = f_tfTxt(htf1) + " " + (htf1Valid ? f_regSym(htf1Regime) : "–") + "   " + f_tfTxt(htf2) + " " + (htf2Valid ? f_regSym(htf2Regime) : "–") + (allAligned ? "   ✓ all agree" : "")
+        f_row(r, "Higher Timeframes", htfTxt, allAligned ? f_regimeCol(curRegime) : #C9B37E, "Ichimoku regime on the two higher timeframes, from their last closed bar. ▲ close above the cloud and Tenkan above Kijun, ▼ the mirror, ● neither. ✓: the chart and both higher timeframes agree.")
+        r += 1
+
+        // Cloud now and ahead. Worked out here, at global scope, so it reads the full history of Span A / B
+        // (a function called only on the last bar would see no past values).
+        bool   cloudLeadBull = senkouA[displacement - 1] >= senkouB[displacement - 1]
+        bool   aheadBull     = cloudLeadBull
+        int    twistIn       = na
+        for j = 1 to displacement - 1
+            int off = displacement - 1 - j
+            if (senkouA[off] >= senkouB[off]) != cloudLeadBull
+                twistIn := j
+                break
+        float  thickNow      = atr > 0 ? cloudThickness / atr : 0.0
+        string thickWord     = thickNow < 0.5 ? "thin" : thickNow < 2.0 ? "medium" : "thick"
+        string kumoTxt = (cloudLeadBull ? "Bullish, " : "Bearish, ") + thickWord + (na(twistIn) ? " · no flip ahead" : " · flips " + (aheadBull ? "▼" : "▲") + " in " + str.tostring(twistIn) + " bars")
+        f_row(r, "Cloud", kumoTxt, cloudLeadBull ? colCloudBull : colCloudBear, "Colour and thickness (" + str.tostring(thickNow, "0.0") + "× ATR) of the cloud at the current bar. The cloud for the next " + str.tostring(displacement - 1) + " bars is already known, so the bars to its next colour change are counted exactly.")
+        r += 1
+
+        // Next Hosoda target of the latest wave
+        float  best = na
+        string bestName = ""
+        for h in hOpen
+            if h.bar == array.get(hLast, 0) and f_hInMode(h.k) and (na(best) or math.abs(h.px - close) < math.abs(best - close))
+                best     := h.px
+                bestName := f_hName(h.k) + (h.dir == 1 ? " ▲ " : " ▼ ")
+        f_row(r, "Next Price Target", na(best) ? "none open" : bestName + f_px(best), na(best) ? #C9B37E : #E8DFC8, "The nearest open Hosoda price target (dashed line) of the latest wave, among the targets chosen in Hosoda Theories → Price targets. It is removed if price closes back beyond the wave's pullback low (high).")
+        r += 1
+
+        // Next time window
+        string timeTxt = na(tcNextIn) ? "—" : "in " + str.tostring(tcNextIn) + " bars" + (na(tcConfIn) ? "" : tcConfIn == tcNextIn ? " ◆ gold" : " · ◆ gold in " + str.tostring(tcConfIn))
+        f_row(r, "Next Time Window", timeTxt, na(tcConfIn) ? #C9B37E : colConfl, "Bars to the next Hosoda time window (" + tcNextTxt + "), counted from the latest swings, and to the next gold window where two or more counts agree. Ichimoku watches these bars for turns or acceleration; they are reference points, not forecasts.")
+        r += 1
+
+        string sigAgo = na(lastSigBar) ? "" : (bar_index - lastSigBar == 0 ? " · now" : " · " + str.tostring(bar_index - lastSigBar) + " bars ago")
+        f_row(r, "Last Signal", lastSigTxt + sigAgo, lastSigCol, "The latest breakout badge, Kanzen ◆, Kijun bounce or cloud twist on the chart.")
+        r += 1
+
+        if detailed
+            bool  isStretched = math.abs(kijunDistAtr) >= kijunStretchAtr
+            color kijunCol    = isStretched ? color.new(#F59E0B, 0) : kijunDir == 1 ? colBuyBadge : kijunDir == -1 ? colSellBadge : #C9B37E
+            f_row(r, "Kijun", kijunSlopeTxt + " · " + (isStretched ? "⚠ " : "") + str.tostring(math.abs(kijunDistAtr), "0.0") + "× ATR away", kijunCol, "Kijun slope over 3 bars, and price distance from Kijun in ATR.")
+            r += 1
+            string chikouTxt = chikouOpenAirBull ? "✦ Open Air ▲" : chikouOpenAirBear ? "✦ Open Air ▼" : chikouBullClear ? "Clear ▲" : chikouBearClear ? "Clear ▼" : "● Obstructed"
+            color  chikouCol = chikouOpenAirBull ? colBuyBadge : chikouOpenAirBear ? colSellBadge : chikouBullClear ? color.new(colBuyBadge, 30) : chikouBearClear ? color.new(colSellBadge, 30) : color.new(#64748B, 0)
+            f_row(r, "Chikou", chikouTxt, chikouCol, "Clear: Chikou beyond price and cloud at its position. Open air: also beyond the candles it is about to move through.")
+            r += 1
+            bool chopNow = chopCount >= 2
+            f_row(r, "Market", (chopNow ? "◌ Choppy" : "➜ Trending") + " · ADX " + str.tostring(adxVal, "#"), chopNow ? color.new(#F59E0B, 0) : colBuyBadge, "Choppy: at least 2 of 3 of ADX below " + str.tostring(adxChopLevel, "#") + ", flat Kijun, cloud thinner than 0.5× ATR.")
+            r += 1
+            if array.size(swPx) >= 2
+                string t  = f_waveType()
+                bool   hi = array.last(swHi)
+                f_row(r, "Wave", t == "N" ? (hi ? "N▲ continuation up" : "N▼ continuation down") : t == "P" ? "P · range narrowing" : t == "Y" ? "Y · range widening" : t == "W" ? "W · double top / bottom" : t == "V" ? "V · reversal" : "I · single leg", t == "N" ? (hi ? colCloudBull : #FB7185) : #E8DFC8, f_waveTip(t))
+                r += 1
+
+    // Chart key: what each mark means
+    table.clear(keyT, 0, 0, 1, 6)
+    if showKey
+        color kBg = color.new(#0E171D, 15)
+        color kTx = color.new(#C9B37E, 10)
+        table.cell(keyT, 0, 0, "▲75", bgcolor = kBg, text_color = colCloudBull, text_size = chartTxt)
+        table.cell(keyT, 1, 0, "Cloud breakout and its score (hover it)", bgcolor = kBg, text_color = kTx, text_size = chartTxt, text_halign = text.align_left)
+        table.cell(keyT, 0, 1, "◆", bgcolor = kBg, text_color = colPerfect, text_size = chartTxt)
+        table.cell(keyT, 1, 1, "All five Ichimoku lines agree (Kanzen)", bgcolor = kBg, text_color = kTx, text_size = chartTxt, text_halign = text.align_left)
+        table.cell(keyT, 0, 2, "●", bgcolor = kBg, text_color = colCloudBull, text_size = chartTxt)
+        table.cell(keyT, 1, 2, "Span A crossed Span B: the cloud turns", bgcolor = kBg, text_color = kTx, text_size = chartTxt, text_halign = text.align_left)
+        table.cell(keyT, 0, 3, "- - N", bgcolor = kBg, text_color = colHosodaBull, text_size = chartTxt)
+        table.cell(keyT, 1, 3, "Hosoda price target (✓ = reached)", bgcolor = kBg, text_color = kTx, text_size = chartTxt, text_halign = text.align_left)
+        table.cell(keyT, 0, 4, "◆ 26", bgcolor = kBg, text_color = colConfl, text_size = chartTxt)
+        table.cell(keyT, 1, 4, "Time window ahead (gold = counts agree)", bgcolor = kBg, text_color = kTx, text_size = chartTxt, text_halign = text.align_left)
+        table.cell(keyT, 0, 5, "N▲ P Y", bgcolor = kBg, text_color = color.new(#E8DFC8, 30), text_size = chartTxt)
+        table.cell(keyT, 1, 5, "Wave type at each swing (hover it)", bgcolor = kBg, text_color = kTx, text_size = chartTxt, text_halign = text.align_left)
+        table.cell(keyT, 0, 6, "▢", bgcolor = kBg, text_color = colConfl, text_size = chartTxt)
+        table.cell(keyT, 1, 6, "Time meets price target (kasanari)", bgcolor = kBg, text_color = kTx, text_size = chartTxt, text_halign = text.align_left)
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  11. ALERT CONDITIONS (single events, for the Create Alert dialog)
+// ═════════════════════════════════════════════════════════════════════════════════
+alertcondition(hosodaNewBull, title = "AxeAlgo: Bullish Hosoda Projection", message = "AxeAlgo: a bullish N wave pullback confirmed; Hosoda price targets projected on {{ticker}} ({{interval}}).")
+alertcondition(hosodaNewBear, title = "AxeAlgo: Bearish Hosoda Projection", message = "AxeAlgo: a bearish N wave pullback confirmed; Hosoda price targets projected on {{ticker}} ({{interval}}).")
+alertcondition(timeConfNow, title = "AxeAlgo: Time Confluence Window", message = "AxeAlgo: a Hosoda time confluence window is on the current bar on {{ticker}} ({{interval}}).")
+alertcondition(hosodaHitNow and barstate.isconfirmed, title = "AxeAlgo: Hosoda Target Reached", message = "AxeAlgo: a Hosoda price target was reached on {{ticker}} ({{interval}}).")
+alertcondition(nearFlatSpanBTrigger and barstate.isconfirmed, title = "AxeAlgo: Flat Span B Level Retest", message = "AxeAlgo: price is near a flat Senkou Span B level on {{ticker}} ({{interval}}).")
+alertcondition(chikouOpenAirBullTrigger and barstate.isconfirmed, title = "AxeAlgo: Chikou Open Air Bullish", message = "AxeAlgo: Chikou Span is in open air above price and cloud on {{ticker}} ({{interval}}).")
+alertcondition(chikouOpenAirBearTrigger and barstate.isconfirmed, title = "AxeAlgo: Chikou Open Air Bearish", message = "AxeAlgo: Chikou Span is in open air below price and cloud on {{ticker}} ({{interval}}).")
+alertcondition((kijunStretchTriggerBull or kijunStretchTriggerBear) and barstate.isconfirmed, title = "AxeAlgo: Kijun Stretch", message = "AxeAlgo: price is stretched far from Kijun-sen on {{ticker}} ({{interval}}).")
+
+// ═════════════════════════════════════════════════════════════════════════════════
+//  BRANDING
+// ═════════════════════════════════════════════════════════════════════════════════
+var table wm = table.new(position.bottom_center, 2, 1, frame_width = 1, border_width = 0)
+if showWatermark and barstate.islast
+    table.cell(wm, 0, 0, " ◆ ", bgcolor = color.new(#14110B, 0), text_color = color.new(#D4AF37, 15), text_size = size.small, text_formatting = text.format_bold)
+    table.cell(wm, 1, 0, " A X E A L G O ", bgcolor = color.new(#14110B, 0), text_color = color.new(#C9B37E, 0), text_size = size.small, text_formatting = text.format_bold)

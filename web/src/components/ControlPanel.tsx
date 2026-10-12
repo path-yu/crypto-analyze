@@ -10,6 +10,7 @@ import Chip from '@mui/material/Chip'
 import Divider from '@mui/material/Divider'
 import FormControl from '@mui/material/FormControl'
 import FormControlLabel from '@mui/material/FormControlLabel'
+import IconButton from '@mui/material/IconButton'
 import InputAdornment from '@mui/material/InputAdornment'
 import InputLabel from '@mui/material/InputLabel'
 import MenuItem from '@mui/material/MenuItem'
@@ -20,6 +21,7 @@ import Switch from '@mui/material/Switch'
 import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
+import ChevronLeftIcon from '@mui/icons-material/ChevronLeft'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import PlayArrowIcon from '@mui/icons-material/PlayArrow'
 import RestartAltIcon from '@mui/icons-material/RestartAlt'
@@ -28,6 +30,7 @@ import CircularProgress from '@mui/material/CircularProgress'
 import type { ExchangeId, Instrument, StrategyKind, StrategyParams, Timeframe } from '@shared/types'
 import { DEFAULT_STRATEGY_PARAMS, EXCHANGES, TIMEFRAMES } from '@shared/types'
 import { fetchInstruments } from '../api'
+import PineEditor, { type PinePanelState } from './PineEditor'
 
 export type RangeKey = '1m' | '3m' | '6m' | '1y' | '2y' | '3y' | 'custom'
 
@@ -58,6 +61,11 @@ export const RECOMMENDED_RANGE: Record<Timeframe, RangeKey> = {
   '1w': '3y',
 }
 
+/** 面板宽度可拖拽（见 App.tsx），表单网格因此按「容器可用宽度自动填充列」排布，
+ *  而不是按视口断点——这样面板在 300～640px 的任意宽度下都不会把输入框压扁。 */
+const FIELD_GRID = 'repeat(auto-fill, minmax(150px, 1fr))'
+const TOGGLE_GRID = 'repeat(auto-fill, minmax(160px, 1fr))'
+
 export function rangeToSince(key: RangeKey, custom?: string): number {
   if (key === 'custom' && custom) {
     const t = new Date(custom).getTime()
@@ -84,6 +92,10 @@ interface Props {
   onRun: () => void
   loading: boolean
   estimatedBars: number
+  /** Pine 面板状态（仅在 strategy === 'pine' 时使用） */
+  pine: PinePanelState
+  /** 收起面板（宽度收敛为一条窄轨），由外层布局控制实际宽度 */
+  onCollapse?: () => void
   /** 所选合约的下单精度（syminfo.mintick），用于把滑点 tick 数换算成价格 */
   onTickSizeChange?: (tickSize: number) => void
 }
@@ -153,6 +165,8 @@ export default function ControlPanel({
   onRun,
   loading,
   estimatedBars,
+  pine,
+  onCollapse,
   onTickSizeChange,
 }: Props) {
   const [instruments, setInstruments] = useState<Instrument[]>([])
@@ -223,12 +237,31 @@ export default function ControlPanel({
       patch.positionSizePercent = 10
       patch.leverage = 1
       patch.slippageTicks = 2
+    } else if (next === 'pine') {
+      // 与后端 normalizeParams 对 pine 的强制语义保持一致，避免界面与行为不符
+      patch.exitStrategy = 'Zone OCO'
+      patch.partialTp = false
+      patch.pyramiding = 1
     } else if (next === 'supertrend') {
       patch.slippageTicks = 0
     } else {
       patch.slippageTicks = 0
     }
     onParamsChange(patch)
+  }
+
+  /**
+   * 策略下拉的选中值：既可能是内置策略，也可能是某份已保存的 Pine 脚本。
+   * 选中已保存脚本 = 切到 Pine 策略 + 载入该脚本（编辑器随即实时编译）。
+   */
+  const selectStrategy = (value: string) => {
+    if (value.startsWith('saved:')) {
+      changeStrategy('pine')
+      pine.onSelect(value.slice('saved:'.length))
+      return
+    }
+    pine.onSelect(null)
+    changeStrategy(value as StrategyKind)
   }
 
   /** 订单块数值输入 */
@@ -291,6 +324,19 @@ export default function ControlPanel({
 
   return (
     <Paper sx={{ p: 2 }}>
+      <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1 }}>
+        <Typography variant="subtitle1" sx={{ fontSize: 15, fontWeight: 700 }}>
+          回测参数
+        </Typography>
+        {onCollapse && (
+          <Tooltip title="收起面板">
+            <IconButton size="small" onClick={onCollapse} sx={{ mr: -0.5 }}>
+              <ChevronLeftIcon fontSize="small" />
+            </IconButton>
+          </Tooltip>
+        )}
+      </Stack>
+
       <Stack spacing={2}>
         {/* ---------------- 行情设置 ---------------- */}
         <Box>
@@ -301,7 +347,7 @@ export default function ControlPanel({
             sx={{
               display: 'grid',
               gap: 1.5,
-              gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr', md: '1fr 1fr 1fr' },
+              gridTemplateColumns: { xs: '1fr', sm: 'minmax(110px, 1fr) minmax(0, 2.2fr)' },
             }}
           >
             <FormControl size="small" fullWidth>
@@ -350,42 +396,40 @@ export default function ControlPanel({
               </Alert>
             )}
 
-            <Stack direction="row" spacing={1.5}>
-              <FormControl size="small" fullWidth>
-                <InputLabel shrink>K 线周期</InputLabel>
-                <Select
-                  label="K 线周期"
-                  notched
-                  value={timeframe}
-                  onChange={(e) => {
-                    const tf = e.target.value as Timeframe
-                    onTimeframeChange(tf)
-                    onRangeChange(RECOMMENDED_RANGE[tf])
-                  }}
-                >
-                  {TIMEFRAMES.map((tf) => (
-                    <MenuItem key={tf} value={tf}>
-                      {tf}
-                    </MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-              <FormControl size="small" fullWidth>
-                <InputLabel shrink>回测区间</InputLabel>
-                <Select
-                  label="回测区间"
-                  notched
-                  value={range}
-                  onChange={(e) => onRangeChange(e.target.value as RangeKey)}
-                >
-                  {RANGE_OPTIONS.map((r) => (
-                    <MenuItem key={r.key} value={r.key}>
-                      {r.label}
-                    </MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-            </Stack>
+            <FormControl size="small" fullWidth>
+              <InputLabel shrink>K 线周期</InputLabel>
+              <Select
+                label="K 线周期"
+                notched
+                value={timeframe}
+                onChange={(e) => {
+                  const tf = e.target.value as Timeframe
+                  onTimeframeChange(tf)
+                  onRangeChange(RECOMMENDED_RANGE[tf])
+                }}
+              >
+                {TIMEFRAMES.map((tf) => (
+                  <MenuItem key={tf} value={tf}>
+                    {tf}
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+            <FormControl size="small" fullWidth>
+              <InputLabel shrink>回测区间</InputLabel>
+              <Select
+                label="回测区间"
+                notched
+                value={range}
+                onChange={(e) => onRangeChange(e.target.value as RangeKey)}
+              >
+                {RANGE_OPTIONS.map((r) => (
+                  <MenuItem key={r.key} value={r.key}>
+                    {r.label}
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
           </Box>
 
           {range === 'custom' && (
@@ -400,7 +444,7 @@ export default function ControlPanel({
             />
           )}
 
-          <Stack direction="row" spacing={1} sx={{ mt: 1.5 }} alignItems="center">
+          <Stack direction="row" spacing={1} sx={{ mt: 1.5 }} alignItems="center" flexWrap="wrap" useFlexGap>
             <Chip size="small" label={`预计约 ${estimatedBars.toLocaleString()} 根 K 线`} />
             {estimatedBars > 40000 && (
               <Chip size="small" color="warning" label="数据量较大，拉取与计算会偏慢" />
@@ -422,7 +466,7 @@ export default function ControlPanel({
             sx={{
               display: 'grid',
               gap: 1.5,
-              gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+              gridTemplateColumns: FIELD_GRID,
             }}
           >
             <NumField
@@ -494,12 +538,19 @@ export default function ControlPanel({
             <Select
               label="策略"
               notched
-              value={params.strategy}
-              onChange={(e) => changeStrategy(e.target.value as StrategyKind)}
+              value={pine.selectedId ? `saved:${pine.selectedId}` : params.strategy}
+              onChange={(e) => selectStrategy(e.target.value)}
             >
               <MenuItem value="fib-trend">Fibonacci Trend Reversals（IMBA + TSOT）</MenuItem>
               <MenuItem value="supertrend">SuperTrend（KivancOzbilgic）</MenuItem>
               <MenuItem value="order-block">Volume Order Block Retest（订单块回踩）</MenuItem>
+              <MenuItem value="pine">Pine 脚本（实时编译）</MenuItem>
+              {pine.scripts.length > 0 && <Divider sx={{ my: 0.5 }} />}
+              {pine.scripts.map((s) => (
+                <MenuItem key={s.id} value={`saved:${s.id}`}>
+                  已保存 · {s.name}
+                </MenuItem>
+              ))}
             </Select>
           </FormControl>
 
@@ -509,7 +560,7 @@ export default function ControlPanel({
                 sx={{
                   display: 'grid',
                   gap: 1.5,
-                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                  gridTemplateColumns: FIELD_GRID,
                 }}
               >
                 <NumField
@@ -560,7 +611,7 @@ export default function ControlPanel({
                   display: 'grid',
                   gap: 1.5,
                   mt: 1.5,
-                  gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                  gridTemplateColumns: FIELD_GRID,
                 }}
               >
                 <FormControl size="small" fullWidth>
@@ -613,7 +664,7 @@ export default function ControlPanel({
                 />
               </Box>
 
-              <Stack direction="row" spacing={3} sx={{ mt: 1.5 }} flexWrap="wrap">
+              <Stack direction="row" spacing={3} sx={{ mt: 1.5 }} flexWrap="wrap" useFlexGap>
                 <FormControlLabel
                   control={
                     <Switch
@@ -693,7 +744,7 @@ export default function ControlPanel({
                 sx={{
                   display: 'grid',
                   gap: 1.5,
-                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                  gridTemplateColumns: FIELD_GRID,
                 }}
               >
                 {obNum('atrLen', 'ATR 周期', {
@@ -726,7 +777,7 @@ export default function ControlPanel({
                   display: 'grid',
                   gap: 0.5,
                   mt: 1,
-                  gridTemplateColumns: { xs: '1fr', md: '1fr 1fr 1fr' },
+                  gridTemplateColumns: TOGGLE_GRID,
                 }}
               >
                 {obBool('needOpp', '要求脉冲前反向 K 线', 'Pine: Require opposite-colour candle before impulse')}
@@ -741,7 +792,7 @@ export default function ControlPanel({
                 sx={{
                   display: 'grid',
                   gap: 1.5,
-                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                  gridTemplateColumns: FIELD_GRID,
                 }}
               >
                 {obNum('emaLen', 'EMA 周期', { min: 2, max: 2000, tooltip: 'Pine: EMA length（默认 100）' })}
@@ -765,7 +816,7 @@ export default function ControlPanel({
                   display: 'grid',
                   gap: 0.5,
                   mt: 1,
-                  gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' },
+                  gridTemplateColumns: TOGGLE_GRID,
                 }}
               >
                 {obBool('firstTouch', '每个区域只成交一次', 'Pine: Each zone trades once')}
@@ -784,7 +835,7 @@ export default function ControlPanel({
                 sx={{
                   display: 'grid',
                   gap: 1.5,
-                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                  gridTemplateColumns: FIELD_GRID,
                 }}
               >
                 {obNum('slBuf', '止损缓冲', {
@@ -845,7 +896,7 @@ export default function ControlPanel({
                   display: 'grid',
                   gap: 0.5,
                   mt: 1,
-                  gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' },
+                  gridTemplateColumns: TOGGLE_GRID,
                 }}
               >
                 {obBool('useBE', '保本移动止损', 'Pine: Move stop to break-even')}
@@ -855,6 +906,27 @@ export default function ControlPanel({
                 原脚本声明的固定语义：初始资金 10,000、手续费单边 0.05%、下单量为权益的 10%（1 倍杠杆）、
                 滑点 2 tick、同时只持有一仓（不加仓、无分批止盈），离场为「区域止损 / 固定盈亏比目标 / 保本 / 时间止损」。
                 切换策略时已自动套用，可在上方「资金与杠杆」处覆盖。
+              </Typography>
+            </>
+          ) : params.strategy === 'pine' ? (
+            <>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+                Pine 脚本：源码在后端实时编译为 TypeScript 并在沙箱中执行，逐根 K 线产出信号。
+                strategy() 脚本用 strategy.entry / strategy.exit 驱动；indicator() 脚本用 plotshape
+                的方向判定多空、以标题含 sl/stop 的 plot 作为离场止损。
+              </Typography>
+              {/* 放大编辑时编辑器整个搬到右侧 Drawer，面板内留一行提示，避免同时挂载两个编辑器 */}
+              {pine.drawerOpen ? (
+                <Alert severity="info" sx={{ py: 0 }}>
+                  <Typography variant="caption">
+                    编辑器已在右侧弹窗中打开；关闭弹窗后回到此处编辑。
+                  </Typography>
+                </Alert>
+              ) : (
+                <PineEditor {...pine} onRun={onRun} loading={loading} />
+              )}
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 1.5, display: 'block' }}>
+                脚本声明的固定语义（离场/仓位/方向）由引擎统一撮合，上方「资金与杠杆」通用参数继续生效。
               </Typography>
             </>
           ) : (
@@ -868,7 +940,7 @@ export default function ControlPanel({
                 sx={{
                   display: 'grid',
                   gap: 1.5,
-                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                  gridTemplateColumns: FIELD_GRID,
                 }}
               >
                 <NumField
@@ -947,7 +1019,7 @@ export default function ControlPanel({
                   display: 'grid',
                   gap: 1.5,
                   mt: 1.5,
-                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                  gridTemplateColumns: FIELD_GRID,
                 }}
               >
                 <FormControl size="small" fullWidth>
@@ -975,7 +1047,7 @@ export default function ControlPanel({
 
         <Divider />
 
-        <Stack direction="row" spacing={1.5}>
+        <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap sx={{ minWidth: 0 }}>
           <Button
             variant="contained"
             size="large"
@@ -1040,6 +1112,24 @@ export default function ControlPanel({
                   市价单与止损单按 slippage tick 取劣势价，止盈限价单不受影响。
                   <br />
                   · <b>手续费</b>：开仓与平仓均按名义价值收取，本策略默认单边 0.05%。
+                  <br />
+                  · <b>未计入</b>：资金费率与流动性冲击，实盘表现通常弱于回测。
+                </>
+              ) : params.strategy === 'pine' ? (
+                <>
+                  · <b>编译</b>：源码经词法（注释剥离、续行合并、缩进插桩）→ 语法 → 语义检查，
+                  生成 TypeScript 后由 Node 内置类型擦除转成 JS，在 vm 沙箱中执行；
+                  同一份源码走 LRU 缓存，只编译一次。
+                  <br />
+                  · <b>信号</b>：每根 K 线调用一次编译产物（脚本的 var 状态在预热期自然累积）。
+                  strategy.entry 的方向决定多空；strategy.exit 的止损/止盈在空仓 bar 上被引擎读取。
+                  <br />
+                  · <b>撮合</b>：与订单块策略共用引擎既有通路 —— 信号 bar 之后**下一根开盘**市价进场，
+                  离场为「区域止损 / 目标 / 保本 / 时间止损」；同一根 K 线内同时触及止损与止盈时，
+                  按阳线先探低、阴线先探高处理。
+                  <br />
+                  · <b>保本与时间止损</b>：脚本内的相应语句照常执行并进入 plot 输出，
+                  但对交易的实际影响由引擎既有通路承担（与 order-block 完全一致）。
                   <br />
                   · <b>未计入</b>：资金费率与流动性冲击，实盘表现通常弱于回测。
                 </>
