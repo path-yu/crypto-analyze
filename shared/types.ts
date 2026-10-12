@@ -58,11 +58,73 @@ export const TIMEFRAME_MS: Record<Timeframe, number> = {
 /* ------------------------------------------------------------------ */
 
 export type TradeDirection = 'Long Only' | 'Short Only' | 'Both'
-export type ExitStrategy = 'ATR' | 'Fixed Percent' | 'Trend Switch'
+export type ExitStrategy =
+  | 'ATR'
+  | 'Fixed Percent'
+  | 'Trend Switch'
+  /** 订单块：区域止损 + 固定盈亏比目标 + 保本触发 + 时间止损（Volume Order Block 原版离场） */
+  | 'Zone OCO'
 export type AtrSmoothing = 'RMA' | 'SMA' | 'EMA' | 'WMA'
 
 /** 支持的回测策略 */
-export type StrategyKind = 'fib-trend' | 'supertrend'
+export type StrategyKind = 'fib-trend' | 'supertrend' | 'order-block'
+
+/** Volume Order Block Retest 策略参数（Pine v6 原版一一对应） */
+export interface OrderBlockConfig {
+  /* ---- Order Block Detection ---- */
+  /** ATR 周期（原 "ATR length"，默认 14） */
+  atrLen: number
+  /** 脉冲实体 ≥ ATR × 该值（原 "Displacement body ≥ ATR ×"，默认 0.8） */
+  dispMult: number
+  /** 成交量 SMA 周期（原 "Volume SMA length"，默认 20） */
+  volLen: number
+  /** 脉冲成交量 ≥ SMA × 该值（原 "Impulse volume ≥ SMA ×"，默认 1.0） */
+  impVolMult: number
+  /** 是否要求脉冲前一根为反向颜色（原 "Require opposite-colour candle before impulse"，默认 false） */
+  needOpp: boolean
+  /** 是否要求脉冲收盘突破前一根区间（原 "Require impulse close beyond prior candle range"，默认 false） */
+  needBreak: boolean
+  /** 区域取实体（否则取最高/最低）（原 "Use candle body only for zone"，默认 false） */
+  bodyZone: boolean
+  /** 最大同时存在区域数（原 "Max active zones"，默认 15） */
+  maxZones: number
+  /** 区域最大存活 K 线数（原 "Max zone age (bars)"，默认 300） */
+  maxAge: number
+
+  /* ---- Entry Filters ---- */
+  /** 每个区域只成交一次（原 "Each zone trades once"，默认 true） */
+  firstTouch: boolean
+  /** 要求 K 线方向与交易方向一致（原 "Require candle in trade direction"，默认 true） */
+  needCandle: boolean
+  /** 要求拒绝影线（原 "Require rejection wick"，默认 false） */
+  useRejection: boolean
+  /** 影线占振幅的最小百分比（原 "Min wick % of range"，默认 25） */
+  wickPct: number
+  /** 要求回踩缩量（原 "Require volume dry-up on retest"，默认 false） */
+  useRetestVol: boolean
+  /** 回踩成交量 ≤ 脉冲成交量 × 该值（原 "Retest volume ≤ impulse volume ×"，默认 1.0） */
+  retestVolMax: number
+  /** EMA 趋势过滤（原 "EMA trend filter"，默认 false） */
+  useTrend: boolean
+  /** EMA 周期（原 "EMA length"，默认 100） */
+  emaLen: number
+  /** 允许做多（原 "Allow longs"，默认 true） */
+  allowLong: boolean
+  /** 允许做空（原 "Allow shorts"，默认 true） */
+  allowShort: boolean
+
+  /* ---- Risk Management ---- */
+  /** 止损缓冲（区域外侧 ATR × 该值，原 "SL buffer beyond zone"，默认 0.2） */
+  slBuf: number
+  /** 止盈 R 倍数（原 "Take profit (R multiple)"，默认 1.5） */
+  rrTarget: number
+  /** 是否移动止损到保本（原 "Move stop to break-even"，默认 true） */
+  useBE: boolean
+  /** 保本触发 R 倍数（原 "Break-even trigger (R)"，默认 1.0） */
+  beAtR: number
+  /** 时间止损（K 线数，0 = 关闭；原 "Time stop (bars)"，默认 60） */
+  maxBars: number
+}
 
 /** SuperTrend 策略参数（KivancOzbilgic 原版 Pine 移植） */
 export interface SupertrendConfig {
@@ -130,12 +192,51 @@ export interface StrategyParams {
   positionSizePercent: number
   /** 是否启用强平检查（按逐仓 1/leverage 价格波动估算） */
   checkLiquidation: boolean
+  /**
+   * 滑点（tick 数）。对应 TradingView 策略属性里的 `slippage`：
+   * 市价单与止损单按 `slippageTicks × tickSize` 的劣势价格成交，
+   * 限价单（止盈）不受影响。tickSize 由前端按所选合约的下单精度传入，
+   * 未提供时按 0 处理（即不模拟滑点）。
+   */
+  slippageTicks: number
 
   /* ---- 策略选择 ---- */
   /** 当前激活的策略 */
   strategy: StrategyKind
   /** SuperTrend 参数（仅在 strategy === 'supertrend' 时生效） */
   supertrend: SupertrendConfig
+  /** 订单块参数（仅在 strategy === 'order-block' 时生效） */
+  orderBlock: OrderBlockConfig
+}
+
+/** Volume Order Block Retest 默认参数（与 Pine 原版 input 默认值一一对应） */
+export const DEFAULT_ORDER_BLOCK: OrderBlockConfig = {
+  atrLen: 14,
+  dispMult: 0.8,
+  volLen: 20,
+  impVolMult: 1.0,
+  needOpp: false,
+  needBreak: false,
+  bodyZone: false,
+  maxZones: 15,
+  maxAge: 300,
+
+  firstTouch: true,
+  needCandle: true,
+  useRejection: false,
+  wickPct: 25,
+  useRetestVol: false,
+  retestVolMax: 1.0,
+  useTrend: false,
+  emaLen: 100,
+  allowLong: true,
+  allowShort: true,
+
+  slBuf: 0.2,
+  rrTarget: 1.5,
+  useBE: true,
+  beAtR: 1.0,
+  maxBars: 60,
 }
 
 export const DEFAULT_STRATEGY_PARAMS: StrategyParams = {
@@ -157,6 +258,8 @@ export const DEFAULT_STRATEGY_PARAMS: StrategyParams = {
   leverage: 3,
   positionSizePercent: 100,
   checkLiquidation: true,
+  // fib / supertrend 原版均未设置 slippage，默认不模拟
+  slippageTicks: 0,
   strategy: 'fib-trend',
   supertrend: {
     atrPeriod: 10,
@@ -165,6 +268,7 @@ export const DEFAULT_STRATEGY_PARAMS: StrategyParams = {
     useSmaAtr: false,
     source: 'hl2',
   },
+  orderBlock: DEFAULT_ORDER_BLOCK,
 }
 
 /* ------------------------------------------------------------------ */
@@ -215,6 +319,7 @@ export type ExitReason =
   | 'Reverse'      // 反手平仓
   | 'TrendSwitch'  // 趋势反转平仓
   | 'Liquidation'  // 强平
+  | 'TimeStop'     // 时间止损（持仓超过 N 根 K 线，市价平仓）
   | 'EndOfData'    // 回测结束时强制平仓
 
 /** 一次减仓（一笔成交） */
@@ -383,6 +488,10 @@ export interface BacktestResult {
     supertrendDn?: number
     /** SuperTrend 方向 1/-1（仅 supertrend 策略有值） */
     supertrendDirection?: number
+    /** 订单块策略：该信号对应的区域止损价（仅 order-block 策略有值） */
+    obStopLoss?: number
+    /** 订单块策略：该信号对应的目标止盈价（仅 order-block 策略有值） */
+    obTakeProfit?: number
   }[]
   meta: {
     exchange: ExchangeId

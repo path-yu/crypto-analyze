@@ -13,6 +13,11 @@ import type {
 import { DEFAULT_STRATEGY_PARAMS, TIMEFRAME_MS, TIMEFRAMES } from '../../../shared/types'
 import { computeFibTrendSeries, type FibTrendSeries } from '../indicators/fibTrendReversal'
 import { computeSupertrendSeries, type SupertrendSeries } from '../indicators/supertrend'
+import {
+  emptyOrderBlockSignal,
+  OrderBlockTracker,
+  type OrderBlockSignal,
+} from '../indicators/orderBlock'
 import { runBacktest } from '../backtest/engine'
 import { computeReport } from '../backtest/metrics'
 import { fetchKlines, MarketError } from '../market/exchange'
@@ -41,6 +46,8 @@ export interface BacktestRequest {
   bars?: number
   params?: Partial<StrategyParams>
   useCache?: boolean
+  /** 合约最小变动价位（syminfo.mintick），用于把 slippageTicks 换算成价格 */
+  tickSize?: number
 }
 
 export class ValidationError extends Error {
@@ -74,7 +81,7 @@ export function normalizeParams(input?: Partial<StrategyParams>): StrategyParams
   if (!['Long Only', 'Short Only', 'Both'].includes(p.tradeDirection)) {
     p.tradeDirection = d.tradeDirection
   }
-  if (!['ATR', 'Fixed Percent', 'Trend Switch'].includes(p.exitStrategy)) {
+  if (!['ATR', 'Fixed Percent', 'Trend Switch', 'Zone OCO'].includes(p.exitStrategy)) {
     p.exitStrategy = d.exitStrategy
   }
   p.partialTp = Boolean(p.partialTp)
@@ -82,9 +89,13 @@ export function normalizeParams(input?: Partial<StrategyParams>): StrategyParams
   p.checkLiquidation = Boolean(p.checkLiquidation)
   // 金字塔式加仓：0 = 不限，其余取 1~20 的整数（1 = 不加仓）
   p.pyramiding = Math.round(clamp(p.pyramiding, 0, 20, d.pyramiding))
+  // 滑点：0 = 不模拟（TradingView 的 slippage 以 tick 为单位）
+  p.slippageTicks = Math.round(clamp(p.slippageTicks ?? 0, 0, 200, 0))
 
   // 策略选择与 SuperTrend 参数
-  if (p.strategy !== 'fib-trend' && p.strategy !== 'supertrend') p.strategy = d.strategy
+  if (p.strategy !== 'fib-trend' && p.strategy !== 'supertrend' && p.strategy !== 'order-block') {
+    p.strategy = d.strategy
+  }
   const st = p.supertrend ?? d.supertrend
   p.supertrend = {
     atrPeriod: Math.round(clamp(st.atrPeriod, 1, 500, d.supertrend.atrPeriod)),
@@ -93,6 +104,44 @@ export function normalizeParams(input?: Partial<StrategyParams>): StrategyParams
     source: ['hl2', 'close', 'open', 'high', 'low'].includes(st.source)
       ? st.source
       : d.supertrend.source,
+  }
+
+  // 订单块参数
+  const ob = { ...d.orderBlock, ...(p.orderBlock ?? {}) }
+  p.orderBlock = {
+    atrLen: Math.round(clamp(ob.atrLen, 1, 500, d.orderBlock.atrLen)),
+    dispMult: clamp(ob.dispMult, 0.1, 50, d.orderBlock.dispMult),
+    volLen: Math.round(clamp(ob.volLen, 1, 500, d.orderBlock.volLen)),
+    impVolMult: clamp(ob.impVolMult, 0, 50, d.orderBlock.impVolMult),
+    needOpp: Boolean(ob.needOpp),
+    needBreak: Boolean(ob.needBreak),
+    bodyZone: Boolean(ob.bodyZone),
+    maxZones: Math.round(clamp(ob.maxZones, 1, 40, d.orderBlock.maxZones)),
+    maxAge: Math.round(clamp(ob.maxAge, 2, 100_000, d.orderBlock.maxAge)),
+    firstTouch: Boolean(ob.firstTouch),
+    needCandle: Boolean(ob.needCandle),
+    useRejection: Boolean(ob.useRejection),
+    wickPct: clamp(ob.wickPct, 1, 99, d.orderBlock.wickPct),
+    useRetestVol: Boolean(ob.useRetestVol),
+    retestVolMax: clamp(ob.retestVolMax, 0.05, 50, d.orderBlock.retestVolMax),
+    useTrend: Boolean(ob.useTrend),
+    emaLen: Math.round(clamp(ob.emaLen, 2, 2000, d.orderBlock.emaLen)),
+    allowLong: Boolean(ob.allowLong),
+    allowShort: Boolean(ob.allowShort),
+    slBuf: clamp(ob.slBuf, 0, 50, d.orderBlock.slBuf),
+    rrTarget: clamp(ob.rrTarget, 0.2, 50, d.orderBlock.rrTarget),
+    useBE: Boolean(ob.useBE),
+    beAtR: clamp(ob.beAtR, 0.2, 50, d.orderBlock.beAtR),
+    maxBars: Math.round(clamp(ob.maxBars, 0, 100_000, d.orderBlock.maxBars)),
+  }
+
+  // 订单块策略的固定语义（原脚本 strategy() 声明：pyramiding = 0、
+  // 无分批止盈、方向由 allowLong / allowShort 决定、离场为区域止损 + 固定盈亏比）
+  if (p.strategy === 'order-block') {
+    p.exitStrategy = 'Zone OCO'
+    p.partialTp = false
+    p.tradeDirection = 'Both'
+    p.pyramiding = 1
   }
 
   return p
@@ -109,6 +158,10 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
   if (!symbol) throw new ValidationError('缺少交易对 symbol')
 
   const rawParams = normalizeParams(req.params)
+
+  // 合约最小变动价位：由前端按所选合约的下单精度传入，用于 slippageTicks → 价格换算
+  const rawTick = Number(req.tickSize)
+  const tickSize = Number.isFinite(rawTick) && rawTick > 0 ? rawTick : 0
   // SuperTrend 是纯趋势策略：用「趋势反转离场」语义最贴近原 Pine（无 SL/TP）。
   // 强制覆盖退出模式与分批止盈，避免与策略本质冲突。
   const params: typeof rawParams =
@@ -134,10 +187,18 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
     )
   }
 
-  // 指标预热：TSOT 需要 144 根，Fibonacci 通道需要 sensitivity*10 根；SuperTrend 只需 atrPeriod
+  // 指标预热：TSOT 需要 144 根，Fibonacci 通道需要 sensitivity*10 根；SuperTrend 只需 atrPeriod；
+  // 订单块需要覆盖「区域最长存活 maxAge」，否则进入回测区间时存活区域会与 TradingView 不一致
   const fibWarmup = Math.max(200, Math.trunc(params.sensitivity * 10) + 20, 144 + 20)
   const stWarmup = Math.max(200, params.supertrend.atrPeriod + 20)
-  const warmupBars = Math.min(1000, Math.max(fibWarmup, stWarmup))
+  const obWarmup = Math.max(
+    200,
+    params.orderBlock.maxAge + 50,
+    params.orderBlock.atrLen + 20,
+    params.orderBlock.volLen + 20,
+    params.orderBlock.emaLen + 20,
+  )
+  const warmupBars = Math.min(1000, Math.max(fibWarmup, stWarmup, obWarmup))
   const fetchSince = since - warmupBars * tfMs
 
   const { candles: allCandles, cached, exchange: usedExchange, fallbackFrom, clampNote } = await fetchKlines({
@@ -163,9 +224,23 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
   }
   if (tradeFromIndex >= allCandles.length - 1) tradeFromIndex = 0
 
-  let series: FibTrendSeries | SupertrendSeries
+  let series: FibTrendSeries | SupertrendSeries | { signals: OrderBlockSignal[] }
+  /**
+   * 订单块策略的信号依赖持仓（原脚本的区域扫描带 `position_size == 0` 条件），
+   * 因此不能提前算好：由引擎在每根 K 线收盘、挂单撮合之后回调这里，
+   * 再把结果写回 signals[index]，图表标记与统计都读同一份数组。
+   */
+  let signalProvider: ((index: number, ctx: { flat: boolean }) => void) | undefined
+
   if (params.strategy === 'supertrend') {
     series = computeSupertrendSeries(allCandles, params.supertrend)
+  } else if (params.strategy === 'order-block') {
+    const signals = allCandles.map(() => emptyOrderBlockSignal())
+    const tracker = new OrderBlockTracker(allCandles, params.orderBlock, tickSize)
+    signalProvider = (index, ctx) => {
+      signals[index] = tracker.step(index, ctx.flat)
+    }
+    series = { signals }
   } else {
     series = computeFibTrendSeries(allCandles, {
       sensitivity: params.sensitivity,
@@ -180,6 +255,8 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
     series,
     params,
     tradeFromIndex,
+    signalProvider,
+    tickSize,
   })
 
   /* -------- 裁剪到用户请求的区间 -------- */
@@ -200,9 +277,11 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
     atrShortStop: s.atrShortStop,
     canLong: s.canLong,
     canShort: s.canShort,
-    supertrendUp: s.supertrendUp,
-    supertrendDn: s.supertrendDn,
-    supertrendDirection: s.supertrendDirection,
+    supertrendUp: (s as Partial<SupertrendSeries['signals'][number]>).supertrendUp,
+    supertrendDn: (s as Partial<SupertrendSeries['signals'][number]>).supertrendDn,
+    supertrendDirection: (s as Partial<SupertrendSeries['signals'][number]>).supertrendDirection,
+    obStopLoss: (s as Partial<OrderBlockSignal>).obStopLoss,
+    obTakeProfit: (s as Partial<OrderBlockSignal>).obTakeProfit,
   }))
 
   const warnings: string[] = []

@@ -16,7 +16,13 @@ import Typography from '@mui/material/Typography'
 import InsightsIcon from '@mui/icons-material/Insights'
 import { ThemeProvider } from '@mui/material/styles'
 
-import type { BacktestResult, ExchangeId, StrategyParams, Timeframe } from '@shared/types'
+import type {
+  BacktestResult,
+  ExchangeId,
+  StrategyKind,
+  StrategyParams,
+  Timeframe,
+} from '@shared/types'
 import { DEFAULT_STRATEGY_PARAMS, TIMEFRAME_MS } from '@shared/types'
 import { buildTheme, UP_COLOR, DOWN_COLOR } from './theme'
 import { runBacktest } from './api'
@@ -31,6 +37,12 @@ import { dateTime, humanizeError, money, num, pct } from './utils/format'
 
 type TabKey = 'chart' | 'equity' | 'analysis' | 'trades' | 'report'
 
+const STRATEGY_LABEL: Record<StrategyKind, string> = {
+  'fib-trend': 'Fib Trend',
+  supertrend: 'SuperTrend',
+  'order-block': 'Volume Order Block',
+}
+
 export default function App() {
   const [exchange, setExchange] = useState<ExchangeId>('binanceusdm')
   const [symbol, setSymbol] = useState('BTC/USDT:USDT')
@@ -41,6 +53,8 @@ export default function App() {
     return d.toISOString().slice(0, 10)
   })
   const [params, setParams] = useState<StrategyParams>({ ...DEFAULT_STRATEGY_PARAMS })
+  /** 所选合约的最小变动价位（下单精度），用于滑点换算 */
+  const [tickSize, setTickSize] = useState(0)
 
   const [result, setResult] = useState<BacktestResult | null>(null)
   const [loading, setLoading] = useState(false)
@@ -67,6 +81,7 @@ export default function App() {
         since,
         until: Date.now(),
         params,
+        tickSize,
       })
       setResult(data)
       setTab('chart')
@@ -87,8 +102,9 @@ export default function App() {
   const theme = useMemo(() => buildTheme(themeMode), [themeMode])
 
   const report = result?.report
+  const strategyLabel = result ? STRATEGY_LABEL[result.meta.strategy] : ''
   const headline = report
-    ? `${result?.meta.strategy === 'supertrend' ? 'SuperTrend' : 'Fib Trend'} · ${report.symbol} ${report.timeframe} · ${report.leverage}x · ${money(
+    ? `${strategyLabel} · ${report.symbol} ${report.timeframe} · ${report.leverage}x · ${money(
         report.initialCapital,
         0,
       )} → ${money(report.finalEquity, 0)}`
@@ -173,6 +189,7 @@ export default function App() {
                 onRun={handleRun}
                 loading={loading}
                 estimatedBars={estimatedBars}
+                onTickSizeChange={setTickSize}
               />
             </Box>
 

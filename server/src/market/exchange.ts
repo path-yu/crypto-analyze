@@ -369,13 +369,16 @@ export async function fetchKlines(opts: FetchKlinesOptions): Promise<FetchKlines
   let clampNote: string | undefined
   let truncatedFuture = requestedUntil > now
 
-  const cacheKey = `${opts.exchange}|${opts.symbol}|${opts.timeframe}|${since}|${until}`
+  // 缓存键的时间按周期向下取整：until 通常是 Date.now()，毫秒级漂移会让
+  // 每次请求都落到不同的键上（旧的磁盘缓存就是这么膨胀起来的，见 cachePrefixFor 注释）。
+  const cachePrefix = cachePrefixFor(opts.exchange, opts.symbol, opts.timeframe)
+  const cacheKey = `${cachePrefix}${alignFloor(since, tfMs)}_${alignFloor(until, tfMs)}`
   if (opts.useCache !== false) {
     const mem = memoryCache.get(cacheKey)
     if (mem && mem.expires > Date.now()) {
       return { candles: mem.data, cached: true, exchange: opts.exchange }
     }
-    const disk = readDiskCache(cacheKey)
+    const disk = findDiskCache(cachePrefix, since, until, tfMs)
     if (disk) {
       memoryCache.set(cacheKey, { expires: Date.now() + MEMORY_TTL_MS, data: disk })
       return { candles: disk, cached: true, exchange: opts.exchange }
@@ -411,9 +414,9 @@ export async function fetchKlines(opts: FetchKlinesOptions): Promise<FetchKlines
 
   const done = (candles: Candle[], exId: ExchangeId): FetchKlinesResult => {
     // 用收缩后的 since 作为最终缓存键，便于后续命中
-    const finalKey = `${opts.exchange}|${opts.symbol}|${opts.timeframe}|${since}|${until}`
+    const finalKey = `${cachePrefix}${alignFloor(since, tfMs)}_${alignFloor(until, tfMs)}`
     memoryCache.set(finalKey, { expires: Date.now() + MEMORY_TTL_MS, data: candles })
-    writeDiskCache(finalKey, candles)
+    writeDiskCache(cachePrefix, since, until, tfMs, candles)
     if (exId !== opts.exchange) preferredFallback.set(opts.exchange, exId)
     let note = clampNote
     if (truncatedFuture) {
@@ -438,9 +441,10 @@ export async function fetchKlines(opts: FetchKlinesOptions): Promise<FetchKlines
    * warnings 明确告知，且价格本身就是同源的现货价。
    */
   const doneVision = (candles: Candle[]): FetchKlinesResult => {
-    const finalKey = `vision|${opts.symbol}|${opts.timeframe}|${since}|${until}`
+    const visionPrefix = cachePrefixFor('vision', opts.symbol, opts.timeframe)
+    const finalKey = `${visionPrefix}${alignFloor(since, tfMs)}_${alignFloor(until, tfMs)}`
     memoryCache.set(finalKey, { expires: Date.now() + MEMORY_TTL_MS, data: candles })
-    writeDiskCache(finalKey, candles)
+    writeDiskCache(visionPrefix, since, until, tfMs, candles)
 
     const from = candles[0].timestamp
     const to = candles[candles.length - 1].timestamp
@@ -672,20 +676,48 @@ export async function fetchLastPrice(
 /* 磁盘缓存                                                            */
 /* ------------------------------------------------------------------ */
 
-function cachePathFor(key: string): string {
-  const safe = key.replace(/[^a-zA-Z0-9._-]/g, '_')
-  return path.join(CACHE_DIR, `${safe}.json`)
+/** 磁盘缓存有效期 */
+const DISK_TTL_MS = 24 * 3600 * 1000
+/** 同一「数据源 + 品种 + 周期」最多保留的缓存文件数（按修改时间淘汰旧的） */
+const MAX_CACHE_FILES = 3
+
+function sanitizeCachePart(s: string): string {
+  return s.replace(/[^a-zA-Z0-9._-]/g, '_')
 }
 
-function readDiskCache(key: string): Candle[] | null {
+/** 缓存文件名前缀：`数据源_品种_周期_`，例如 binanceusdm_BTC_USDT_USDT_1h_ */
+function cachePrefixFor(source: string, symbol: string, timeframe: string): string {
+  return `${sanitizeCachePart(source)}_${sanitizeCachePart(symbol)}_${sanitizeCachePart(timeframe)}_`
+}
+
+/** 按周期向下取整到 bar 边界 */
+function alignFloor(t: number, tfMs: number): number {
+  return Math.floor(t / tfMs) * tfMs
+}
+
+/**
+ * 缓存文件名：`<前缀><起>_<止>.json`，时间取整到 bar 边界。
+ *
+ * 旧实现直接把毫秒级 since/until 拼进文件名，而 until 通常是 Date.now()，
+ * 于是**每次回测**都会写一个约 1MB 的新文件（实测一天 158 个 / 141MB），
+ * 且两个源（vision / binanceusdm）各写一份。取整后同一根 bar 内重复运行
+ * 会落在同一个文件上。
+ */
+function cacheFileNameFor(prefix: string, since: number, until: number, tfMs: number): string {
+  return `${prefix}${alignFloor(since, tfMs)}_${alignFloor(until, tfMs)}.json`
+}
+
+/** 从缓存文件名解析其覆盖范围（毫秒），不符合命名规则时返回 null */
+function parseCacheRange(file: string, prefix: string): { since: number; until: number } | null {
+  if (!file.startsWith(prefix) || !file.endsWith('.json')) return null
+  const m = /_(\d+)_(\d+)\.json$/.exec(file)
+  if (!m) return null
+  return { since: Number(m[1]), until: Number(m[2]) }
+}
+
+function readCandlesFile(file: string): Candle[] | null {
   try {
-    const file = cachePathFor(key)
-    if (!fs.existsSync(file)) return null
-    const stat = fs.statSync(file)
-    // 磁盘缓存有效期 24 小时
-    if (Date.now() - stat.mtimeMs > 24 * 3600 * 1000) return null
-    const raw = fs.readFileSync(file, 'utf8')
-    const parsed = JSON.parse(raw) as Candle[]
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as Candle[]
     if (!Array.isArray(parsed) || parsed.length === 0) return null
     return parsed
   } catch {
@@ -693,12 +725,102 @@ function readDiskCache(key: string): Candle[] | null {
   }
 }
 
-function writeDiskCache(key: string, data: Candle[]): void {
+/**
+ * 查找可复用的磁盘缓存。
+ *
+ * 命中条件（缺一不可）：
+ *  - 文件名前缀相同（同数据源 + 品种 + 周期）
+ *  - 覆盖请求区间：起点不晚于请求的第一根 bar，终点不早于请求的最后一根 bar
+ *  - 未超过 24 小时有效期
+ *
+ * 多个候选时优先取范围最小的（冗余最少）；读取后还会用文件内
+ * 实际 K 线范围复核一次，避免文件名与实际内容不一致。
+ */
+function findDiskCache(prefix: string, since: number, until: number, tfMs: number): Candle[] | null {
+  let names: string[]
+  try {
+    names = fs.readdirSync(CACHE_DIR)
+  } catch {
+    return null
+  }
+
+  const headBar = Math.ceil(since / tfMs) * tfMs
+  const tailBar = alignFloor(until, tfMs)
+  const now = Date.now()
+
+  const candidates: { file: string; since: number; until: number }[] = []
+  for (const name of names) {
+    const range = parseCacheRange(name, prefix)
+    if (!range) continue
+    if (range.since > headBar || range.until < tailBar) continue
+    const file = path.join(CACHE_DIR, name)
+    try {
+      if (now - fs.statSync(file).mtimeMs > DISK_TTL_MS) continue
+    } catch {
+      continue
+    }
+    candidates.push({ file, ...range })
+  }
+  candidates.sort((a, b) => a.until - a.since - (b.until - b.since))
+
+  for (const c of candidates) {
+    const data = readCandlesFile(c.file)
+    if (!data) continue
+    if (data[0].timestamp > headBar) continue
+    if (data[data.length - 1].timestamp < tailBar) continue
+    // 延长有效期，让活跃缓存不被淘汰
+    try {
+      const stamp = new Date()
+      fs.utimesSync(c.file, stamp, stamp)
+    } catch {
+      /* 忽略 */
+    }
+    // 裁剪到请求区间：缓存文件可能覆盖得更宽（头部多出的是更长的预热历史），
+    // 这里保证返回值与「未命中、重新拉取」时完全一致。
+    return data.filter((c) => c.timestamp >= since && c.timestamp <= until)
+  }
+  return null
+}
+
+function writeDiskCache(
+  prefix: string,
+  since: number,
+  until: number,
+  tfMs: number,
+  data: Candle[],
+): void {
   try {
     fs.mkdirSync(CACHE_DIR, { recursive: true })
-    fs.writeFileSync(cachePathFor(key), JSON.stringify(data), 'utf8')
+    const file = path.join(CACHE_DIR, cacheFileNameFor(prefix, since, until, tfMs))
+    fs.writeFileSync(file, JSON.stringify(data), 'utf8')
+    pruneDiskCache(prefix, file)
   } catch {
     // 缓存写入失败不影响主流程
+  }
+}
+
+/** 同一前缀只保留最新的 MAX_CACHE_FILES 个文件，避免缓存目录无限膨胀 */
+function pruneDiskCache(prefix: string, keepFile: string): void {
+  try {
+    const files = fs
+      .readdirSync(CACHE_DIR)
+      .filter((name) => parseCacheRange(name, prefix) !== null)
+      .map((name) => {
+        const file = path.join(CACHE_DIR, name)
+        return { file, mtime: fs.statSync(file).mtimeMs }
+      })
+      .sort((a, b) => b.mtime - a.mtime)
+
+    files.forEach((f, i) => {
+      if (f.file === keepFile || i < MAX_CACHE_FILES) return
+      try {
+        fs.unlinkSync(f.file)
+      } catch {
+        /* 忽略 */
+      }
+    })
+  } catch {
+    /* 忽略 */
   }
 }
 

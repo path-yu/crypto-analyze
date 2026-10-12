@@ -18,7 +18,7 @@ import {
 } from 'recharts'
 
 import type { BacktestResult } from '@shared/types'
-import { axisTimeLabel, compact, money, num, pct } from '../utils/format'
+import { axisTimeLabel, compact, money, num, pct, price } from '../utils/format'
 import { downsample } from '../utils/series'
 import { darkChartPalette, UP_COLOR, DOWN_COLOR } from '../theme'
 
@@ -62,11 +62,26 @@ export default function EquityPanel({ result }: { result: BacktestResult }) {
         t: p.timestamp,
         equity: p.equity,
         drawdown: p.drawdownPercent,
+        price: c?.close,
         buyHold: c ? (c.close / firstClose) * report.initialCapital : report.initialCapital,
       }
     })
     return downsample(rows, 1400)
   }, [equityCurve, candles, report.initialCapital])
+
+  /** 品种价格区间的统计信息（用于价格曲线卡片的副标题） */
+  const priceStats = useMemo(() => {
+    if (candles.length === 0) return null
+    const first = candles[0].close
+    const last = candles[candles.length - 1].close
+    let high = -Infinity
+    let low = Infinity
+    for (const c of candles) {
+      if (c.high > high) high = c.high
+      if (c.low < low) low = c.low
+    }
+    return { first, last, high, low, change: first > 0 ? ((last - first) / first) * 100 : 0 }
+  }, [candles])
 
   const spanMs = useMemo(() => {
     if (candles.length === 0) return 0
@@ -150,6 +165,65 @@ export default function EquityPanel({ result }: { result: BacktestResult }) {
           </AreaChart>
         </ResponsiveContainer>
       </ChartCard>
+
+      {priceStats && (
+        <ChartCard
+          title="价格曲线"
+          subtitle={`${report.symbol} · ${report.timeframe} · 区间 ${pct(priceStats.change)}（首 ${price(
+            priceStats.first,
+          )} → 末 ${price(priceStats.last)}）· 最高 ${price(priceStats.high)} / 最低 ${price(
+            priceStats.low,
+          )}`}
+          height={230}
+        >
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={equityData} margin={{ top: 8, right: 16, bottom: 4, left: 8 }}>
+              <defs>
+                <linearGradient id="pxFill" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={PAL.accent} stopOpacity={0.3} />
+                  <stop offset="100%" stopColor={PAL.accent} stopOpacity={0.02} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid stroke={PAL.grid} vertical={false} />
+              <XAxis
+                dataKey="t"
+                tickFormatter={tickFormatter}
+                stroke={PAL.axis}
+                tick={{ fill: PAL.text, fontSize: 11 }}
+                minTickGap={48}
+              />
+              <YAxis
+                stroke={PAL.axis}
+                tick={{ fill: PAL.text, fontSize: 11 }}
+                tickFormatter={(v: number) => compact(v)}
+                domain={['auto', 'auto']}
+                width={62}
+              />
+              <RTooltip
+                contentStyle={{
+                  background: PAL.tooltipBg,
+                  border: `1px solid ${PAL.tooltipBorder}`,
+                  borderRadius: 8,
+                  fontSize: 12,
+                }}
+                labelFormatter={(v) => axisTimeLabel(Number(v), spanMs)}
+                formatter={(value: unknown) => `$${price(Number(value))}`}
+              />
+              <ReferenceLine y={priceStats.first} stroke={PAL.muted} strokeDasharray="4 4" />
+              <Area
+                type="monotone"
+                dataKey="price"
+                name="收盘价"
+                stroke={PAL.accent}
+                strokeWidth={1.4}
+                fill="url(#pxFill)"
+                dot={false}
+                isAnimationActive={false}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        </ChartCard>
+      )}
 
       <Box sx={{ display: 'grid', gap: 1.5, gridTemplateColumns: { xs: '1fr', lg: '1fr 1fr' } }}>
         <ChartCard

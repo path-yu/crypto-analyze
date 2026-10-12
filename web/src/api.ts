@@ -15,6 +15,8 @@ export interface BacktestRequest {
   bars?: number
   params: Partial<StrategyParams>
   useCache?: boolean
+  /** 合约最小变动价位，用于把 slippageTicks 换算成价格 */
+  tickSize?: number
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {

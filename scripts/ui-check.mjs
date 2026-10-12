@@ -145,6 +145,21 @@ async function main() {
   await cdp.send('Network.enable')
   await cdp.send('Page.enable')
 
+  // 视口尺寸：--size=2160x1050（用于验证宽屏响应式布局）
+  const sizeArg = process.argv.find((a) => a.startsWith('--size='))
+  if (sizeArg) {
+    const [w, h] = sizeArg.slice('--size='.length).split('x').map(Number)
+    if (w > 0 && h > 0) {
+      await cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: w,
+        height: h,
+        deviceScaleFactor: 1,
+        mobile: false,
+      })
+      console.log(`视口设为 ${w}×${h}`)
+    }
+  }
+
   console.log(`打开 ${URL_TARGET}`)
   await cdp.send('Page.navigate', { url: URL_TARGET })
 
@@ -230,8 +245,106 @@ async function main() {
     console.log(`  截图 ${file}`)
   }
 
+  // 可选：切到 Volume Order Block 策略并重跑一遍（node scripts/ui-check.mjs <url> --ob）
+  if (process.argv.includes('--ob')) {
+    const click = async (expression, note) => {
+      const r = await cdp.send('Runtime.evaluate', { expression, returnByValue: true })
+      if (!r.result.value) console.log(`  (失败) ${note}`)
+      return r.result.value === true
+    }
+
+    console.log('切换到 Volume Order Block 策略…')
+    // MUI 的 Select 由 mousedown 触发展开，需要手动派发鼠标事件
+    await click(
+      `(() => {
+        const fire = (el, type) => el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+        const label = [...document.querySelectorAll('label')].find(e => e.textContent.trim() === '策略');
+        const combo = label && label.parentElement.querySelector('[role=combobox]');
+        if (!combo) return false;
+        fire(combo, 'mousedown'); fire(combo, 'mouseup'); fire(combo, 'click');
+        return true;
+      })()`,
+      '打开策略下拉',
+    )
+    await sleep(900)
+    await click(
+      `(() => {
+        const fire = (el, type) => el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+        const opt = [...document.querySelectorAll('[role=option]')].find(e => e.textContent.includes('Volume Order Block'));
+        if (!opt) return false;
+        fire(opt, 'mousedown'); fire(opt, 'mouseup'); fire(opt, 'click');
+        return true;
+      })()`,
+      '选择订单块策略',
+    )
+    await sleep(800)
+    await click(
+      `(() => {
+        const btn = [...document.querySelectorAll('button')].find(e => e.textContent.includes('开始回测'));
+        if (!btn) return false;
+        btn.click();
+        return true;
+      })()`,
+      '点击开始回测',
+    )
+
+    // 等待顶部标题切换为 Volume Order Block
+    let switched = false
+    for (let i = 0; i < 90; i++) {
+      await sleep(2000)
+      const r = await cdp.send('Runtime.evaluate', {
+        expression: `(document.body?.innerText || '').includes('Volume Order Block')`,
+        returnByValue: true,
+      })
+      if (r.result.value) {
+        switched = true
+        console.log(`订单块回测完成（等待 ${(i + 1) * 2}s）`)
+        break
+      }
+    }
+    if (!switched) console.log('警告：未检测到订单块策略的回测结果')
+
+    const obText = await cdp.send('Runtime.evaluate', {
+      expression: `(document.body?.innerText || '').replace(/\\n+/g, ' | ').slice(0, 1200)`,
+      returnByValue: true,
+    })
+    console.log('页面摘要:', obText.result.value)
+  }
+
   await shot('01-chart')
   await shot('02-equity', '收益分析')
+
+  // 布局检查：横向溢出 / 越界元素 / 关键容器宽度
+  const layout = await cdp.send('Runtime.evaluate', {
+    expression: `(() => {
+      const vw = window.innerWidth;
+      const rect = (el) => {
+        const r = el.getBoundingClientRect();
+        return { w: Math.round(r.width), left: Math.round(r.left), right: Math.round(r.right) };
+      };
+      const container = document.querySelector('.MuiContainer-root');
+      const grid = container && container.firstElementChild;
+      const cols = grid ? [...grid.children].map(rect) : [];
+      const overflow = [...document.querySelectorAll('body *')]
+        .filter((el) => {
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.right > vw + 1;
+        })
+        .slice(0, 10)
+        .map((el) => el.tagName + '|' + String(el.className || '').slice(0, 40) + '|right=' + Math.round(el.getBoundingClientRect().right) + '|w=' + Math.round(el.getBoundingClientRect().width));
+      return JSON.stringify({
+        innerWidth: vw,
+        innerHeight: window.innerHeight,
+        docScrollWidth: document.documentElement.scrollWidth,
+        overflowX: document.documentElement.scrollWidth - vw,
+        cols,
+        overflow,
+      });
+    })()`,
+    returnByValue: true,
+  })
+  console.log('布局检查:', layout.result.value)
+
   await shot('03-analysis', '交易分析')
   await shot('04-trades', '交易明细')
   await shot('05-report', '回测报告')

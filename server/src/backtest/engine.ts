@@ -31,6 +31,13 @@ export interface StrategySignalCore {
   canShort: boolean
   atrLongStop: number
   atrShortStop: number
+  /* ---- 订单块策略（exitStrategy = 'Zone OCO'）---- */
+  /** 区域止损价 */
+  obStopLoss?: number
+  /** 固定盈亏比目标价 */
+  obTakeProfit?: number
+  /** 信号风险（用于计算保本触发价） */
+  obRisk?: number
 }
 
 export interface StrategySeriesCore {
@@ -47,6 +54,17 @@ export interface BacktestInput {
    * 起始点的权益必然等于初始资金。
    */
   tradeFromIndex?: number
+  /**
+   * 位置相关的信号源（订单块策略）。
+   *
+   * fib / supertrend 的信号与持仓无关，可一次性算好；
+   * 订单块策略的区域扫描带有 `strategy.position_size == 0` 条件，
+   * 必须在每根 K 线**收盘、挂单撮合之后**才知道 flat 与否，
+   * 因此由引擎逐 bar 回调，由调用方把结果写回 signals[index]。
+   */
+  signalProvider?: (index: number, ctx: { flat: boolean }) => void
+  /** 合约最小变动价位（syminfo.mintick），配合 slippageTicks 计算滑点 */
+  tickSize?: number
 }
 
 export interface BacktestOutput {
@@ -114,12 +132,32 @@ interface SubOrder {
   maePercent: number
   fills: TradeFill[]
   grossPnl: number
+  /**
+   * 订单块策略：保本触发价（价格为该值时把止损移动到开仓价）。
+   * 与 fib 的 `breakEven`（触发第一目标后移动到保本）不同，这里由价格触发。
+   */
+  beTrigger: number
+  /** 是否已经完成保本移动（用于交易记录里的离场原因展示） */
+  beArmed: boolean
 }
 
 /** 持仓位：由 1~N 笔同向子订单组成，整体共享一个方向与账户资金 */
 interface Position {
   side: TradeSide
   subs: SubOrder[]
+}
+
+/** 排队等待「下一根开盘成交」的市价开仓单 */
+interface PendingEntry {
+  side: TradeSide
+  /** 展示用初始止损（SuperTrend 的上下轨），不参与挂单撮合 */
+  displayStopLoss?: number
+  /** 订单块：区域止损价（参与撮合） */
+  stopLoss?: number
+  /** 订单块：目标止盈价（作为单一 TP，整仓离场） */
+  takeProfit?: number
+  /** 订单块：信号风险（正数），用于按实际成交价推导保本触发价 */
+  risk?: number
 }
 
 /** 说明性注释，尽量与 Pine 中 strategy.close 的注释文案对齐 */
@@ -131,6 +169,7 @@ export const EXIT_COMMENT: Record<ExitReason, string> = {
   Reverse: 'Reversing',
   TrendSwitch: 'Trend Switch Close',
   Liquidation: 'Liquidation',
+  TimeStop: 'Time stop',
   EndOfData: 'Backtest End',
 }
 
@@ -145,6 +184,8 @@ class BacktestEngine {
   private readonly rr: number
   private readonly dir: StrategyParams['tradeDirection']
   private readonly tradeFromIndex: number
+  /** 位置相关信号源（订单块策略），见 BacktestInput.signalProvider */
+  private readonly signalProvider?: (index: number, ctx: { flat: boolean }) => void
 
   private cash: number
   private position: Position | null = null
@@ -152,14 +193,20 @@ class BacktestEngine {
 
   /**
    * 成交时点语义（按策略区分，对齐各自的 Pine 原版）：
-   * - SuperTrend 原版的 `strategy()` 未设置 process_orders_on_close，
-   *   TradingView 默认在**信号 K 线的下一根开盘**成交；
+   * - SuperTrend / Volume Order Block 原版的 `strategy()` 未设置
+   *   process_orders_on_close，TradingView 默认在**信号 K 线的下一根开盘**成交；
    * - fib 原版显式设置了 process_orders_on_close = true，按信号 K 线**收盘**成交。
    */
   private readonly fillNextBarOpen: boolean
 
-  /** Trend Switch 模式下排队等待「下一根开盘成交」的反手单 */
-  private pendingTrendSwitch: { side: TradeSide; trail: number } | null = null
+  /** 滑点的绝对价格偏移 = slippageTicks × tickSize（0 表示不模拟滑点） */
+  private readonly slippageAbs: number
+
+  /** 排队等待「下一根开盘成交」的市价开仓单 */
+  private pendingEntry: PendingEntry | null = null
+
+  /** 排队等待「下一根开盘成交」的市价平仓单（时间止损） */
+  private pendingExit: ExitReason | null = null
 
   readonly trades: Trade[] = []
   readonly equityCurve: EquityPoint[]
@@ -181,7 +228,12 @@ class BacktestEngine {
     this.tradeFromIndex = Math.max(0, input.tradeFromIndex ?? 0)
     // 0 表示不限；至少允许 1 笔（即基础开仓）
     this.maxPyramiding = Math.max(1, Math.trunc(input.params.pyramiding ?? 1))
-    this.fillNextBarOpen = input.params.strategy === 'supertrend'
+    this.fillNextBarOpen =
+      input.params.strategy === 'supertrend' || input.params.strategy === 'order-block'
+
+    const tick = Number.isFinite(input.tickSize) ? (input.tickSize as number) : 0
+    this.slippageAbs = tick > 0 ? tick * Math.max(0, input.params.slippageTicks ?? 0) : 0
+    this.signalProvider = input.signalProvider
 
     this.cash = input.params.initialCapital
     this.peakEquity = input.params.initialCapital
@@ -216,6 +268,11 @@ class BacktestEngine {
      * 但不让它触发 checkExits 的止损检查，避免破坏「只由反向信号离场」的语义。
      */
     displayStopLoss?: number,
+    /**
+     * 订单块策略的保本触发价（价格到达该值时把止损移动到开仓价）。
+     * 与 `breakEven`（第一目标成交后移动止损）是两套独立机制。
+     */
+    beTrigger?: number,
   ): void {
     if (!Number.isFinite(price) || price <= 0) return
     const margin = this.cash * this.sizeFraction
@@ -258,6 +315,8 @@ class BacktestEngine {
       maePercent: 0,
       fills: [],
       grossPnl: 0,
+      beTrigger: typeof beTrigger === 'number' ? beTrigger : Number.NaN,
+      beArmed: false,
     }
 
     if (this.position && this.position.side === side) {
@@ -386,22 +445,88 @@ class BacktestEngine {
   }
 
   /**
-   * 在本根 K 线开盘价执行排队的 Trend Switch 反手单。
+   * 在本根 K 线开盘价执行排队的市价开仓单。
    *
    * 复刻 TradingView「信号在上一根收盘产生、订单在本根开盘成交」的行为：
-   * 旧仓的平仓与新仓的开仓发生在同一根开盘、同一个价格上，
+   * SuperTrend 反手时旧仓的平仓与新仓的开仓发生在同一根开盘、同一个价格上，
    * 这也正是 TV 交易清单里「平仓价 = 下一笔开仓价」的由来。
    */
-  private fillPendingTrendSwitch(bar: Candle, index: number): void {
-    const pending = this.pendingTrendSwitch
-    this.pendingTrendSwitch = null
+  private fillPendingEntry(bar: Candle, index: number): void {
+    const pending = this.pendingEntry
+    this.pendingEntry = null
     if (!pending) return
 
     const pos = this.position
     if (pos && pos.side !== pending.side) {
       this.closeAll('TrendSwitch', bar.open, index, bar.timestamp)
     }
-    this.addSubOrder(pending.side, bar.open, index, bar.timestamp, NaN, NaN, NaN, NaN, pending.trail)
+    // 市价单按滑点取劣势价（TradingView 的 slippage 语义）
+    const price = pending.side === 'long' ? bar.open + this.slippageAbs : bar.open - this.slippageAbs
+    this.addSubOrder(
+      pending.side,
+      price,
+      index,
+      bar.timestamp,
+      pending.stopLoss ?? NaN,
+      NaN,
+      pending.takeProfit ?? NaN,
+      NaN,
+      pending.displayStopLoss,
+      // 保本触发价用「实际成交价 ± 风险×beAtR」计算（对齐 avg + longRisk*beAtR）
+      this.resolveBeTrigger(pending, price),
+    )
+  }
+
+  /** 计算保本触发价：成交价 ± 风险 × beAtR（多单在开仓价上方触发，空单在下方） */
+  private resolveBeTrigger(pending: PendingEntry, fillPrice: number): number {
+    if (pending.risk === undefined || !Number.isFinite(pending.risk)) return Number.NaN
+    const cfg = this.params.orderBlock
+    if (!cfg.useBE || !(cfg.beAtR > 0)) return Number.NaN
+    return pending.side === 'long'
+      ? fillPrice + pending.risk * cfg.beAtR
+      : fillPrice - pending.risk * cfg.beAtR
+  }
+
+  /** 在本根开盘价执行排队的时间止损（市价平仓，含滑点） */
+  private fillPendingExit(bar: Candle, index: number): void {
+    const reason = this.pendingExit
+    this.pendingExit = null
+    if (!reason) return
+    const pos = this.position
+    if (!pos) return
+    const price = pos.side === 'long' ? bar.open - this.slippageAbs : bar.open + this.slippageAbs
+    this.closeAll(reason, price, index, bar.timestamp)
+  }
+
+  /**
+   * 订单块策略的保本移动（在每根 K 线收盘、挂单撮合之后执行）。
+   *
+   * 对应 Pine：
+   *   if useBE and not na(longRisk) and high >= avg + longRisk*beAtR
+   *       longStop := math.max(longStop, avg)
+   *
+   * 由于挂单在收盘才更新，新的止损从**下一根** K 线开始才可能触发 —— 与
+   * strategy.exit 重新下单的时点一致。
+   */
+  private armBreakEven(bar: Candle): void {
+    const pos = this.position
+    if (!pos) return
+    const isLong = pos.side === 'long'
+
+    for (const sub of pos.subs) {
+      if (!this.isAlive(sub) || !Number.isFinite(sub.beTrigger)) continue
+      const hit = isLong ? bar.high >= sub.beTrigger : bar.low <= sub.beTrigger
+      if (!hit) continue
+
+      sub.stopLoss = isLong
+        ? Number.isFinite(sub.stopLoss)
+          ? Math.max(sub.stopLoss, sub.entryPrice)
+          : sub.entryPrice
+        : Number.isFinite(sub.stopLoss)
+          ? Math.min(sub.stopLoss, sub.entryPrice)
+          : sub.entryPrice
+      sub.beArmed = true
+    }
   }
 
   /** 检查一根 bar 上的止盈/止损/强平挂单（逐子订单独立撮合） */
@@ -421,6 +546,9 @@ class BacktestEngine {
 
     for (const sub of pos.subs) {
       if (!this.isAlive(sub)) continue
+      // 挂单从**开仓后的下一根**才生效：订单块策略在开盘成交，
+      // 其 strategy.exit 挂单是在同一根 K 线的收盘才创建的（对应 TradingView）。
+      if (sub.entryIndex >= index) continue
 
       // 更新 MFE / MAE
       const favo = isLong
@@ -434,7 +562,7 @@ class BacktestEngine {
 
       // 止损位与强平价取「先被触及」的那一个
       let stopLevel = sub.stopLoss
-      let stopReason: ExitReason = sub.tp1Hit ? 'BreakEven' : 'StopLoss'
+      let stopReason: ExitReason = sub.tp1Hit || sub.beArmed ? 'BreakEven' : 'StopLoss'
       if (Number.isFinite(sub.liquidationPrice)) {
         const liqFirst = isLong
           ? sub.liquidationPrice > stopLevel
@@ -453,7 +581,14 @@ class BacktestEngine {
         if (Number.isFinite(stopLevel)) {
           const hit = isLong ? p <= stopLevel : p >= stopLevel
           if (hit) {
-            this.reduceSubOrder(sub, sub.remaining, stopLevel, stopReason, bar.timestamp)
+            // 止损单同样吃滑点（劣势方向）；强平价由交易所撮合，不再加滑点
+            const fillPrice =
+              stopReason === 'Liquidation' || this.slippageAbs === 0
+                ? stopLevel
+                : isLong
+                  ? stopLevel - this.slippageAbs
+                  : stopLevel + this.slippageAbs
+            this.reduceSubOrder(sub, sub.remaining, fillPrice, stopReason, bar.timestamp)
             closed.push(sub)
             done = true
             break
@@ -541,19 +676,33 @@ class BacktestEngine {
 
     for (let i = 0; i < n; i++) {
       const bar = candles[i]
-      const sig = series.signals[i]
 
-      // A0. 上一根 K 线信号排队的 Trend Switch 反手单：在本根开盘成交
-      if (this.pendingTrendSwitch) this.fillPendingTrendSwitch(bar, i)
+      // A0. 上一根 K 线排队的市价单：在本根开盘成交
+      //     （时间止损的市价平仓、以及 supertrend / 订单块的下一根开盘开仓）
+      if (this.pendingExit) this.fillPendingExit(bar, i)
+      if (this.pendingEntry) this.fillPendingEntry(bar, i)
 
       // A. 已有仓位的挂单撮合（挂单从开仓后的下一根 bar 起生效）
       this.checkExits(bar, i)
+
+      // A1. 位置相关信号（订单块策略）：在收盘、撮合完成之后计算，
+      //     这样 flat 才等于原 Pine 中 `strategy.position_size == 0`
+      if (this.signalProvider) this.signalProvider(i, { flat: this.position === null })
+      const sig = series.signals[i]
+
+      // A2. 订单块：保本触发（等价于 Pine 在收盘时更新 longStop/shortStop）
+      if (params.exitStrategy === 'Zone OCO' && this.position) this.armBreakEven(bar)
 
       const inLong = this.position?.side === 'long'
       const inShort = this.position?.side === 'short'
 
       // B. 反手逻辑（对应 Pine 中 exitStrategy != "Trend Switch" 的 reversal 块）
-      if (this.position && params.exitStrategy !== 'Trend Switch' && params.allowReversePosition) {
+      if (
+        this.position &&
+        params.exitStrategy !== 'Trend Switch' &&
+        params.exitStrategy !== 'Zone OCO' &&
+        params.allowReversePosition
+      ) {
         if (inLong && sig.canShort) {
           this.closeAll('Reverse', bar.close, i, bar.timestamp)
         } else if (inShort && sig.canLong) {
@@ -637,6 +786,33 @@ class BacktestEngine {
             )
           }
         }
+      } else if (params.exitStrategy === 'Zone OCO') {
+        // 订单块：区域回踩信号 → 下一根开盘市价进场，同时挂出
+        // 区域止损（stop）与固定盈亏比目标（limit），二者构成 OCO；整仓离场。
+        const inPos = this.position !== null
+        if (wantLong && !inPos && this.canAddSameDirection('long', true)) {
+          const stopLoss = Number.isFinite(sig.obStopLoss ?? NaN) ? (sig.obStopLoss as number) : NaN
+          const takeProfit = Number.isFinite(sig.obTakeProfit ?? NaN)
+            ? (sig.obTakeProfit as number)
+            : NaN
+          const risk = Number.isFinite(sig.obRisk ?? NaN) ? (sig.obRisk as number) : undefined
+          if (this.fillNextBarOpen) {
+            this.pendingEntry = { side: 'long', stopLoss, takeProfit, risk }
+          } else {
+            this.addSubOrder('long', bar.close, i, bar.timestamp, stopLoss, NaN, takeProfit, NaN, NaN)
+          }
+        } else if (wantShort && !inPos && this.canAddSameDirection('short', true)) {
+          const stopLoss = Number.isFinite(sig.obStopLoss ?? NaN) ? (sig.obStopLoss as number) : NaN
+          const takeProfit = Number.isFinite(sig.obTakeProfit ?? NaN)
+            ? (sig.obTakeProfit as number)
+            : NaN
+          const risk = Number.isFinite(sig.obRisk ?? NaN) ? (sig.obRisk as number) : undefined
+          if (this.fillNextBarOpen) {
+            this.pendingEntry = { side: 'short', stopLoss, takeProfit, risk }
+          } else {
+            this.addSubOrder('short', bar.close, i, bar.timestamp, stopLoss, NaN, takeProfit, NaN, NaN)
+          }
+        }
       } else {
         // Trend Switch：无固定止盈止损，靠反向信号离场
         const inLongNow = this.position?.side === 'long'
@@ -648,7 +824,7 @@ class BacktestEngine {
           const trail = Number.isFinite(sig.atrLongStop) ? sig.atrLongStop : NaN
           if (this.fillNextBarOpen) {
             // 排队到下一根开盘成交（对齐 TradingView 默认下单时点）
-            this.pendingTrendSwitch = { side: 'long', trail }
+            this.pendingEntry = { side: 'long', displayStopLoss: trail }
           } else {
             if (inShortNow) this.closeAll('TrendSwitch', bar.close, i, bar.timestamp)
             this.addSubOrder('long', bar.close, i, bar.timestamp, NaN, NaN, NaN, NaN, trail)
@@ -656,11 +832,20 @@ class BacktestEngine {
         } else if (wantShort && !inShortNow && this.canAddSameDirection('short', true)) {
           const trail = Number.isFinite(sig.atrShortStop) ? sig.atrShortStop : NaN
           if (this.fillNextBarOpen) {
-            this.pendingTrendSwitch = { side: 'short', trail }
+            this.pendingEntry = { side: 'short', displayStopLoss: trail }
           } else {
             if (inLongNow) this.closeAll('TrendSwitch', bar.close, i, bar.timestamp)
             this.addSubOrder('short', bar.close, i, bar.timestamp, NaN, NaN, NaN, NaN, trail)
           }
+        }
+      }
+
+      // C2. 订单块：时间止损（收盘判定 → 下一根开盘市价平仓）
+      if (params.exitStrategy === 'Zone OCO' && this.position) {
+        const maxBars = params.orderBlock.maxBars
+        if (maxBars > 0) {
+          const alive = this.position.subs.find((s) => this.isAlive(s))
+          if (alive && i - alive.entryIndex >= maxBars) this.pendingExit = 'TimeStop'
         }
       }
 

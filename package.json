@@ -22,7 +22,8 @@
     "diag:vision": "tsx scripts/test-vision.ts",
     "diag:pyramiding": "tsx scripts/check-pyramiding.ts",
     "compare:tv": "tsx scripts/compare-tradingview.ts",
-    "check:ui": "node scripts/ui-check.mjs"
+    "check:ui": "node scripts/ui-check.mjs",
+    "clean:cache": "node scripts/clean-cache.mjs"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",

@@ -84,6 +84,15 @@ interface Props {
   onRun: () => void
   loading: boolean
   estimatedBars: number
+  /** 所选合约的下单精度（syminfo.mintick），用于把滑点 tick 数换算成价格 */
+  onTickSizeChange?: (tickSize: number) => void
+}
+
+/** 由合约的下单精度推导最小变动价位：< 1 视为 tick 本身，否则视为小数位数 */
+function tickSizeOf(inst: Instrument | null): number {
+  const p = inst?.pricePrecision
+  if (typeof p !== 'number' || !Number.isFinite(p) || p <= 0) return 0
+  return p < 1 ? p : Math.pow(10, -Math.round(p))
 }
 
 function NumField({
@@ -144,6 +153,7 @@ export default function ControlPanel({
   onRun,
   loading,
   estimatedBars,
+  onTickSizeChange,
 }: Props) {
   const [instruments, setInstruments] = useState<Instrument[]>([])
   const [loadingInstruments, setLoadingInstruments] = useState(false)
@@ -183,6 +193,11 @@ export default function ControlPanel({
     [instruments, symbol],
   )
 
+  // 把所选合约的最小变动价位上抛给 App，回测时用于把滑点 tick 换算成价格
+  useEffect(() => {
+    onTickSizeChange?.(tickSizeOf(selected))
+  }, [selected, onTickSizeChange])
+
   const set = <K extends keyof StrategyParams>(key: K, value: StrategyParams[K]) => {
     onParamsChange({ ...params, [key]: value })
   }
@@ -196,6 +211,83 @@ export default function ControlPanel({
 
   const isATR = params.exitStrategy === 'ATR'
   const isFixed = params.exitStrategy === 'Fixed Percent'
+
+  /** 切换策略：订单块策略按原 Pine 的 strategy() 声明同步资金/费用/仓位默认值 */
+  const changeStrategy = (next: StrategyKind) => {
+    const patch: StrategyParams = { ...params, strategy: next }
+    if (next === 'order-block') {
+      // strategy(...) 声明：initial_capital=10000, commission 0.05%,
+      // default_qty = 10% of equity（= 仓位 10% × 1x）, slippage = 2 tick, pyramiding = 0
+      patch.initialCapital = 10000
+      patch.commissionPercent = 0.05
+      patch.positionSizePercent = 10
+      patch.leverage = 1
+      patch.slippageTicks = 2
+    } else if (next === 'supertrend') {
+      patch.slippageTicks = 0
+    } else {
+      patch.slippageTicks = 0
+    }
+    onParamsChange(patch)
+  }
+
+  /** 订单块数值输入 */
+  const obNum = (
+    key: keyof StrategyParams['orderBlock'],
+    label: string,
+    opts: {
+      step?: number
+      min?: number
+      max?: number
+      suffix?: string
+      tooltip?: string
+      integer?: boolean
+    } = {},
+  ) => (
+    <NumField
+      key={String(key)}
+      label={label}
+      value={Number(params.orderBlock[key])}
+      step={opts.step ?? 1}
+      min={opts.min ?? 0}
+      max={opts.max ?? 10_000}
+      suffix={opts.suffix}
+      tooltip={opts.tooltip}
+      onChange={(v) =>
+        onParamsChange({
+          ...params,
+          orderBlock: {
+            ...params.orderBlock,
+            [key]: opts.integer === false ? v : Math.round(v),
+          },
+        })
+      }
+    />
+  )
+
+  /** 订单块开关 */
+  const obBool = (key: keyof StrategyParams['orderBlock'], label: string, tooltip?: string) => (
+    <FormControlLabel
+      key={String(key)}
+      control={
+        <Switch
+          size="small"
+          checked={Boolean(params.orderBlock[key])}
+          onChange={(e) =>
+            onParamsChange({
+              ...params,
+              orderBlock: { ...params.orderBlock, [key]: e.target.checked },
+            })
+          }
+        />
+      }
+      label={
+        <Tooltip title={tooltip ?? ''}>
+          <Typography variant="caption">{label}</Typography>
+        </Tooltip>
+      }
+    />
+  )
 
   return (
     <Paper sx={{ p: 2 }}>
@@ -403,10 +495,11 @@ export default function ControlPanel({
               label="策略"
               notched
               value={params.strategy}
-              onChange={(e) => onParamsChange({ ...params, strategy: e.target.value as StrategyKind })}
+              onChange={(e) => changeStrategy(e.target.value as StrategyKind)}
             >
               <MenuItem value="fib-trend">Fibonacci Trend Reversals（IMBA + TSOT）</MenuItem>
               <MenuItem value="supertrend">SuperTrend（KivancOzbilgic）</MenuItem>
+              <MenuItem value="order-block">Volume Order Block Retest（订单块回踩）</MenuItem>
             </Select>
           </FormControl>
 
@@ -585,6 +678,185 @@ export default function ControlPanel({
                 </Typography>
               )}
             </>
+          ) : params.strategy === 'order-block' ? (
+            <>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+                Volume Order Block Retest：用「放量脉冲 K 线 + 其前一根 K 线区间」标记订单块，
+                价格回踩区域时顺势入场；止损放在区域外侧，止盈按固定盈亏比，可选保本移动与时间止损。
+                参数与原 Pine v6 脚本逐条对应，成交时点同样按「信号下一根开盘」。
+              </Typography>
+
+              <Typography variant="caption" sx={{ display: 'block', mb: 0.75, fontWeight: 600 }}>
+                订单块检测
+              </Typography>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gap: 1.5,
+                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                }}
+              >
+                {obNum('atrLen', 'ATR 周期', {
+                  min: 1,
+                  max: 500,
+                  tooltip: 'Pine: ATR length（默认 14）',
+                })}
+                {obNum('dispMult', '脉冲实体 ≥', {
+                  step: 0.1,
+                  min: 0.1,
+                  max: 50,
+                  suffix: '×ATR',
+                  integer: false,
+                  tooltip: 'Pine: Displacement body ≥ ATR ×（默认 0.8）',
+                })}
+                {obNum('volLen', '量能 SMA 周期', { min: 1, max: 500, tooltip: 'Pine: Volume SMA length（默认 20）' })}
+                {obNum('impVolMult', '脉冲量能 ≥', {
+                  step: 0.1,
+                  min: 0,
+                  max: 50,
+                  suffix: '×SMA',
+                  integer: false,
+                  tooltip: 'Pine: Impulse volume ≥ SMA ×（默认 1.0）',
+                })}
+                {obNum('maxZones', '最大存活区域', { min: 1, max: 40, suffix: '个', tooltip: 'Pine: Max active zones（默认 15）' })}
+                {obNum('maxAge', '区域存活上限', { min: 10, max: 100_000, suffix: '根', tooltip: 'Pine: Max zone age (bars)（默认 300）' })}
+              </Box>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gap: 0.5,
+                  mt: 1,
+                  gridTemplateColumns: { xs: '1fr', md: '1fr 1fr 1fr' },
+                }}
+              >
+                {obBool('needOpp', '要求脉冲前反向 K 线', 'Pine: Require opposite-colour candle before impulse')}
+                {obBool('needBreak', '要求脉冲突破前一根区间', 'Pine: Require impulse close beyond prior candle range')}
+                {obBool('bodyZone', '区域取实体（否则取高低点）', 'Pine: Use candle body only for zone')}
+              </Box>
+
+              <Typography variant="caption" sx={{ display: 'block', mt: 2, mb: 0.75, fontWeight: 600 }}>
+                入场过滤
+              </Typography>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gap: 1.5,
+                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                }}
+              >
+                {obNum('emaLen', 'EMA 周期', { min: 2, max: 2000, tooltip: 'Pine: EMA length（默认 100）' })}
+                {obNum('wickPct', '最小影线占比', {
+                  min: 5,
+                  max: 95,
+                  suffix: '%',
+                  tooltip: 'Pine: Min wick % of range（默认 25）',
+                })}
+                {obNum('retestVolMax', '回踩量能 ≤', {
+                  step: 0.05,
+                  min: 0.1,
+                  max: 50,
+                  suffix: '×脉冲',
+                  integer: false,
+                  tooltip: 'Pine: Retest volume ≤ impulse volume ×（默认 1.0）',
+                })}
+              </Box>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gap: 0.5,
+                  mt: 1,
+                  gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' },
+                }}
+              >
+                {obBool('firstTouch', '每个区域只成交一次', 'Pine: Each zone trades once')}
+                {obBool('needCandle', '要求顺势 K 线', 'Pine: Require candle in trade direction')}
+                {obBool('useRejection', '要求拒绝影线', 'Pine: Require rejection wick')}
+                {obBool('useRetestVol', '要求回踩缩量', 'Pine: Require volume dry-up on retest')}
+                {obBool('useTrend', 'EMA 趋势过滤', 'Pine: EMA trend filter')}
+                {obBool('allowLong', '允许做多', 'Pine: Allow longs')}
+                {obBool('allowShort', '允许做空', 'Pine: Allow shorts')}
+              </Box>
+
+              <Typography variant="caption" sx={{ display: 'block', mt: 2, mb: 0.75, fontWeight: 600 }}>
+                风险控制
+              </Typography>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gap: 1.5,
+                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                }}
+              >
+                {obNum('slBuf', '止损缓冲', {
+                  step: 0.05,
+                  min: 0,
+                  max: 50,
+                  suffix: '×ATR',
+                  integer: false,
+                  tooltip: 'Pine: SL buffer beyond zone（默认 0.2）：止损放在区域外侧 ATR×该值 处',
+                })}
+                {obNum('rrTarget', '止盈目标', {
+                  step: 0.1,
+                  min: 0.2,
+                  max: 50,
+                  suffix: 'R',
+                  integer: false,
+                  tooltip: 'Pine: Take profit (R multiple)（默认 1.5）',
+                })}
+                {obNum('beAtR', '保本触发', {
+                  step: 0.1,
+                  min: 0.2,
+                  max: 50,
+                  suffix: 'R',
+                  integer: false,
+                  tooltip: 'Pine: Break-even trigger (R)（默认 1.0）：浮盈达到该 R 倍数后把止损移到开仓价',
+                })}
+                {obNum('maxBars', '时间止损', {
+                  min: 0,
+                  max: 100_000,
+                  suffix: '根',
+                  tooltip: 'Pine: Time stop (bars)（默认 60，0 = 关闭）：持仓超过该根数后下一根开盘市价平仓',
+                })}
+                <TextField
+                  label="滑点"
+                  type="number"
+                  size="small"
+                  fullWidth
+                  value={params.slippageTicks}
+                  onChange={(e) => set('slippageTicks', clampNum(e.target.value, 0, 200, 0))}
+                  slotProps={{
+                    htmlInput: { min: 0, max: 200, step: 1 },
+                    input: {
+                      endAdornment: (
+                        <Tooltip title="Pine: slippage = 2（单位 tick，按所选合约最小变动价位换算成价格）。市价单与止损单按劣势方向成交，止盈限价单不受影响">
+                          <InputAdornment position="end">
+                            <Typography variant="caption" color="text.secondary">
+                              tick
+                            </Typography>
+                          </InputAdornment>
+                        </Tooltip>
+                      ),
+                    },
+                  }}
+                />
+              </Box>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gap: 0.5,
+                  mt: 1,
+                  gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' },
+                }}
+              >
+                {obBool('useBE', '保本移动止损', 'Pine: Move stop to break-even')}
+              </Box>
+
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 1.5, display: 'block' }}>
+                原脚本声明的固定语义：初始资金 10,000、手续费单边 0.05%、下单量为权益的 10%（1 倍杠杆）、
+                滑点 2 tick、同时只持有一仓（不加仓、无分批止盈），离场为「区域止损 / 固定盈亏比目标 / 保本 / 时间止损」。
+                切换策略时已自动套用，可在上方「资金与杠杆」处覆盖。
+              </Typography>
+            </>
           ) : (
             <>
               <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
@@ -750,6 +1022,26 @@ export default function ControlPanel({
                   · <b>手续费</b>：开仓与每笔平仓均按名义价值收取，默认单边 0.055%。
                   <br />
                   · <b>未计入</b>：资金费率、滑点与流动性冲击，实盘表现通常弱于回测。
+                </>
+              ) : params.strategy === 'order-block' ? (
+                <>
+                  · <b>订单块</b>：放量脉冲 K 线（实体 ≥ ATR×0.8 且成交量 ≥ 20 根均量）出现时，
+                  把它的**前一根** K 线的最高/最低（可选实体）标记为同向区域；同向已被覆盖的区域不重复创建，
+                  超过 maxZones 个时丢弃最旧的一个。
+                  <br />
+                  · <b>回踩入场</b>：价格再次触及区域（high ≥ 区域下沿且 low ≤ 区域上沿）时，
+                  按过滤器（顺势 K 线、拒绝影线、回踩缩量、EMA 趋势）判定；每个区域默认只成交一次。
+                  信号 bar 之后**下一根开盘**市价进场（对应 TV 未开启 process_orders_on_close）。
+                  <br />
+                  · <b>离场</b>：进场同时挂出 OCO —— 止损 = 区域外侧 ∓ ATR×slBuf，止盈 = 信号收盘价 ± 风险×盈亏比。
+                  浮盈达到 beAtR 倍风险后把止损移动到开仓价；持仓超过 maxBars 根后下一根开盘市价平仓。
+                  <br />
+                  · <b>撮合</b>：同一根 K 线内同时触及止损与止盈时，按阳线先探低、阴线先探高处理；
+                  市价单与止损单按 slippage tick 取劣势价，止盈限价单不受影响。
+                  <br />
+                  · <b>手续费</b>：开仓与平仓均按名义价值收取，本策略默认单边 0.05%。
+                  <br />
+                  · <b>未计入</b>：资金费率与流动性冲击，实盘表现通常弱于回测。
                 </>
               ) : (
                 <>
