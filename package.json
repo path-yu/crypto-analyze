@@ -1,0 +1,56 @@
+{
+  "name": "crypto-fib-trend-reversals",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Fibonacci Trend Reversals 策略的 TypeScript 复刻 —— ccxt 拉取公开加密货币合约 K 线，Node 回测引擎 + React/MUI/KLineChart 可视化",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:all": "node scripts/dev.mjs",
+    "dev:prod": "node scripts/dev.mjs --build",
+    "dev:server": "tsx watch server/src/index.ts",
+    "dev:web": "vite --config web/vite.config.ts",
+    "build": "npm run typecheck && vite build --config web/vite.config.ts",
+    "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p web/tsconfig.json --noEmit",
+    "test": "tsx --test server/src/tests/*.test.ts",
+    "start": "cross-env NODE_ENV=production tsx server/src/index.ts",
+    "backtest": "tsx server/src/cli.ts",
+    "diag:trades": "tsx scripts/diagnose-trade-count.ts",
+    "diag:exchanges": "node scripts/diag-exchanges.mjs",
+    "diag:signals": "tsx scripts/probe-signals.ts",
+    "diag:history": "tsx scripts/probe-history-depth.ts",
+    "diag:vision": "tsx scripts/test-vision.ts",
+    "diag:pyramiding": "tsx scripts/check-pyramiding.ts",
+    "compare:tv": "tsx scripts/compare-tradingview.ts",
+    "check:ui": "node scripts/ui-check.mjs"
+  },
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.0",
+    "@mui/icons-material": "^9.5.0",
+    "@mui/material": "^9.5.0",
+    "ccxt": "^4.5.85",
+    "cors": "^2.8.5",
+    "express": "^5.3.0",
+    "klinecharts": "^10.0.3",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "recharts": "^3.10.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.5",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

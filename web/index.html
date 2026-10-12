@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fibonacci Trend Reversals · 加密货币合约回测</title>
+    <meta
+      name="description"
+      content="基于 ccxt 公开合约数据 + KLineChart 的 Fibonacci Trend Reversals 策略回测终端"
+    />
+    <style>
+      html,
+      body,
+      #root {
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', system-ui, -apple-system,
+          'Segoe UI', Roboto, sans-serif;
+        background: #0b0e14;
+      }
+      /* 细滚动条，避免破坏深色界面观感 */
+      ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #2c3444;
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #3d475c;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

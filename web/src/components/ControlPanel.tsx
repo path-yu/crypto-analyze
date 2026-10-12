@@ -1,0 +1,776 @@
+import { useEffect, useMemo, useState } from 'react'
+import Accordion from '@mui/material/Accordion'
+import AccordionDetails from '@mui/material/AccordionDetails'
+import AccordionSummary from '@mui/material/AccordionSummary'
+import Alert from '@mui/material/Alert'
+import Autocomplete from '@mui/material/Autocomplete'
+import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
+import Chip from '@mui/material/Chip'
+import Divider from '@mui/material/Divider'
+import FormControl from '@mui/material/FormControl'
+import FormControlLabel from '@mui/material/FormControlLabel'
+import InputAdornment from '@mui/material/InputAdornment'
+import InputLabel from '@mui/material/InputLabel'
+import MenuItem from '@mui/material/MenuItem'
+import Paper from '@mui/material/Paper'
+import Select from '@mui/material/Select'
+import Stack from '../ui/Stack'
+import Switch from '@mui/material/Switch'
+import TextField from '@mui/material/TextField'
+import Tooltip from '@mui/material/Tooltip'
+import Typography from '@mui/material/Typography'
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
+import PlayArrowIcon from '@mui/icons-material/PlayArrow'
+import RestartAltIcon from '@mui/icons-material/RestartAlt'
+import CircularProgress from '@mui/material/CircularProgress'
+
+import type { ExchangeId, Instrument, StrategyKind, StrategyParams, Timeframe } from '@shared/types'
+import { DEFAULT_STRATEGY_PARAMS, EXCHANGES, TIMEFRAMES } from '@shared/types'
+import { fetchInstruments } from '../api'
+
+export type RangeKey = '1m' | '3m' | '6m' | '1y' | '2y' | '3y' | 'custom'
+
+const RANGE_OPTIONS: { key: RangeKey; label: string; ms?: number }[] = [
+  { key: '1m', label: '最近 1 个月', ms: 30 * 86400_000 },
+  { key: '3m', label: '最近 3 个月', ms: 90 * 86400_000 },
+  { key: '6m', label: '最近 6 个月', ms: 180 * 86400_000 },
+  { key: '1y', label: '最近 1 年', ms: 365 * 86400_000 },
+  { key: '2y', label: '最近 2 年', ms: 730 * 86400_000 },
+  { key: '3y', label: '最近 3 年', ms: 1095 * 86400_000 },
+  { key: 'custom', label: '自定义起始日期' },
+]
+
+/** 各周期的推荐回测区间，避免 K 线数量爆炸 */
+export const RECOMMENDED_RANGE: Record<Timeframe, RangeKey> = {
+  '1m': '3m',
+  '3m': '3m',
+  '5m': '6m',
+  '15m': '6m',
+  '30m': '1y',
+  '1h': '1y',
+  '2h': '1y',
+  '4h': '3y',
+  '6h': '3y',
+  '12h': '3y',
+  '1d': '3y',
+  '3d': '3y',
+  '1w': '3y',
+}
+
+export function rangeToSince(key: RangeKey, custom?: string): number {
+  if (key === 'custom' && custom) {
+    const t = new Date(custom).getTime()
+    if (Number.isFinite(t)) return t
+  }
+  const opt = RANGE_OPTIONS.find((r) => r.key === key)
+  const ms = opt?.ms ?? 180 * 86400_000
+  return Date.now() - ms
+}
+
+interface Props {
+  exchange: ExchangeId
+  onExchangeChange: (v: ExchangeId) => void
+  symbol: string
+  onSymbolChange: (v: string) => void
+  timeframe: Timeframe
+  onTimeframeChange: (v: Timeframe) => void
+  range: RangeKey
+  onRangeChange: (v: RangeKey) => void
+  customSince: string
+  onCustomSinceChange: (v: string) => void
+  params: StrategyParams
+  onParamsChange: (v: StrategyParams) => void
+  onRun: () => void
+  loading: boolean
+  estimatedBars: number
+}
+
+function NumField({
+  label,
+  value,
+  onChange,
+  step = 1,
+  min,
+  max,
+  tooltip,
+  suffix,
+}: {
+  label: string
+  value: number
+  onChange: (v: number) => void
+  step?: number
+  min?: number
+  max?: number
+  tooltip?: string
+  suffix?: string
+}) {
+  return (
+    <Tooltip title={tooltip ?? ''} placement="top">
+      <TextField
+        size="small"
+        type="number"
+        label={label}
+        value={Number.isFinite(value) ? value : ''}
+        onChange={(e) => {
+          const v = Number(e.target.value)
+          if (Number.isFinite(v)) onChange(v)
+          else if (e.target.value === '') onChange(min ?? 0)
+        }}
+        slotProps={{
+          htmlInput: { step, min, max, style: { fontSize: 13 } },
+          inputLabel: { shrink: true },
+          input: suffix ? { endAdornment: <Typography variant="caption">{suffix}</Typography> } : undefined,
+        }}
+        fullWidth
+      />
+    </Tooltip>
+  )
+}
+
+export default function ControlPanel({
+  exchange,
+  onExchangeChange,
+  symbol,
+  onSymbolChange,
+  timeframe,
+  onTimeframeChange,
+  range,
+  onRangeChange,
+  customSince,
+  onCustomSinceChange,
+  params,
+  onParamsChange,
+  onRun,
+  loading,
+  estimatedBars,
+}: Props) {
+  const [instruments, setInstruments] = useState<Instrument[]>([])
+  const [loadingInstruments, setLoadingInstruments] = useState(false)
+  const [instrumentError, setInstrumentError] = useState<string | null>(null)
+  const [instrumentNote, setInstrumentNote] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoadingInstruments(true)
+    setInstrumentError(null)
+    setInstrumentNote(null)
+    fetchInstruments(exchange)
+      .then((res) => {
+        if (cancelled) return
+        setInstruments(res.data)
+        if (res.fallbackFrom) {
+          setInstrumentNote(
+            `${res.fallbackFrom} 暂不可用，合约列表已回退到 ${res.exchange}。行情与价格与该交易所保持一致。`,
+          )
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        // 不回退成一片空白：保留手动输入的 symbol，并给出可读的提示
+        setInstrumentError(err instanceof Error ? err.message : '加载合约列表失败')
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingInstruments(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [exchange])
+
+  const selected = useMemo(
+    () => instruments.find((i) => i.symbol === symbol) ?? null,
+    [instruments, symbol],
+  )
+
+  const set = <K extends keyof StrategyParams>(key: K, value: StrategyParams[K]) => {
+    onParamsChange({ ...params, [key]: value })
+  }
+
+  /** 数字输入：空串或非法值回落到 fallback，合法值夹到 [lo, hi] 的整数 */
+  const clampNum = (raw: string, lo: number, hi: number, fallback: number): number => {
+    const v = Number(raw)
+    if (!Number.isFinite(v)) return fallback
+    return Math.min(hi, Math.max(lo, Math.round(v)))
+  }
+
+  const isATR = params.exitStrategy === 'ATR'
+  const isFixed = params.exitStrategy === 'Fixed Percent'
+
+  return (
+    <Paper sx={{ p: 2 }}>
+      <Stack spacing={2}>
+        {/* ---------------- 行情设置 ---------------- */}
+        <Box>
+          <Typography variant="subtitle2" sx={{ mb: 1.25 }}>
+            行情设置
+          </Typography>
+          <Box
+            sx={{
+              display: 'grid',
+              gap: 1.5,
+              gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr', md: '1fr 1fr 1fr' },
+            }}
+          >
+            <FormControl size="small" fullWidth>
+              <InputLabel shrink>交易所</InputLabel>
+              <Select
+                label="交易所"
+                notched
+                value={exchange}
+                onChange={(e) => onExchangeChange(e.target.value as ExchangeId)}
+              >
+                {EXCHANGES.map((e) => (
+                  <MenuItem key={e.id} value={e.id}>
+                    {e.label}
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+
+            <Autocomplete
+              size="small"
+              fullWidth
+              options={instruments}
+              loading={loadingInstruments}
+              value={selected}
+              getOptionLabel={(o) => (typeof o === 'string' ? o : `${o.label} · ${o.symbol}`)}
+              isOptionEqualToValue={(a, b) => a.symbol === b.symbol}
+              onChange={(_e, v) => {
+                if (!v) return
+                onSymbolChange(typeof v === 'string' ? v : v.symbol)
+              }}
+              renderInput={(p) => (
+                <TextField
+                  {...p}
+                  label="合约（USDT 本位永续）"
+                  placeholder={loadingInstruments ? '加载中…' : '输入 BTC / ETH 搜索'}
+                  helperText={instrumentError ?? instrumentNote ?? undefined}
+                  error={Boolean(instrumentError)}
+                  color={instrumentNote ? 'info' : undefined}
+                  focused={instrumentNote ? true : undefined}
+                />
+              )}
+            />
+            {instrumentNote && (
+              <Alert severity="info" sx={{ gridColumn: '1 / -1' }} onClose={() => setInstrumentNote(null)}>
+                {instrumentNote}
+              </Alert>
+            )}
+
+            <Stack direction="row" spacing={1.5}>
+              <FormControl size="small" fullWidth>
+                <InputLabel shrink>K 线周期</InputLabel>
+                <Select
+                  label="K 线周期"
+                  notched
+                  value={timeframe}
+                  onChange={(e) => {
+                    const tf = e.target.value as Timeframe
+                    onTimeframeChange(tf)
+                    onRangeChange(RECOMMENDED_RANGE[tf])
+                  }}
+                >
+                  {TIMEFRAMES.map((tf) => (
+                    <MenuItem key={tf} value={tf}>
+                      {tf}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <FormControl size="small" fullWidth>
+                <InputLabel shrink>回测区间</InputLabel>
+                <Select
+                  label="回测区间"
+                  notched
+                  value={range}
+                  onChange={(e) => onRangeChange(e.target.value as RangeKey)}
+                >
+                  {RANGE_OPTIONS.map((r) => (
+                    <MenuItem key={r.key} value={r.key}>
+                      {r.label}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            </Stack>
+          </Box>
+
+          {range === 'custom' && (
+            <TextField
+              sx={{ mt: 1.5, maxWidth: 260 }}
+              size="small"
+              type="date"
+              label="起始日期（UTC+8）"
+              value={customSince}
+              onChange={(e) => onCustomSinceChange(e.target.value)}
+              slotProps={{ inputLabel: { shrink: true } }}
+            />
+          )}
+
+          <Stack direction="row" spacing={1} sx={{ mt: 1.5 }} alignItems="center">
+            <Chip size="small" label={`预计约 ${estimatedBars.toLocaleString()} 根 K 线`} />
+            {estimatedBars > 40000 && (
+              <Chip size="small" color="warning" label="数据量较大，拉取与计算会偏慢" />
+            )}
+            {selected?.maxLeverage && (
+              <Chip size="small" variant="outlined" label={`该合约最大杠杆 ${selected.maxLeverage}x`} />
+            )}
+          </Stack>
+        </Box>
+
+        <Divider />
+
+        {/* ---------------- 资金与杠杆 ---------------- */}
+        <Box>
+          <Typography variant="subtitle2" sx={{ mb: 1.25 }}>
+            资金与杠杆
+          </Typography>
+          <Box
+            sx={{
+              display: 'grid',
+              gap: 1.5,
+              gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+            }}
+          >
+            <NumField
+              label="初始资金"
+              value={params.initialCapital}
+              step={100}
+              min={10}
+              suffix="USDT"
+              onChange={(v) => set('initialCapital', v)}
+            />
+            <NumField
+              label="杠杆倍数"
+              value={params.leverage}
+              step={1}
+              min={1}
+              max={125}
+              suffix="x"
+              tooltip="名义价值 = 保证金 × 杠杆；杠杆越高，同等价格波动下的盈亏放大越多，也越容易触及强平"
+              onChange={(v) => set('leverage', Math.round(v))}
+            />
+            <NumField
+              label="仓位比例"
+              value={params.positionSizePercent}
+              step={5}
+              min={1}
+              max={100}
+              suffix="%"
+              tooltip="每次开仓使用的保证金占当前权益的百分比"
+              onChange={(v) => set('positionSizePercent', v)}
+            />
+            <NumField
+              label="单边手续费"
+              value={params.commissionPercent}
+              step={0.005}
+              min={0}
+              max={2}
+              suffix="%"
+              tooltip="Pine 脚本 commission_value = 0.055，即单边 0.055%，双边合计约 0.11%"
+              onChange={(v) => set('commissionPercent', v)}
+            />
+          </Box>
+          <FormControlLabel
+            sx={{ mt: 1 }}
+            control={
+              <Switch
+                size="small"
+                checked={params.checkLiquidation}
+                onChange={(e) => set('checkLiquidation', e.target.checked)}
+              />
+            }
+            label={
+              <Tooltip title="按逐仓 1/杠杆 的价格波动估算强平价；关闭则假设永不爆仓">
+                <Typography variant="caption">启用强平检查</Typography>
+              </Tooltip>
+            }
+          />
+        </Box>
+
+        <Divider />
+
+        {/* ---------------- 策略参数 ---------------- */}
+        <Box>
+          <Typography variant="subtitle2" sx={{ mb: 1.25 }}>
+            策略参数
+          </Typography>
+
+          <FormControl size="small" fullWidth sx={{ mb: 1.5 }}>
+            <InputLabel shrink>策略</InputLabel>
+            <Select
+              label="策略"
+              notched
+              value={params.strategy}
+              onChange={(e) => onParamsChange({ ...params, strategy: e.target.value as StrategyKind })}
+            >
+              <MenuItem value="fib-trend">Fibonacci Trend Reversals（IMBA + TSOT）</MenuItem>
+              <MenuItem value="supertrend">SuperTrend（KivancOzbilgic）</MenuItem>
+            </Select>
+          </FormControl>
+
+          {params.strategy === 'fib-trend' ? (
+            <>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gap: 1.5,
+                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                }}
+              >
+                <NumField
+                  label="Sensitivity 敏感度"
+                  value={params.sensitivity}
+                  step={1}
+                  min={1}
+                  max={200}
+                  tooltip="Pine 中该值会 ×10 作为 highest/lowest 的窗口长度。默认 18 → 180 根 K 线构成斐波那契通道"
+                  onChange={(v) => set('sensitivity', v)}
+                />
+                <NumField
+                  label="ATR 长度"
+                  value={params.atrLength}
+                  step={1}
+                  min={1}
+                  max={500}
+                  onChange={(v) => set('atrLength', Math.round(v))}
+                />
+                <FormControl size="small" fullWidth>
+                  <InputLabel shrink>ATR 平滑方式</InputLabel>
+                  <Select
+                    label="ATR 平滑方式"
+                    notched
+                    value={params.atrSmoothing}
+                    onChange={(e) => set('atrSmoothing', e.target.value as StrategyParams['atrSmoothing'])}
+                  >
+                    {['RMA', 'SMA', 'EMA', 'WMA'].map((s) => (
+                      <MenuItem key={s} value={s}>
+                        {s}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                </FormControl>
+                <NumField
+                  label="ATR 止损倍数"
+                  value={params.atrMultiplier}
+                  step={0.1}
+                  min={0.1}
+                  max={50}
+                  suffix="×ATR"
+                  onChange={(v) => set('atrMultiplier', v)}
+                />
+              </Box>
+
+              <Box
+                sx={{
+                  display: 'grid',
+                  gap: 1.5,
+                  mt: 1.5,
+                  gridTemplateColumns: { xs: '1fr', sm: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                }}
+              >
+                <FormControl size="small" fullWidth>
+                  <InputLabel shrink>交易方向</InputLabel>
+                  <Select
+                    label="交易方向"
+                    notched
+                    value={params.tradeDirection}
+                    onChange={(e) => set('tradeDirection', e.target.value as StrategyParams['tradeDirection'])}
+                  >
+                    <MenuItem value="Both">双向（多 + 空）</MenuItem>
+                    <MenuItem value="Long Only">仅做多</MenuItem>
+                    <MenuItem value="Short Only">仅做空</MenuItem>
+                  </Select>
+                </FormControl>
+
+                <FormControl size="small" fullWidth>
+                  <InputLabel shrink>止损模式</InputLabel>
+                  <Select
+                    label="止损模式"
+                    notched
+                    value={params.exitStrategy}
+                    onChange={(e) => set('exitStrategy', e.target.value as StrategyParams['exitStrategy'])}
+                  >
+                    <MenuItem value="ATR">ATR 动态止损</MenuItem>
+                    <MenuItem value="Fixed Percent">固定百分比止损</MenuItem>
+                    <MenuItem value="Trend Switch">趋势反转离场（无止损）</MenuItem>
+                  </Select>
+                </FormControl>
+
+                <NumField
+                  label="固定止损百分比"
+                  value={params.slPercent}
+                  step={0.1}
+                  min={0.05}
+                  max={50}
+                  suffix="%"
+                  tooltip="仅当止损模式为「固定百分比止损」时生效"
+                  onChange={(v) => set('slPercent', v)}
+                />
+
+                <NumField
+                  label="盈亏比 (Risk/Reward)"
+                  value={params.riskRewardRatio}
+                  step={0.1}
+                  min={0.1}
+                  max={50}
+                  tooltip="TP1 = 入场 + 盈亏比×风险/2，TP2 = 入场 + 盈亏比×风险"
+                  onChange={(v) => set('riskRewardRatio', v)}
+                />
+              </Box>
+
+              <Stack direction="row" spacing={3} sx={{ mt: 1.5 }} flexWrap="wrap">
+                <FormControlLabel
+                  control={
+                    <Switch
+                      size="small"
+                      checked={params.partialTp}
+                      onChange={(e) => set('partialTp', e.target.checked)}
+                    />
+                  }
+                  label={
+                    <Tooltip title="开启后：TP1 平掉 50% 并移动止损到保本，TP2 平掉剩余 50%">
+                      <Typography variant="caption">分批止盈（TP1 平 50%）</Typography>
+                    </Tooltip>
+                  }
+                />
+                <FormControlLabel
+                  control={
+                    <Switch
+                      size="small"
+                      checked={params.allowReversePosition}
+                      onChange={(e) => set('allowReversePosition', e.target.checked)}
+                    />
+                  }
+                  label={
+                    <Tooltip title="持有多单时出现做空信号（或反之）立即平仓反手">
+                      <Typography variant="caption">允许反手</Typography>
+                    </Tooltip>
+                  }
+                />
+              </Stack>
+
+              {(isATR || isFixed) && (
+                <Box sx={{ mt: 2 }}>
+                  <TextField
+                    label="金字塔式加仓上限（订单数）"
+                    type="number"
+                    size="small"
+                    fullWidth
+                    value={params.pyramiding}
+                    onChange={(e) => set('pyramiding', clampNum(e.target.value, 0, 20, 1))}
+                    slotProps={{
+                      htmlInput: { min: 0, max: 20, step: 1 },
+                      input: {
+                        endAdornment: (
+                          <Tooltip title="对应 TradingView 策略属性里的「金字塔式 N 订单」。持仓期间再出现同向信号时允许继续加仓，总订单数不超过该值；填 0 表示不限制。填 1 即完全不加仓。">
+                            <InputAdornment position="end">
+                              <Typography variant="caption" color="text.secondary">
+                                ?
+                              </Typography>
+                            </InputAdornment>
+                          </Tooltip>
+                        ),
+                      },
+                    }}
+                    helperText="TradingView 图表上同一根 K 线出现多笔同向开仓，就是这里的值大于 1。"
+                  />
+                </Box>
+              )}
+
+              {(isATR || isFixed) && !params.partialTp && (
+                <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+                  当前为整仓离场模式：价格触及 TP2 或止损时一次性平掉全部仓位。
+                </Typography>
+              )}
+            </>
+          ) : (
+            <>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+                SuperTrend 策略为纯趋势策略：趋势翻多即做多，翻空即做空并在同一根 K 线上反手。
+                原版脚本无固定止损/止盈，由趋势反转触发离场。
+              </Typography>
+
+              <Box
+                sx={{
+                  display: 'grid',
+                  gap: 1.5,
+                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                }}
+              >
+                <NumField
+                  label="ATR 周期"
+                  value={params.supertrend.atrPeriod}
+                  step={1}
+                  min={1}
+                  max={500}
+                  tooltip="Pine input 'ATR Period'，用于计算波动幅度"
+                  onChange={(v) =>
+                    onParamsChange({
+                      ...params,
+                      supertrend: { ...params.supertrend, atrPeriod: Math.max(1, Math.round(v)) },
+                    })
+                  }
+                />
+                <NumField
+                  label="ATR 乘数"
+                  value={params.supertrend.multiplier}
+                  step={0.1}
+                  min={0.1}
+                  max={50}
+                  suffix="×ATR"
+                  tooltip="Pine input 'ATR Multiplier'，越大趋势越不容易翻转"
+                  onChange={(v) =>
+                    onParamsChange({
+                      ...params,
+                      supertrend: { ...params.supertrend, multiplier: v },
+                    })
+                  }
+                />
+                <FormControl size="small" fullWidth>
+                  <InputLabel shrink>价格源</InputLabel>
+                  <Select
+                    label="价格源"
+                    notched
+                    value={params.supertrend.source}
+                    onChange={(e) =>
+                      onParamsChange({
+                        ...params,
+                        supertrend: {
+                          ...params.supertrend,
+                          source: e.target.value as StrategyParams['supertrend']['source'],
+                        },
+                      })
+                    }
+                  >
+                    <MenuItem value="hl2">hl2（默认）</MenuItem>
+                    <MenuItem value="close">close</MenuItem>
+                    <MenuItem value="open">open</MenuItem>
+                    <MenuItem value="high">high</MenuItem>
+                    <MenuItem value="low">low</MenuItem>
+                  </Select>
+                </FormControl>
+                <FormControl size="small" fullWidth>
+                  <InputLabel shrink>ATR 算法</InputLabel>
+                  <Select
+                    label="ATR 算法"
+                    notched
+                    value={params.supertrend.useSmaAtr ? 'SMA' : 'RMA'}
+                    onChange={(e) =>
+                      onParamsChange({
+                        ...params,
+                        supertrend: { ...params.supertrend, useSmaAtr: e.target.value === 'SMA' },
+                      })
+                    }
+                  >
+                    <MenuItem value="RMA">RMA（Wilder，原版默认）</MenuItem>
+                    <MenuItem value="SMA">SMA（changeATR 切换）</MenuItem>
+                  </Select>
+                </FormControl>
+              </Box>
+
+              <Box
+                sx={{
+                  display: 'grid',
+                  gap: 1.5,
+                  mt: 1.5,
+                  gridTemplateColumns: { xs: '1fr 1fr', md: 'repeat(4, 1fr)' },
+                }}
+              >
+                <FormControl size="small" fullWidth>
+                  <InputLabel shrink>交易方向</InputLabel>
+                  <Select
+                    label="交易方向"
+                    notched
+                    value={params.tradeDirection}
+                    onChange={(e) => set('tradeDirection', e.target.value as StrategyParams['tradeDirection'])}
+                  >
+                    <MenuItem value="Both">双向（多 + 空）</MenuItem>
+                    <MenuItem value="Long Only">仅做多</MenuItem>
+                    <MenuItem value="Short Only">仅做空</MenuItem>
+                  </Select>
+                </FormControl>
+              </Box>
+
+              <Typography variant="caption" color="text.secondary" sx={{ mt: 1.5, display: 'block' }}>
+                资金与杠杆、佣金与强平检查等通用参数继续生效；止损/止盈/分批/加仓相关项在 SuperTrend
+                下无意义，已隐藏。
+              </Typography>
+            </>
+          )}
+        </Box>
+
+        <Divider />
+
+        <Stack direction="row" spacing={1.5}>
+          <Button
+            variant="contained"
+            size="large"
+            startIcon={loading ? <CircularProgress size={16} color="inherit" /> : <PlayArrowIcon />}
+            disabled={loading}
+            onClick={onRun}
+            sx={{ flex: 1 }}
+          >
+            {loading ? '回测中…' : '开始回测'}
+          </Button>
+          <Button
+            variant="outlined"
+            startIcon={<RestartAltIcon />}
+            disabled={loading}
+            onClick={() => onParamsChange({ ...DEFAULT_STRATEGY_PARAMS })}
+          >
+            恢复默认参数
+          </Button>
+        </Stack>
+
+        <Accordion disableGutters elevation={0} sx={{ bgcolor: 'transparent', '&:before': { display: 'none' } }}>
+          <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 0, minHeight: 32 }}>
+            <Typography variant="caption" color="text.secondary">
+              策略说明与实现细节
+            </Typography>
+          </AccordionSummary>
+          <AccordionDetails sx={{ px: 0 }}>
+            <Typography variant="caption" color="text.secondary" component="div" sx={{ lineHeight: 1.9 }}>
+              {params.strategy === 'supertrend' ? (
+                <>
+                  · <b>信号</b>：基于 ATR 动态上下轨。up = src − Multiplier×ATR（多头支撑线），
+                  dn = src + Multiplier×ATR（空头阻力线）。收盘价跌破上一根 up → 翻空做空；
+                  收盘价升破上一根 dn → 翻多做多。
+                  <br />
+                  · <b>上下轨约束</b>：up 只能上移（max(本次 up, 上次 up)）、dn 只能下移
+                  （min(本次 dn, 上次 dn)），避免小幅来回穿越造成虚假翻向。
+                  <br />
+                  · <b>离场</b>：原脚本无 strategy.exit，仅由反向信号（趋势翻向）平旧仓并反手。
+                  本引擎以「趋势反转离场」语义复刻。
+                  <br />
+                  · <b>撮合</b>：开平仓按信号 K 线收盘价成交；同一根 K 线上同时出现翻多/翻空时，
+                  实际只会按收盘那一刻的最终方向入场。
+                  <br />
+                  · <b>手续费</b>：开仓与每笔平仓均按名义价值收取，默认单边 0.055%。
+                  <br />
+                  · <b>未计入</b>：资金费率、滑点与流动性冲击，实盘表现通常弱于回测。
+                </>
+              ) : (
+                <>
+                  · <b>信号</b>：以 0.5 斐波那契回撤位作为趋势线，K 线由下向上穿越且 TSOT 趋势强度为正 → 做多；
+                  由上向下穿越且趋势强度为负 → 做空。
+                  <br />
+                  · <b>TSOT</b>：统计 13/21/34/55/89 周期的 75 分位高点与 25 分位低点相对 144 周期分位区间的位置，
+                  综合得到多空强度差。
+                  <br />
+                  · <b>撮合</b>：开平仓按信号 K 线收盘价成交（对应 Pine 的 process_orders_on_close = true），
+                  挂单从下一根 K 线开始生效；同一根 K 线内同时触及止损与止盈时，按阳线先探低、阴线先探高处理。
+                  <br />
+                  · <b>手续费</b>：开仓与每笔平仓均按名义价值收取，默认单边 0.055%。
+                  <br />
+                  · <b>未计入</b>：资金费率、滑点与流动性冲击，实盘表现通常弱于回测。
+                </>
+              )}
+            </Typography>
+          </AccordionDetails>
+        </Accordion>
+      </Stack>
+    </Paper>
+  )
+}
