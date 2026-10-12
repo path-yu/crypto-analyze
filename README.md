@@ -61,6 +61,8 @@ npm run backtest -- --symbol ETH/USDT:USDT --timeframe 15m --since 2025-01-01 --
 | --- | --- | --- |
 | `PORT` | `8787` | 后端 API 端口 |
 | `API_TARGET` | `http://127.0.0.1:8787` | Vite 开发代理指向的后端地址 |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | 未设置 | 显式指定行情代理（未设置时自动读取 Windows 系统代理，见下文） |
+| `DISABLE_PROXY` | 未设置 | 设为 `1` 强制直连，忽略系统代理 |
 
 ## 目录结构
 

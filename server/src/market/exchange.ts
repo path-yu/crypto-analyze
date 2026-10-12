@@ -7,6 +7,7 @@
  *   - 内存 + 磁盘两级缓存，避免重复拉取
  */
 
+import { execSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -107,15 +108,86 @@ export class MarketError extends Error {
 }
 
 /* ------------------------------------------------------------------ */
+/* 代理                                                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Windows 系统代理（WinINET / Internet 选项）。
+ *
+ * 浏览器读的就是这里；**Node 默认完全不读** —— 因此「浏览器能打开交易所、
+ * 后端却超时」时几乎都是这个原因：直连会被 DNS 劫持到 169.254.x.x，
+ * 或 TLS 握手被重置（Recv failure: Connection was reset）。
+ */
+function winInetProxy(): string | null {
+  if (process.platform !== 'win32') return null
+  try {
+    const out = execSync(
+      'reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyServer',
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 },
+    )
+    const m = /ProxyServer\s+REG_SZ\s+(.+)/.exec(out)
+    if (!m) return null
+    const raw = m[1].trim()
+    // 可能是 "127.0.0.1:7890"，也可能是 "http=host:port;https=host:port"
+    const httpsPart = /https=([^;]+)/.exec(raw)
+    const value = (httpsPart ? httpsPart[1] : (/http=([^;]+)/.exec(raw)?.[1] ?? raw)).trim()
+    return value ? (value.startsWith('http') ? value : `http://${value}`) : null
+  } catch {
+    return null
+  }
+}
+
+let proxyCache: string | null | undefined
+
+/**
+ * 解析 ccxt 要使用的代理地址。
+ *
+ * 优先级：环境变量（HTTPS_PROXY / HTTP_PROXY / ALL_PROXY）> Windows 系统代理。
+ * 设置 `DISABLE_PROXY=1` 可强制直连（例如本地代理进程没开时）。
+ * 结果会缓存，避免每次建实例都读注册表。
+ *
+ * 注意：只有 ccxt 的接口调用走代理；Binance Data Vision 的历史归档
+ * 走的是全局 fetch，这里不动它（`data.binance.vision` 通常可直连）。
+ */
+export function resolveProxyUrl(): string | null {
+  if (proxyCache !== undefined) return proxyCache
+
+  if (process.env.DISABLE_PROXY === '1') {
+    proxyCache = null
+    return proxyCache
+  }
+
+  const env =
+    process.env.HTTPS_PROXY ??
+    process.env.https_proxy ??
+    process.env.HTTP_PROXY ??
+    process.env.http_proxy ??
+    process.env.ALL_PROXY ??
+    process.env.all_proxy
+
+  proxyCache = env && env.trim() ? env.trim() : winInetProxy()
+  return proxyCache
+}
+
+/** ccxt 使用 httpsProxy 前必须显式加载代理模块（依赖 https-proxy-agent） */
+async function loadProxyModules(ex: CcxtExchange): Promise<void> {
+  const loader = (ex as unknown as { loadProxyModules?: () => Promise<void> }).loadProxyModules
+  if (typeof loader !== 'function') return
+  await loader.call(ex)
+}
+
+/* ------------------------------------------------------------------ */
 /* 实例管理                                                            */
 /* ------------------------------------------------------------------ */
 
-export function createExchange(id: ExchangeId): CcxtExchange {
+export function createExchange(id: ExchangeId, opts: { ignoreProxy?: boolean } = {}): CcxtExchange {
+  const proxy = opts.ignoreProxy ? null : resolveProxyUrl()
   const common = {
     enableRateLimit: true,
     timeout: DEFAULT_TIMEOUT,
     options: { defaultType: 'swap' },
-  } as const
+    ...(proxy ? { httpsProxy: proxy } : {}),
+  }
 
   switch (id) {
     case 'binanceusdm':
@@ -141,7 +213,25 @@ async function getInstance(id: ExchangeId): Promise<CcxtExchange> {
   let p = instances.get(id)
   if (!p) {
     p = (async () => {
-      const ex = createExchange(id)
+      const proxy = resolveProxyUrl()
+
+      if (proxy) {
+        try {
+          const ex = createExchange(id)
+          await loadProxyModules(ex)
+          await ex.loadMarkets()
+          return ex
+        } catch (err) {
+          // 代理不可用（进程没启动、端口写错等）时回退直连，
+          // 避免本可直连的交易所（如 gate）被代理一起拖死。
+          console.warn(
+            `[proxy] 经 ${proxy} 连接 ${id} 失败，回退直连：` +
+              (err instanceof Error ? err.message : String(err)),
+          )
+        }
+      }
+
+      const ex = createExchange(id, { ignoreProxy: true })
       await ex.loadMarkets()
       return ex
     })()

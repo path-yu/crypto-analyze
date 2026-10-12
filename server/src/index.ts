@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 import express from 'express'
 import cors from 'cors'
 import { apiRouter } from './routes/api'
+import { resolveProxyUrl } from './market/exchange'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = Number(process.env.PORT ?? 8787)
@@ -53,6 +54,13 @@ if (fs.existsSync(webDist)) {
 }
 
 app.listen(PORT, () => {
+  const proxy = resolveProxyUrl()
   console.log(`\n  ● 回测服务已启动: http://127.0.0.1:${PORT}`)
-  console.log(`  ● 健康检查:      http://127.0.0.1:${PORT}/api/health\n`)
+  console.log(`  ● 健康检查:      http://127.0.0.1:${PORT}/api/health`)
+  console.log(
+    proxy
+      ? `  ● 行情代理:      ${proxy}（ccxt 走代理；Binance 归档直连）`
+      : '  ● 行情代理:      未检测到（直连，可用 HTTPS_PROXY 指定）',
+  )
+  console.log('')
 })

@@ -23,7 +23,8 @@
     "diag:pyramiding": "tsx scripts/check-pyramiding.ts",
     "compare:tv": "tsx scripts/compare-tradingview.ts",
     "check:ui": "node scripts/ui-check.mjs",
-    "clean:cache": "node scripts/clean-cache.mjs"
+    "clean:cache": "node scripts/clean-cache.mjs",
+    "test:ccxt": "tsx scripts/test-ccxt-example.ts"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",
@@ -33,6 +34,8 @@
     "ccxt": "^4.5.85",
     "cors": "^2.8.5",
     "express": "^5.3.0",
+    "http-proxy-agent": "^9.1.0",
+    "https-proxy-agent": "^9.1.0",
     "klinecharts": "^10.0.3",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
