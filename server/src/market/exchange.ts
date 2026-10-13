@@ -49,12 +49,17 @@ const MAX_PAGES = 400
  *
  * 交易所普遍限制「只能取最近 N 根」：
  *   - Gate 期货：超过 10000 根直接报 `Candlestick too long ago`
- *   - Binance 期货：单次窗口约 1500 根，但历史回溯很长，这里给一个保守值
+ *   - Binance 期货：单次窗口约 1500 根，但历史回溯很长（BTCUSDT 永续自 2019-09）
  * 当用户选择的区间超过该上限时，自动收缩到允许范围内并给出提示，
  * 而不是直接把错误抛给用户。
+ *
+ * Binance 期货原先给的是 20,000 根这一保守值，结果是「起始日期填 2019」
+ * 会被静默收缩到最近 2 万根（1h ≈ 2.3 年、2h ≈ 4.6 年），看起来像「起始日期不生效」。
+ * 这里放宽到 10 万根（1h ≈ 11 年），分页上限 MAX_PAGES × 1500 足够覆盖；
+ * 服务端 MAX_BARS = 20 万根仍然是最终兜底。
  */
 const MAX_LOOKBACK_BARS: Record<ExchangeId, number> = {
-  binanceusdm: 20_000,
+  binanceusdm: 100_000,
   okx: 20_000,
   bybit: 20_000,
   bitget: 20_000,

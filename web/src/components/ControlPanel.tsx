@@ -22,6 +22,7 @@ import TextField from '@mui/material/TextField'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import ChevronLeftIcon from '@mui/icons-material/ChevronLeft'
+import ClearIcon from '@mui/icons-material/Clear'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import PlayArrowIcon from '@mui/icons-material/PlayArrow'
 import RestartAltIcon from '@mui/icons-material/RestartAlt'
@@ -76,6 +77,21 @@ export function rangeToSince(key: RangeKey, custom?: string): number {
   return Date.now() - ms
 }
 
+/**
+ * 结束日期 → 时间戳（当天 23:59:59.999）。
+ *
+ * 留空 / 非法输入返回 undefined，调用方按「今天（当前时刻）」处理。
+ * 与起始日期一样按本地时区解析（界面标注 UTC+8）。
+ */
+export function rangeToUntil(custom?: string): number | undefined {
+  const text = (custom ?? '').trim()
+  if (!text) return undefined
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(text)
+  if (!m) return undefined
+  const t = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 23, 59, 59, 999).getTime()
+  return Number.isFinite(t) ? t : undefined
+}
+
 interface Props {
   exchange: ExchangeId
   onExchangeChange: (v: ExchangeId) => void
@@ -87,6 +103,9 @@ interface Props {
   onRangeChange: (v: RangeKey) => void
   customSince: string
   onCustomSinceChange: (v: string) => void
+  /** 自定义结束日期（YYYY-MM-DD）；留空 = 回测到今天 */
+  customUntil: string
+  onCustomUntilChange: (v: string) => void
   params: StrategyParams
   onParamsChange: (v: StrategyParams) => void
   onRun: () => void
@@ -160,6 +179,8 @@ export default function ControlPanel({
   onRangeChange,
   customSince,
   onCustomSinceChange,
+  customUntil,
+  onCustomUntilChange,
   params,
   onParamsChange,
   onRun,
@@ -444,8 +465,36 @@ export default function ControlPanel({
             />
           )}
 
+          <TextField
+            sx={{ mt: 1.5, maxWidth: 260, display: 'block' }}
+            size="small"
+            type="date"
+            label="结束日期（留空 = 今天）"
+            value={customUntil}
+            onChange={(e) => onCustomUntilChange(e.target.value)}
+            slotProps={{
+              inputLabel: { shrink: true },
+              input: customUntil
+                ? {
+                    endAdornment: (
+                      <InputAdornment position="end">
+                        <Tooltip title="清空则回测到当前时刻（今天）">
+                          <IconButton size="small" onClick={() => onCustomUntilChange('')}>
+                            <ClearIcon fontSize="small" />
+                          </IconButton>
+                        </Tooltip>
+                      </InputAdornment>
+                    ),
+                  }
+                : undefined,
+            }}
+            helperText="按该日 23:59（UTC+8）收盘；留空即回测到今天"
+          />
+
           <Stack direction="row" spacing={1} sx={{ mt: 1.5 }} alignItems="center" flexWrap="wrap" useFlexGap>
-            <Chip size="small" label={`预计约 ${estimatedBars.toLocaleString()} 根 K 线`} />
+            <Tooltip title="按「起始 → 结束」区间估算。若起始早于该合约上市时间，实际会从上市日起算，根数会少于这里">
+              <Chip size="small" label={`预计约 ${estimatedBars.toLocaleString()} 根 K 线`} />
+            </Tooltip>
             {estimatedBars > 40000 && (
               <Chip size="small" color="warning" label="数据量较大，拉取与计算会偏慢" />
             )}

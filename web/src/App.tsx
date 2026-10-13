@@ -36,7 +36,7 @@ import {
   runPineBacktest,
   savePineScript,
 } from './api'
-import ControlPanel, { rangeToSince, type RangeKey } from './components/ControlPanel'
+import ControlPanel, { rangeToSince, rangeToUntil, type RangeKey } from './components/ControlPanel'
 import PineEditor, { type PinePanelState } from './components/PineEditor'
 import KLinePanel from './components/KLinePanel'
 import KpiCards from './components/KpiCards'
@@ -80,6 +80,8 @@ export default function App() {
     const d = new Date(Date.now() - 365 * 86400_000)
     return d.toISOString().slice(0, 10)
   })
+  /** 自定义结束日期（YYYY-MM-DD）；空串 = 回测到今天 */
+  const [customUntil, setCustomUntil] = useState('')
   const [params, setParams] = useState<StrategyParams>({ ...DEFAULT_STRATEGY_PARAMS })
   /** Pine 策略源码（strategy === 'pine' 时随回测请求一起提交） */
   const [pineSource, setPineSource] = useState('')
@@ -140,21 +142,28 @@ export default function App() {
 
   const estimatedBars = useMemo(() => {
     const since = rangeToSince(range, customSince)
-    const span = Math.max(0, Date.now() - since)
+    // 结束日期留空即「今天（当前时刻）」
+    const until = rangeToUntil(customUntil) ?? Date.now()
+    const span = Math.max(0, until - since)
     return Math.floor(span / TIMEFRAME_MS[timeframe])
-  }, [range, customSince, timeframe])
+  }, [range, customSince, customUntil, timeframe])
 
   const handleRun = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
       const since = rangeToSince(range, customSince)
+      const until = rangeToUntil(customUntil)
+      if (until !== undefined && until <= since) {
+        throw new Error('结束日期必须晚于起始日期')
+      }
       const base = {
         exchange,
         symbol,
         timeframe,
         since,
-        until: Date.now(),
+        // 未设置结束日期时回测到当前时刻
+        until: until ?? Date.now(),
         params,
         tickSize,
       }
@@ -170,7 +179,7 @@ export default function App() {
     } finally {
       setLoading(false)
     }
-  }, [exchange, symbol, timeframe, range, customSince, params, pineSource, tickSize])
+  }, [exchange, symbol, timeframe, range, customSince, customUntil, params, pineSource, tickSize])
 
   /* ---------------- Pine 脚本：保存 / 载入 ---------------- */
 
@@ -407,6 +416,8 @@ export default function App() {
                 onRangeChange={setRange}
                 customSince={customSince}
                 onCustomSinceChange={setCustomSince}
+                customUntil={customUntil}
+                onCustomUntilChange={setCustomUntil}
                 params={params}
                 onParamsChange={setParams}
                 onRun={handleRun}
@@ -487,6 +498,19 @@ export default function App() {
                   <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
                     {error}
                   </Typography>
+                </Alert>
+              )}
+
+              {/* 数据源降级 / 区间被自动收缩等提示：以前只在「回测报告」页可见 */}
+              {(report?.warnings.length ?? 0) > 0 && (
+                <Alert severity="warning">
+                  <Stack spacing={0.5}>
+                    {report!.warnings.map((w) => (
+                      <Typography key={w} variant="body2">
+                        {w}
+                      </Typography>
+                    ))}
+                  </Stack>
                 </Alert>
               )}
 

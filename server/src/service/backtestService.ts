@@ -345,6 +345,20 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
   if (clampNote) {
     warnings.push(clampNote)
   }
+  // 请求的起始时间早于数据源实际能给出的最早一根 K 线时明确说明。
+  // 典型情况是「起始日期早于该合约上市时间」（如 ETH/USDT:USDT 自 2019-11-27 起才有行情），
+  // 不提示的话，看到区间从 2019-11 开始会误以为起始日期没生效。
+  const firstTs = allCandles[0]?.timestamp
+  if (Number.isFinite(firstTs) && (firstTs as number) - since > 3 * tfMs) {
+    const cst = new Date((firstTs as number) + 8 * 3600_000)
+      .toISOString()
+      .slice(0, 16)
+      .replace('T', ' ')
+    warnings.push(
+      `${symbol} 在 ${cst}（UTC+8）之前没有行情（一般早于该合约上市时间），` +
+        `回测区间已按实际可用起点执行。`,
+    )
+  }
   if (equity.length < candles.length) {
     warnings.push('资金曲线长度与 K 线长度不一致，请检查数据完整性。')
   }
