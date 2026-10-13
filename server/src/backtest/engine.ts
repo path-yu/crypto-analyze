@@ -406,8 +406,16 @@ class BacktestEngine {
 
     const closeQty = sub.initialQty * f
     const sign = sub.side === 'long' ? 1 : -1
-    const gross = (price - sub.entryPrice) * closeQty * sign
+    let gross = (price - sub.entryPrice) * closeQty * sign
     const fee = price * closeQty * this.feeRate
+
+    // 逐仓亏损上限：一笔仓位最多亏掉它为这笔仓位占用的保证金（现实中此时已被强平）。
+    // 没有这道闸时，高杠杆 + 跳空会出现「权益为负」的结果（例如 5x 下单笔 -25% 亏损），
+    // 那既不符合交易所行为，也会让收益率出现 -200%、回撤 -470% 这种不可能的数字。
+    // 上限按「含手续费的总亏损」计算，保证账户余额不会被亏成负数。
+    const maxLoss = sub.margin * f
+    const entryFeePart = sub.entryFee * f
+    if (gross - fee - entryFeePart < -maxLoss) gross = -maxLoss + fee + entryFeePart
 
     this.cash += gross - fee
     sub.grossPnl += gross
@@ -700,7 +708,10 @@ class BacktestEngine {
       for (const s of this.position.subs) {
         if (!this.isAlive(s)) continue
         const sign = s.side === 'long' ? 1 : -1
-        unrealized += (bar.close - s.entryPrice) * s.initialQty * s.remaining * sign
+        const pnl = (bar.close - s.entryPrice) * s.initialQty * s.remaining * sign
+        // 逐仓口径：浮亏不会超过该仓位占用的保证金（现实中此时已被强平），
+        // 否则高杠杆下的浮亏会把权益打成深度负数，回撤出现 -400% 这种不可能的数字
+        unrealized += Math.max(pnl, -s.margin * s.remaining)
       }
     }
     const equity = this.cash + unrealized

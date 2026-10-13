@@ -691,16 +691,25 @@ class Parser {
         e = this.parseCallArgs(e)
         continue
       }
-      // 泛型调用 `array.new<OB>()` / `array.new<chart.point>()`
+      // 泛型调用 `array.new<OB>()` / `map.new<string, float>()` / `array.new<chart.point>()`
       if (isOp(t, '<') && this.isGenericCall()) {
         this.next() // '<'
-        let arg = this.expectIdent().text
-        while (isOp(this.peek(), '.') && this.peek(1)?.kind === 'ident') {
-          this.next()
-          arg += `.${this.expectIdent().text}`
+        const args: string[] = []
+        for (;;) {
+          let arg = this.expectIdent().text
+          while (isOp(this.peek(), '.') && this.peek(1)?.kind === 'ident') {
+            this.next()
+            arg += `.${this.expectIdent().text}`
+          }
+          args.push(arg)
+          if (isOp(this.peek(), ',')) {
+            this.next()
+            continue
+          }
+          break
         }
         this.next() // '>'
-        e = this.parseCallArgs(e, arg)
+        e = this.parseCallArgs(e, args.join(', '))
         continue
       }
       break
@@ -708,12 +717,21 @@ class Parser {
     return e
   }
 
-  /** 形如 `<Ident>(` 的泛型调用前缀 */
+  /** 形如 `<Ident(, Ident)*>(` 的泛型调用前缀（`map.new<string, float>()`） */
   private isGenericCall(): boolean {
     if (!isOp(this.peek(), '<') || this.peek(1)?.kind !== 'ident') return false
-    // 泛型实参可以是点分路径（如 chart.point）
-    let k = this.pos + 2
-    while (isOp(this.tokens[k], '.') && this.tokens[k + 1]?.kind === 'ident') k += 2
+    let k = this.pos + 1
+    for (;;) {
+      // 一个类型实参：标识符 + 可选的 `.` 点分后缀（如 chart.point）
+      if (this.tokens[k]?.kind !== 'ident') return false
+      k++
+      while (isOp(this.tokens[k], '.') && this.tokens[k + 1]?.kind === 'ident') k += 2
+      if (isOp(this.tokens[k], ',')) {
+        k++
+        continue
+      }
+      break
+    }
     return isOp(this.tokens[k], '>') && isOp(this.tokens[k + 1], '(')
   }
 

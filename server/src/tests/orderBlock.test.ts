@@ -423,6 +423,35 @@ describe('回测引擎 · Pine 脚本离场语义', () => {
     assert.equal(trades[0].exitReason, 'EndOfData', 'Pine 脚本不应被引擎加时间止损')
   })
 
+  it('逐仓亏损上限：跳空亏损超过保证金时，账户不会被亏成负数', () => {
+    const candles = bars([
+      flat(),
+      flat(),
+      flat(),
+      flat(),
+      flat(),
+      [100, 100.2, 99.8, 100], // 信号
+      [100, 100.5, 99.5, 100], // 入场 100：名义 = 1000 × 5 = 5000，数量 50，保证金 1000
+      [70, 71, 69, 70], // 跳空到 70 市价平仓：亏损 -1500 > 保证金 1000
+    ])
+    const signals = candles.map<StrategySignalCore>(() => emptyOrderBlockSignal())
+    signals[5] = { ...emptyOrderBlockSignal(), canLong: true }
+    signals[6] = { ...emptyOrderBlockSignal(), forceClose: true } // 收盘判定 → 下一根开盘市价平仓
+
+    const { trades } = runBacktest({
+      candles,
+      series: { signals },
+      params: { ...PINE_PARAMS, leverage: 5, positionSizePercent: 100, orderBlock: { ...PINE_PARAMS.orderBlock, maxBars: 0 } },
+    })
+
+    assert.equal(trades.length, 1)
+    const t = trades[0]
+    near(t.entryPrice, 100, 1e-9)
+    near(t.exitPrice, 70, 1e-9)
+    near(t.balanceAfter, 0, 1e-6)
+    assert.ok(t.balanceAfter >= 0, '账户余额不应为负')
+  })
+
   it('保本移动不作用于 Pine 脚本（脚本自己用 strategy.exit 更新止损才算数）', () => {
     const candles = bars([
       flat(),
