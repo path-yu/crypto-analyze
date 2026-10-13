@@ -235,6 +235,7 @@ const TA_SERIES_FNS = new Set([
   'sma', 'ema', 'rma', 'wma', 'hma', 'alma', 'atr', 'tr', 'highest', 'lowest',
   'pivothigh', 'pivotlow', 'change', 'mom', 'roc', 'stdev', 'variance', 'dev', 'rsi',
   'rising', 'falling', 'stoch', 'linreg', 'barssince', 'valuewhen', 'sar',
+  'cum', 'percentrank',
 ])
 /** 源序列固定为内置 OHLC(V) 的 ta 函数（实参里不含序列） */
 const TA_OHLC_FNS = new Set(['dmi', 'mfi'])
@@ -261,7 +262,7 @@ const BARE_COLORS = new Set([
   'purple', 'lime', 'aqua', 'fuchsia', 'maroon', 'navy', 'olive', 'silver', 'teal',
 ])
 /** 运行时确实提供的 input 通道 */
-const RUNTIME_INPUT_TYPES = new Set(['int', 'float', 'bool', 'color', 'string', 'source', 'time'])
+const RUNTIME_INPUT_TYPES = new Set(['int', 'float', 'bool', 'color', 'string', 'source', 'time', 'symbol'])
 
 /** `dayofweek.monday` … `dayofweek.sunday`（枚举值 = 2..7 / 1） */
 const DAYOFWEEK_MEMBERS: Record<string, number> = {
@@ -346,6 +347,15 @@ class Codegen {
   private callHistSeq = 0
   /** `strategy.entry` 的 id → `strategy.exit` 的 stop/limit 表达式 */
   private readonly exitMap = new Map<string, { stop?: Expr; limit?: Expr }>()
+  /**
+   * `ta.cum(expr)` 调用点 → 增量累加器。
+   *
+   * cum 是整条序列语义，但它的实参通常是 `ta.ema(...)` 的**逐 bar 标量**结果，
+   * 无法在初始化期整条预计算 —— 改为每个调用点一个累加器：
+   * prologue 声明 `let __cum_<id> = 0`，step 内 `+= isNa(x) ? 0 : x`。
+   */
+  private readonly cumAccs = new Map<CallExpr, { id: number }>()
+  private cumSeq = 0
   /**
    * `strategy.entry(id, …, qty=…)` 的 id → 下单量表达式。
    *
@@ -462,6 +472,10 @@ class Codegen {
     for (const [, slot] of this.callHist) {
       lines.push(`  let __cv_${slot.id} = NaN`)
       lines.push(`  const __hc_${slot.id} = __pine.makeRing(${slot.k + 1})`)
+    }
+    // ta.cum 增量累加器
+    for (const [, acc] of this.cumAccs) {
+      lines.push(`  let __cum_${acc.id} = 0`)
     }
     // v4 裸 `tr`：按内置 OHLC 预计算整条真实波幅序列
     if (this.wantsTr) {
@@ -593,7 +607,19 @@ class Codegen {
     }
     // 行内序列缓冲：`f(...)[k]` 这类「调用结果被 [k] 引用」的情形
     this.collectInlineSeries(this.program.body)
+    // ta.cum 调用点：分配增量累加器（见 cumCall）
+    this.collectCumCalls(this.program.body)
     this.collectExits(this.program.body)
+  }
+
+  /** 收集 `ta.cum(expr)` 调用点，为每个调用点分配一个增量累加器 */
+  private collectCumCalls(stmts: Stmt[]): void {
+    this.walkExprs(stmts, (e) => {
+      if (e.kind !== 'call') return
+      const path = this.calleePath(e.callee)
+      const fn = path ? (path.length === 2 && path[0] === 'ta' ? path[1] : path.length === 1 ? path[0] : '') : ''
+      if (fn === 'cum' && !this.cumAccs.has(e)) this.cumAccs.set(e, { id: this.cumSeq++ })
+    })
   }
 
   /**
@@ -948,7 +974,16 @@ class Codegen {
             const m = this.normalizeArgs(s.expr, ['id', 'from_entry', 'qty', 'qty_percent', 'profit', 'limit', 'loss', 'stop', 'comment'])
             const fromEntry = m.get('from_entry')
             const id = fromEntry && fromEntry.kind === 'string' ? fromEntry.value : undefined
-            if (id) this.exitMap.set(id, { stop: m.get('stop'), limit: m.get('limit') })
+            if (id) {
+              // 同一 from_entry 可能有多条 strategy.exit（例如一条只挂 stop、一条只挂 limit），
+              // TradingView 中它们同时生效 —— 这里按字段合并而不是整体覆盖，
+              // 否则后一条会把前一条的止损/止盈抹掉。
+              const prev = this.exitMap.get(id)
+              this.exitMap.set(id, {
+                stop: m.get('stop') ?? prev?.stop,
+                limit: m.get('limit') ?? prev?.limit,
+              })
+            }
           } else if (path && path.join('.') === 'strategy.entry') {
             const m = this.normalizeArgs(s.expr, ['id', 'direction', 'qty', 'limit', 'stop', 'oca_name', 'oca_type', 'comment'])
             const idExpr = m.get('id')
@@ -1757,6 +1792,11 @@ class Codegen {
       // v4 遗留：hlcc4 = (high + low + close * 2) / 4
       case 'hlcc4':
         return '((C.high[__index] + C.low[__index] + C.close[__index] * 2) / 4)'
+      // `open_interest`：TradingView 的持仓量内置序列。本回测的数据层（ccxt K 线）
+      // 不提供 OI 历史，按 na 降级 —— 配合脚本里的 nz() 会得到 0/1.0 这类中性值。
+      case 'open_interest':
+        this.warn('open_interest（持仓量）在本回测中不可用，已按 na 处理，涉及 OI 的条件请自行关闭或调整', node)
+        return 'Number.NaN'
       default:
         break
     }
@@ -2161,6 +2201,18 @@ class Codegen {
   private taCall(e: CallExpr): string {
     const path = this.calleePath(e.callee)!
     const fn = path[1] ?? path[0]
+    // ta.cum：整条序列语义但实参常是逐 bar 标量，走增量累加器（见 cumAccs）
+    if (fn === 'cum') {
+      const acc = this.cumAccs.get(e)
+      if (!acc) return 'NaN'
+      if (this.initPhase) {
+        this.warn('ta.cum 出现在初始化期常量中，无法按增量累加，已按 na 处理', e)
+        return 'NaN'
+      }
+      const arg = this.positionalArgs(e)[0]
+      const val = arg ? this.expr(arg.value) : 'NaN'
+      return `(__cum_${acc.id} += __pine.isNa(${val}) ? 0 : ${val})`
+    }
     if (!this.initPhase) {
       const at = this.taAtCall(e, fn)
       if (at) return at

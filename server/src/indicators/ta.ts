@@ -12,6 +12,48 @@ export function isNa(v: number | null | undefined): boolean {
   return v === null || v === undefined || Number.isNaN(v)
 }
 
+/**
+ * ta.cum —— 自首根起的累积和。
+ *
+ * Pine 语义：从第一根 bar 开始累加。输入里的 na 视为「尚未开始」：
+ * 首个有效值之前的输出为 na，之后按「跳过 na 继续累加」处理（与 TradingView
+ * 对 EMA 平滑序列先 na 后有值的常见用法一致）。
+ */
+export function cum(src: readonly number[]): number[] {
+  const out = new Array<number>(src.length).fill(NA)
+  let acc = 0
+  let started = false
+  for (let i = 0; i < src.length; i++) {
+    const v = src[i]
+    if (Number.isFinite(v)) {
+      acc += v
+      started = true
+    }
+    if (started) out[i] = acc
+  }
+  return out
+}
+
+/**
+ * ta.percentrank —— 当前值在回看 length 根中的百分位（0~100）。
+ * 统计窗口内「小于等于当前值」的根数占比；窗口不足或当前值为 na 时为 na。
+ */
+export function percentrank(src: readonly number[], length: number): number[] {
+  const out = new Array<number>(src.length).fill(NA)
+  if (length <= 0) return out
+  for (let i = length; i < src.length; i++) {
+    const cur = src[i]
+    if (!Number.isFinite(cur)) continue
+    let count = 0
+    for (let j = i - length; j < i; j++) {
+      const v = src[j]
+      if (Number.isFinite(v) && v <= cur) count++
+    }
+    out[i] = (count / length) * 100
+  }
+  return out
+}
+
 /* ------------------------------------------------------------------ */
 /* 简单均线族                                                           */
 /* ------------------------------------------------------------------ */

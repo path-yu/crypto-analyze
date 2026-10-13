@@ -599,6 +599,11 @@ export function createRuntime(
       const v = pick(name, def)
       return typeof v === 'string' ? v : def
     },
+    // input.symbol：回测只透传脚本内配置的 symbol 字符串，不参与多品种取数
+    symbol: (name, def) => {
+      const v = pick(name, def)
+      return typeof v === 'string' && v ? v : typeof def === 'string' ? def : ''
+    },
     source: (name, def) => pick(name, def),
     time: (name, def) => pick(name, def),
   }

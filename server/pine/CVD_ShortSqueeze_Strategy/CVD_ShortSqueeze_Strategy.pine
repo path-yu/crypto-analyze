@@ -1,0 +1,197 @@
+//@version=6
+// ===========================================================================
+//  CVD Short Squeeze Engine —— 逼空探测器（基于 $AUCTION 实战案例建模）
+//  核心逻辑：现货CVD(发动机) 强买 + 合约CVD(燃料) 背离走弱 + 资金费率深度负值
+//           + 持仓量暴增 = 空头拥挤 → 触发逼空
+//
+//  数据源方案：多 symbol 取数（现货 + 合约）
+//  TradingView 标准版无法直接调用 Coinglass，故用 request.security 分别拉
+//  现货 symbol 与永续合约 symbol，各自用"价格方向 + 量"近似拆解 Taker Buy/Sell，
+//  再合成 CVD。参数区已留出 symbol 与权重调节。
+//
+//  ⚠️ 说明：TV 原生 K 线不含 taker buy/sell 明细，此处用
+//     (close-open)/(high-low) 作为"主动方向占比"的代理变量估算 Delta。
+//     如需与 Coinglass 完全对齐，见配套说明文档"数据源校准"一节。
+// ===========================================================================
+
+strategy("CVD Short Squeeze Engine (Spot+Futures Divergence)", overlay=true,
+     commission_type=strategy.commission.percent, commission_value=0.05,
+     slippage=2, initial_capital=10000, default_qty_type=strategy.percent_of_equity,
+     default_qty_value=20, pyramiding=0, calc_on_every_tick=false)
+
+// ------------------------- ① 输入参数 -------------------------
+grpS = "★ 数据源 / Symbols"
+spotSym  = input.symbol("BINANCE:AUCTIONUSDT",  "现货 Symbol (Spot)",  group=grpS)
+futSym   = input.symbol("BINANCE:AUCTIONUSDT.P","永续合约 Symbol (Futures)", group=grpS)
+
+grpD = "① CVD 参数"
+cvdLen   = input.int(200, "CVD 累积平滑长度", minval=10, group=grpD,
+     tooltip="对 Delta 做 EMA 平滑后再累积，抑制单根噪音")
+useDiv   = input.bool(true, "启用 量-价-方向 加权估算 Delta", group=grpD,
+     tooltip="开启后用 |close-open| 占总振幅比例加权成交量，近似主动方向强度")
+
+grpF = "② 资金费率 Funding"
+useFunding   = input.bool(true, "启用资金费率过滤", group=grpF)
+fundNegTh    = input.float(-0.05, "负费率阈值 (%)", step=0.01, group=grpF,
+     tooltip="资金费率低于该值视为『空头拥挤』。案例中极端时低于 -0.4%")
+fundExtreme  = input.float(-0.20, "极端负费率阈值 (%)", step=0.01, group=grpF)
+
+grpO = "③ 持仓量 OI"
+useOI     = input.bool(true, "启用 持仓量 过滤", group=grpO)
+oiSym     = input.symbol("BINANCE:AUCTIONUSDT.P", "OI 来源(永续)", group=grpO)
+oiLen     = input.int(50, "OI 基准均线长度", minval=5, group=grpO)
+oiSurge   = input.float(1.30, "OI 暴增倍数阈值", step=0.05, group=grpO,
+     tooltip="当前OI / OI均线 > 该值 → 判定为『新空头进场(燃料)』。案例中OI翻倍=2.0")
+oiCool    = input.float(0.85, "OI 退潮阈值(离场)", step=0.05, group=grpO,
+     tooltip="OI 跌破均线该倍数 → 空头开始平仓/爆仓，逼空进入尾声")
+
+grpP = "④ 价格 & 触发"
+lookback  = input.int(24, "『极端下跌』回溯窗口(根)", minval=5, group=grpP)
+dropTh    = input.float(-3.0, "前期跌幅阈值 (%)", step=0.5, group=grpP,
+     tooltip="窗口内跌幅小于该值 → 判定为『已被砸深』，具备逼空土壤")
+brkLen    = input.int(20, "价格突破均线长度", minval=5, group=grpP)
+spotCvdTh = input.float(0.0, "现货CVD 需 > 0", group=grpP)
+
+grpR = "⑤ 风控 / 离场"
+useSL     = input.bool(true, "启用止损", group=grpR)
+slPct     = input.float(6.0, "止损 (%)", step=0.5, group=grpR)
+useTP     = input.bool(true, "启用止盈", group=grpR)
+tpPct     = input.float(45.0, "止盈 (%)", step=1.0, group=grpR)
+useTrail  = input.bool(true, "启用 CVD 背离离场 (动态止盈)", group=grpR,
+     tooltip="价格创新高 但 现货CVD 未创新高 → 买盘衰竭，离场")
+maxBars   = input.int(200, "最长持仓(根) 0=不限", minval=0, group=grpR)
+
+grpV = "⑥ 可视化"
+showCvd  = input.bool(true, "显示 CVD 与信号", group=grpV)
+showBg   = input.bool(true, "显示状态背景", group=grpV)
+showLbl  = input.bool(true, "显示调试标签", group=grpV)
+
+// ------------------------- ② 取数工具函数 -------------------------
+// 近似 Taker Delta：用 K 线内部方向占比 × 成交量
+takerDelta() =>
+    rng = high - low
+    // (close-open)/range ∈ [-1,1]，映射到主动买卖占比
+    dir = rng > 0 ? (close - open) / rng : 0.0
+    // 加权：实体越大，方向越可信
+    w   = useDiv ? math.abs(dir) : 1.0
+    volume * dir * w
+
+// 取现货数据：close / volume / delta 累计
+[spC, spV, spD] = request.security(spotSym, timeframe.period,
+     [close, volume, takerDelta()], lookahead=barmerge.lookahead_off)
+
+// 取合约数据
+[ftC, ftV, ftD] = request.security(futSym, timeframe.period,
+     [close, volume, takerDelta()], lookahead=barmerge.lookahead_off)
+
+// --- 资金费率 ---
+// TradingView 无内置 funding rate 历史序列。可用的替代方案：
+//   A) 手动输入当前费率（最稳，配合下方 manualFunding 开关）
+//   B) 用 request.security 拉永续的 "settlement" 类数据源（需 TV 高级版）
+// 此处采用 A 方案，默认自动放行，避免因数据缺失导致永不过滤。
+manualFunding = input.float(0.0, "手动输入当前资金费率 (%)", step=0.01, group=grpF,
+     tooltip="填 0 表示不启用该过滤器。案例中填 -0.4 即可复现『极度负费率』条件")
+fRate = useFunding ? manualFunding : 0.0
+
+// 持仓量 OI（open_interest 为内置序列）
+oiRaw = request.security(oiSym, timeframe.period, open_interest,
+     lookahead=barmerge.lookahead_off)
+
+// ------------------------- ③ 计算核心指标 -------------------------
+// CVD：对 Delta 先 EMA 平滑再累积
+spEma  = ta.ema(spD, cvdLen)
+ftEma  = ta.ema(ftD, cvdLen)
+spotCVD   = ta.cum(spEma)
+futCVD    = ta.cum(ftEma)
+// 归一化为 0-100 便于同图比较
+spCvdNorm = ta.percentrank(spotCVD, 300)
+ftCvdNorm = ta.percentrank(futCVD, 300)
+
+// OI 均线
+oiMa = ta.sma(nz(oiRaw), oiLen)
+oiRatio = oiMa > 0 ? nz(oiRaw) / oiMa : 1.0
+
+// 价格
+px       = close
+pxMa     = ta.sma(px, brkLen)
+isBreak  = px > pxMa
+pctChg   = (px - px[lookback]) / px[lookback] * 100
+deepDrop = pctChg <= dropTh
+
+// 现货CVD 是否在涨 & 合约CVD 是否走弱（背离核心）
+spRising   = spotCVD > spotCVD[1] and spotCVD > spotCVD[lookback]
+ftWeak     = futCVD <= futCVD[lookback]
+divergence = spRising and ftWeak
+
+// 资金费率判定（数据缺失时视为通过）
+fundOK      = not useFunding or fRate == 0.0 or fRate <= fundNegTh
+fundExtOK   = not useFunding or fRate == 0.0 or fRate <= fundExtreme
+
+// OI 判定
+oiOK    = not useOI or oiRatio >= oiSurge
+oiCool_ = not useOI or oiRatio <= oiCool
+
+// ------------------------- ④ 信号合成 -------------------------
+// 建仓条件：深跌 + 突破 + 现货CVD强 + 合约CVD背离 + 负费率 + OI暴增
+longCond = deepDrop and isBreak and spotCVD > spotCvdTh and divergence and fundOK and oiOK
+
+// 离场条件：OI退潮(空头投降) 或 CVD背离(买盘衰竭) 或 超时
+cvdBear  = px > px[1] and spotCVD < spotCVD[1] and spotCVD < spotCVD[5]
+exitCond = (useOI ? oiCool_ : false) or (useTrail ? cvdBear : false)
+timeExit = maxBars > 0 and strategy.opentrades > 0 and
+     (bar_index - strategy.opentrades.entry_bar_index(0)) >= maxBars
+
+// 交易执行
+if longCond and strategy.position_size == 0
+    strategy.entry("SqueezeLong", strategy.long)
+
+if strategy.position_size > 0
+    entryPx = strategy.position_avg_price
+    // 止损 / 止盈（单一出场单，避免多单互抢）
+    if useSL
+        strategy.exit("SL", "SqueezeLong", stop = entryPx * (1 - slPct / 100))
+    if useTP
+        strategy.exit("TP", "SqueezeLong", limit = entryPx * (1 + tpPct / 100))
+    // 逻辑离场：OI退潮(空头投降) 或 CVD背离(买盘衰竭) 或 超时
+    if exitCond or timeExit
+        strategy.close("SqueezeLong", comment = timeExit ? "超时" : "OI冷却/背离")
+
+// ------------------------- ⑤ 可视化 -------------------------
+bgcolor(showBg ? (divergence and deepDrop ? color.new(color.orange, 88) :
+     (strategy.position_size > 0 ? color.new(color.green, 92) : na)) : na, title="状态背景")
+
+plot(pxMa, "突破均线", color=color.new(color.gray, 40))
+plotshape(showCvd and longCond, "逼空触发", shape.labelup,
+     location=location.belowbar, color=color.new(color.red, 0), textcolor=color.white,
+     text="SQUEEZE", size=size.small)
+plotshape(showCvd and exitCond, "离场", shape.labeldown,
+     location=location.abovebar, color=color.new(color.green, 0), textcolor=color.white,
+     text="EXIT", size=size.small)
+
+// 调试标签：把 5 个维度印出来（案例中对应 5 个观察点）
+if showLbl and barstate.islast
+    label.new(bar_index, low, text =
+         "现货CVD:" + str.tostring(spotCVD, "#.##") + " (分位 " + str.tostring(spCvdNorm, "#.#") + "%)" +
+         "\n合约CVD:" + str.tostring(futCVD, "#.##") + " (分位 " + str.tostring(ftCvdNorm, "#.#") + "%)" +
+         "\nOI比率:" + str.tostring(oiRatio, "#.##") +
+         "\n费率:" + str.tostring(fRate, "#.###") +
+         "\n区间涨跌:" + str.tostring(pctChg, "#.##") + "%",
+         style=label.style_label_right, color=color.new(color.blue, 20),
+         textcolor=color.white, size=size.small)
+
+// 顶部状态栏
+var table stat = table.new(position.top_right, 2, 6, border_width=1)
+if barstate.islast and showCvd
+    table.cell(stat, 0, 0, "维度", bgcolor=color.gray, text_color=color.white)
+    table.cell(stat, 1, 0, "状态", bgcolor=color.gray, text_color=color.white)
+    table.cell(stat, 0, 1, "现货CVD(发动机)", text_color=color.white)
+    table.cell(stat, 1, 1, spRising ? "▲强买" : "▼弱", text_color=spRising ? color.lime : color.red)
+    table.cell(stat, 0, 2, "合约CVD(燃料)", text_color=color.white)
+    table.cell(stat, 1, 2, ftWeak ? "▼背离(空头在开)" : "▲追多", text_color=ftWeak ? color.orange : color.lime)
+    table.cell(stat, 0, 3, "资金费率", text_color=color.white)
+    table.cell(stat, 1, 3, fundExtOK ? "★极度负" : (fundOK ? "负" : "中性"), text_color=fundExtOK ? color.red : color.white)
+    table.cell(stat, 0, 4, "持仓量OI", text_color=color.white)
+    table.cell(stat, 1, 4, oiOK ? "▲暴增" : (oiCool_ ? "▼退潮" : "—平稳"), text_color=oiOK ? color.lime : (oiCool_ ? color.red : color.white))
+    table.cell(stat, 0, 5, "综合", text_color=color.white)
+    table.cell(stat, 1, 5, longCond ? "🚀 逼空" : (divergence ? "酝酿中" : "观望"),
+         text_color=longCond ? color.red : (divergence ? color.orange : color.gray))

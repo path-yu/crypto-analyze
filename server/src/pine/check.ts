@@ -31,6 +31,8 @@ const BUILTIN_IDENTS = new Set([
   'time_close',
   'time_tradingday',
   'hlcc4',
+  // TradingView 期货内置序列：本回测无 OI 历史，代码生成阶段按 na 降级并给出警告
+  'open_interest',
   'na',
   'true',
   'false',
