@@ -16,6 +16,7 @@ import {
   percentileNearestRank,
   rma,
   sma,
+  supertrend,
   trueRange,
   wma,
 } from '../indicators/ta'
@@ -25,6 +26,38 @@ import { computeReport } from '../backtest/metrics'
 
 const near = (a: number, b: number, eps = 1e-9) =>
   assert.ok(Math.abs(a - b) < eps, `期望 ${b}，实际 ${a}`)
+
+describe('ta.supertrend', () => {
+  it('预热期为 na，之后方向不卡在单边（回归：NaN 污染棘轮导致 direction 恒为 -1）', () => {
+    // 12 根一循环的锯齿序列：既有上涨段也有下跌段，必须出现双向趋势
+    const seq = [0, 1, 2, 4, 3, 2, 1, -1, -2, -3, -4, -2]
+    const n = seq.length * 8
+    const close = Array.from({ length: n }, (_, i) => 100 + seq[i % seq.length])
+    const high = close.map((v) => v + 0.5)
+    const low = close.map((v) => v - 0.5)
+    const [st, dir] = supertrend(high, low, close, 3, 10)
+
+    // ATR(10) 预热期：前 9 根 supertrend / direction 都是 na（与 TradingView 一致）
+    for (let i = 0; i < 9; i++) {
+      assert.ok(Number.isNaN(st[i]), `st[${i}] 应为 na`)
+      assert.ok(Number.isNaN(dir[i]), `dir[${i}] 应为 na`)
+    }
+    // 之后 supertrend 必须成形
+    const valid = st.slice(9).filter(Number.isFinite)
+    assert.equal(valid.length, n - 9, '预热期之后 supertrend 不应再出现 na')
+    // 方向必须同时出现 -1 与 1（旧的 NaN 污染 bug 会让它恒为 -1）
+    const dirs = [...new Set(dir.slice(9).filter(Number.isFinite))].sort()
+    assert.deepEqual(dirs, [-1, 1], '方向应同时出现 -1 与 1，不能卡在单边')
+    // 一致性：上升趋势(-1)时线在收盘价下方，下降趋势(1)时在上方
+    for (let i = 9; i < n; i++) {
+      if (dir[i] === -1) {
+        assert.ok((st[i] as number) <= close[i] + 1e-9, `bar${i} 上升趋势的支撑线应在收盘价下方`)
+      } else {
+        assert.ok((st[i] as number) >= close[i] - 1e-9, `bar${i} 下降趋势的阻力线应在收盘价上方`)
+      }
+    }
+  })
+})
 
 describe('ta 均线族', () => {
   it('sma 前 length-1 位为 na', () => {

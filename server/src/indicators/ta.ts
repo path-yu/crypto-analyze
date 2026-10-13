@@ -710,16 +710,22 @@ export function supertrend(
   for (let i = 0; i < n; i++) {
     const mid = (high[i] + low[i]) / 2
     const a = atrArr[i]
+    // 预热期（ATR 尚未成形）与 TradingView 一致：supertrend / direction 都是 na。
+    // 这里必须显式跳过 —— 若让 NaN 参与后面的比较，`NaN > x` 恒为 false 会把带值
+    // 棘轮永久钉在 NaN 上（st 全程 na、direction 卡死在 1/‑1），入场条件再也无法成立。
+    if (isNa(a) || isNa(mid)) continue
+
     let upper = mid + factor * a
     let lower = mid - factor * a
-    if (i > 0) {
-      if (!(lower > lowerPrev || close[i - 1] < lowerPrev)) lower = lowerPrev
-      if (!(upper < upperPrev || close[i - 1] > upperPrev)) upper = upperPrev
-    }
-    let d: number
-    if (i === 0 || isNa(atrArr[i - 1])) d = 1
-    else if (stPrev === upperPrev) d = close[i] > upper ? -1 : 1
-    else d = close[i] < lower ? 1 : -1
+    // 带值棘轮（TradingView 官方口径）：
+    //   上一根处于「上轨状态」时上轨只向下收紧，处于「下轨状态」时下轨只向上抬升；
+    //   上一根还没有方向（首根有效 K 线）时不做棘轮，直接用当根的带值。
+    const prevUsedUpper = !isNa(stPrev) && stPrev === upperPrev
+    if (prevUsedUpper && !isNa(upperPrev)) upper = Math.min(upper, upperPrev)
+    if (!isNa(stPrev) && !prevUsedUpper && !isNa(lowerPrev)) lower = Math.max(lower, lowerPrev)
+
+    // 方向：上轨状态→收盘突破上轨则翻多(-1)，下轨状态→收盘跌破下轨则翻空(1)
+    const d = prevUsedUpper ? (close[i] > upper ? -1 : 1) : close[i] < lower ? 1 : -1
     const value = d === -1 ? lower : upper
     st[i] = value
     dir[i] = d

@@ -1637,6 +1637,25 @@ class Codegen {
     const limit = m.get('limit')
     if (stop) parts.push(`__exitStop = ${this.expr(stop)}`)
     if (limit) parts.push(`__exitLimit = ${this.expr(limit)}`)
+    // 目前只有 stop / limit 参与撮合。追踪止盈（trail_points / trail_offset）与
+    // 按跳数止盈止损（profit / loss）尚未实现 —— 明确提示，避免「脚本明明写了追踪
+    // 止盈却与 TradingView 对不上」时无从排查。
+    const ignored = [
+      ...new Set(
+        call.args
+          .map((a) => a.name)
+          .filter(
+            (n): n is string =>
+              n === 'trail_points' || n === 'trail_offset' || n === 'profit' || n === 'loss',
+          ),
+      ),
+    ]
+    if (ignored.length > 0) {
+      this.warn(
+        `strategy.exit 的 ${ignored.join(' / ')} 暂未参与撮合（目前只支持 stop / limit），对应离场条件不会生效`,
+        call,
+      )
+    }
     return parts.length ? parts.join('; ') : 'void 0'
   }
 
