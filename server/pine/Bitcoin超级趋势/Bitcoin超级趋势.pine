@@ -21,7 +21,7 @@ factor      = input.float(1.8, title="Supertrend Factor", step=0.1, group=g_stra
 
 emaLen      = input.int(200, title="EMA Trend Filter Length", group=g_strategy)
 
-enableSL    = input.bool(false, title="Enable Stop Loss", group=g_strategy)
+enableSL    = input.bool(true, title="Enable Stop Loss", group=g_strategy)
 enableTP    = input.bool(false, title="Enable Take Profit", group=g_strategy)
 slPct       = input.float(4.0, title="Stop Loss %", step=0.1, group=g_strategy) / 100
 tpPct       = input.float(8.0, title="Take Profit %", step=0.1, group=g_strategy) / 100

@@ -312,6 +312,61 @@ async function main() {
   }
 
   await shot('01-chart')
+
+  // 验证「点 K 线 → 打开该笔交易明细」：在图表主体区派发一次真实鼠标点击
+  const chartBox = await cdp.send('Runtime.evaluate', {
+    expression: `(() => {
+      const cs = [...document.querySelectorAll('canvas')]
+        .map((c) => { const r = c.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; })
+        .filter((r) => r.w > 200 && r.h > 100);
+      if (cs.length === 0) return null;
+      const main = cs.sort((a, b) => b.w * b.h - a.w * a.h)[0];
+      return { x: Math.round(main.x + main.w * 0.5), y: Math.round(main.y + main.h * 0.35) };
+    })()`,
+    returnByValue: true,
+  })
+  if (chartBox.result.value) {
+    const { x, y } = chartBox.result.value
+    // 诊断：统计图表容器上真实收到的鼠标/指针事件（用于定位「点选无反应」）
+    await cdp.send('Runtime.evaluate', {
+      expression: `(() => {
+        window.__clickProbe = { mouse: 0, pointer: 0 };
+        document.addEventListener('mousedown', () => { window.__clickProbe.mouse++ }, true);
+        document.addEventListener('pointerdown', () => { window.__clickProbe.pointer++ }, true);
+        return true;
+      })()`,
+      returnByValue: true,
+    })
+    let openedAny = false
+    // 沿时间轴扫一批位置：单笔交易只覆盖少量 K 线，点得足够密才能命中
+    const ratios = Array.from({ length: 24 }, (_, i) => (i + 0.5) / 24)
+    for (const ratio of ratios) {
+      const cx = Math.round(x + (ratio - 0.5) * 900)
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await cdp.send('Input.dispatchMouseEvent', { type, x: cx, y, button: 'left', clickCount: 1 })
+      }
+      await sleep(220)
+      const opened = await cdp.send('Runtime.evaluate', {
+        expression: `Boolean(document.querySelector('[role=dialog]'))`,
+        returnByValue: true,
+      })
+      if (opened.result.value) {
+        openedAny = true
+        await shot('07-chart-trade-detail')
+        await cdp.send('Runtime.evaluate', {
+          expression: `document.querySelector('.MuiBackdrop-root')?.click()`,
+          returnByValue: true,
+        })
+        await sleep(400)
+        break
+      }
+    }
+    const probe = await cdp.send('Runtime.evaluate', {
+      expression: `window.__clickProbe ? JSON.stringify(window.__clickProbe) : 'no-probe'`,
+      returnByValue: true,
+    })
+    console.log('图表点选是否打开交易明细:', openedAny, '· 事件计数:', probe.result.value)
+  }
   await shot('02-equity', '收益分析')
 
   // 布局检查：横向溢出 / 越界元素 / 关键容器宽度
@@ -347,6 +402,36 @@ async function main() {
 
   await shot('03-analysis', '交易分析')
   await shot('04-trades', '交易明细')
+
+  // 打开第一行的单笔交易弹窗：确认弹窗布局正常、成交明细表没有横向滚动
+  const openedDialog = await cdp.send('Runtime.evaluate', {
+    expression: `(() => {
+      const rows = [...document.querySelectorAll('tbody tr')].filter((r) => r.querySelector('td'));
+      if (rows.length === 0) return false;
+      rows[0].click();
+      return true;
+    })()`,
+    returnByValue: true,
+  })
+  if (openedDialog.result.value) {
+    await sleep(900)
+    await shot('06-trade-detail')
+    const dialogCheck = await cdp.send('Runtime.evaluate', {
+      expression: `(() => {
+        const dlg = document.querySelector('[role=dialog]');
+        if (!dlg) return { ok: false, reason: 'no-dialog' };
+        const overflowing = [...dlg.querySelectorAll('*')]
+          .filter((e) => e.scrollWidth - e.clientWidth > 2)
+          .map((e) => (typeof e.className === 'string' ? e.className.slice(0, 40) : e.tagName));
+        return { ok: overflowing.length === 0, overflowing: overflowing.slice(0, 5) };
+      })()`,
+      returnByValue: true,
+    })
+    console.log('交易明细弹窗检查:', dialogCheck.result.value)
+  } else {
+    console.log('  (交易明细表暂无数据行，跳过弹窗检查)')
+  }
+
   await shot('05-report', '回测报告')
 
   console.log('\n=========== 验证结果 ===========')

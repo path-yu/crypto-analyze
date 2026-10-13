@@ -2,10 +2,6 @@ import { useMemo, useState } from 'react'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Chip from '@mui/material/Chip'
-import Dialog from '@mui/material/Dialog'
-import DialogContent from '@mui/material/DialogContent'
-import DialogTitle from '@mui/material/DialogTitle'
-import Divider from '@mui/material/Divider'
 import MenuItem from '@mui/material/MenuItem'
 import Paper from '@mui/material/Paper'
 import Stack from '../ui/Stack'
@@ -20,8 +16,6 @@ import TableSortLabel from '@mui/material/TableSortLabel'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import DownloadIcon from '@mui/icons-material/Download'
-import IconButton from '@mui/material/IconButton'
-import CloseIcon from '@mui/icons-material/Close'
 
 import type { BacktestResult, Trade } from '@shared/types'
 import { EXIT_REASON_LABEL, dateTime, money, num, pct, price } from '../utils/format'
@@ -50,13 +44,19 @@ const REASON_COLOR: Record<string, string> = {
   EndOfData: '#8a94a6',
 }
 
-export default function TradesTable({ result }: { result: BacktestResult }) {
+export default function TradesTable({
+  result,
+  onSelectTrade,
+}: {
+  result: BacktestResult
+  /** 点击某一行 → 交给外层打开单笔明细弹窗（与 K 线图上的交易标记共用） */
+  onSelectTrade?: (trade: Trade) => void
+}) {
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(25)
   const [sortKey, setSortKey] = useState<SortKey>('id')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
   const [filter, setFilter] = useState<'all' | 'long' | 'short' | 'win' | 'loss'>('all')
-  const [detail, setDetail] = useState<Trade | null>(null)
 
   const filtered = useMemo(() => {
     let list = result.trades.slice()
@@ -196,7 +196,7 @@ export default function TradesTable({ result }: { result: BacktestResult }) {
                   key={t.id}
                   hover
                   sx={{ cursor: 'pointer' }}
-                  onClick={() => setDetail(t)}
+                  onClick={() => onSelectTrade?.(t)}
                 >
                   <TableCell align="right">{t.id}</TableCell>
                   <TableCell align="center">
@@ -276,117 +276,6 @@ export default function TradesTable({ result }: { result: BacktestResult }) {
         labelDisplayedRows={({ from, to, count }) => `${from}-${to} / ${count}`}
       />
 
-      {/* ---------------- 单笔交易明细 ---------------- */}
-      <Dialog open={Boolean(detail)} onClose={() => setDetail(null)} maxWidth="sm" fullWidth>
-        <DialogTitle sx={{ pr: 6 }}>
-          <Stack direction="row" alignItems="center" spacing={1}>
-            <Typography variant="subtitle1">
-              交易 #{detail?.id} · {detail?.side === 'long' ? '多头' : '空头'}
-            </Typography>
-            <Chip
-              size="small"
-              label={detail ? EXIT_REASON_LABEL[detail.exitReason] ?? detail.exitReason : ''}
-              sx={{ height: 20, fontSize: 11, bgcolor: 'action.hover' }}
-            />
-            <Typography
-              variant="subtitle1"
-              sx={{ ml: 'auto', color: (detail?.netPnl ?? 0) >= 0 ? UP_COLOR : DOWN_COLOR, fontWeight: 700 }}
-            >
-              {detail ? `${money(detail.netPnl)} (${pct(detail.pnlPercent)})` : ''}
-            </Typography>
-          </Stack>
-          <IconButton
-            onClick={() => setDetail(null)}
-            sx={{ position: 'absolute', right: 8, top: 8 }}
-            size="small"
-          >
-            <CloseIcon fontSize="small" />
-          </IconButton>
-        </DialogTitle>
-        <DialogContent dividers>
-          {detail && (
-            <Stack spacing={1.5}>
-              <Box
-                sx={{
-                  display: 'grid',
-                  gap: 1.25,
-                  gridTemplateColumns: { xs: '1fr 1fr', sm: 'repeat(3, 1fr)' },
-                }}
-              >
-                {[
-                  ['入场时间', dateTime(detail.entryTime)],
-                  ['出场时间', dateTime(detail.exitTime)],
-                  ['持仓 K 线', `${detail.barsHeld} 根`],
-                  ['入场价', price(detail.entryPrice)],
-                  ['出场价（加权）', price(detail.exitPrice)],
-                  ['价格变动', pct(detail.priceChangePercent)],
-                  ['初始止损价', price(detail.stopLoss)],
-                  ['离场时止损价', price(detail.finalStopLoss)],
-                  ['保本价', price(detail.breakEven)],
-                  ['TP1', price(detail.takeProfit1)],
-                  ['TP2', price(detail.takeProfit2)],
-                  ['数量', num(detail.qty, 6)],
-                  ['名义价值', money(detail.notional)],
-                  ['保证金', money(detail.margin)],
-                  ['杠杆', `${detail.leverage}x`],
-                  ['手续费', money(detail.fee)],
-                  ['毛利润', money(detail.grossPnl)],
-                  ['平仓后余额', money(detail.balanceAfter)],
-                  ['最大有利幅度', `${num(detail.maxFavorableExcursion, 2)}%`],
-                  ['最大不利幅度', `${num(detail.maxAdverseExcursion, 2)}%`],
-                  ['平仓说明', detail.comment],
-                ].map(([k, v]) => (
-                  <Box key={k}>
-                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
-                      {k}
-                    </Typography>
-                    <Typography variant="body2" sx={{ fontVariantNumeric: 'tabular-nums' }}>
-                      {v}
-                    </Typography>
-                  </Box>
-                ))}
-              </Box>
-
-              <Divider />
-
-              <Typography variant="subtitle2">成交明细</Typography>
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell>时间</TableCell>
-                    <TableCell align="right">价格</TableCell>
-                    <TableCell align="right">数量</TableCell>
-                    <TableCell align="right">占比</TableCell>
-                    <TableCell align="right">手续费</TableCell>
-                    <TableCell align="right">实现盈亏</TableCell>
-                    <TableCell align="center">原因</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {detail.fills.map((f, i) => (
-                    <TableRow key={i}>
-                      <TableCell>{dateTime(f.timestamp)}</TableCell>
-                      <TableCell align="right">{price(f.price)}</TableCell>
-                      <TableCell align="right">{num(f.qty, 6)}</TableCell>
-                      <TableCell align="right">{num(f.portion * 100, 1)}%</TableCell>
-                      <TableCell align="right">{money(f.fee, 4)}</TableCell>
-                      <TableCell
-                        align="right"
-                        sx={{ color: f.realizedPnl >= 0 ? UP_COLOR : DOWN_COLOR }}
-                      >
-                        {money(f.realizedPnl)}
-                      </TableCell>
-                      <TableCell align="center">
-                        {EXIT_REASON_LABEL[f.reason] ?? f.reason}
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </Stack>
-          )}
-        </DialogContent>
-      </Dialog>
     </Paper>
   )
 }

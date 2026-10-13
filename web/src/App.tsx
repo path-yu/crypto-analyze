@@ -21,6 +21,7 @@ import { ThemeProvider } from '@mui/material/styles'
 
 import type {
   BacktestResult,
+  Trade,
   ExchangeId,
   SavedPineScript,
   StrategyKind,
@@ -43,6 +44,7 @@ import KpiCards from './components/KpiCards'
 import EquityPanel from './components/EquityPanel'
 import AnalysisPanel from './components/AnalysisPanel'
 import TradesTable from './components/TradesTable'
+import TradeDetailDialog from './components/TradeDetailDialog'
 import ReportPanel from './components/ReportPanel'
 import { dateTime, humanizeError, money, num, pct } from './utils/format'
 
@@ -101,6 +103,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<TabKey>('chart')
   const [showTrades, setShowTrades] = useState(true)
+  /** 单笔交易明细弹窗（「交易明细」表与 K 线图上的交易标记共用） */
+  const [detailTrade, setDetailTrade] = useState<Trade | null>(null)
   const [showLevels, setShowLevels] = useState(false)
 
   /** 参数面板是否收起（收起时只显示一条窄轨） */
@@ -174,6 +178,7 @@ export default function App() {
         setResult(await runBacktest(base))
       }
       setTab('chart')
+      setDetailTrade(null)
     } catch (err) {
       setError(humanizeError(err instanceof Error ? err.message : String(err)))
     } finally {
@@ -541,12 +546,18 @@ export default function App() {
                       onToggleTrades={setShowTrades}
                       showLevels={showLevels}
                       onToggleLevels={setShowLevels}
+                      onSelectTrade={setDetailTrade}
                     />
                   )}
                   {tab === 'equity' && <EquityPanel result={result!} />}
                   {tab === 'analysis' && <AnalysisPanel result={result!} />}
-                  {tab === 'trades' && <TradesTable result={result!} />}
+                  {tab === 'trades' && (
+                    <TradesTable result={result!} onSelectTrade={setDetailTrade} />
+                  )}
                   {tab === 'report' && <ReportPanel result={result!} />}
+
+                  {/* 单笔交易明细：交易明细表点行、K 线图点交易标记都会打开这里 */}
+                  <TradeDetailDialog trade={detailTrade} onClose={() => setDetailTrade(null)} />
 
                   <Paper sx={{ p: 1.75 }}>
                     <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap>

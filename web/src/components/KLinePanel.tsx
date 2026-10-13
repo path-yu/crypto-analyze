@@ -9,7 +9,7 @@ import Tooltip from '@mui/material/Tooltip'
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined'
 import { dispose, init, type Chart, type KLineData, type Period } from 'klinecharts'
 
-import type { BacktestResult, Timeframe } from '@shared/types'
+import type { BacktestResult, Timeframe, Trade } from '@shared/types'
 import { registerCustomCharts, type TradeMarkerData } from '../charts/klineRegistrations'
 import { klineAxisTime } from '../utils/format'
 
@@ -47,9 +47,13 @@ interface Props {
   onToggleTrades: (v: boolean) => void
   showLevels: boolean
   onToggleLevels: (v: boolean) => void
-  onSelectTrade?: (id: number) => void
+  /** 点击图上的交易标记 → 打开该笔交易明细（与「交易明细」表共用弹窗） */
+  onSelectTrade?: (trade: Trade) => void
   height?: number
 }
+
+/** 点选标记的命中半径（像素） */
+const MARKER_HIT_RADIUS = 14
 
 const MAX_MARKERS = 1200
 
@@ -60,6 +64,7 @@ export default function KLinePanel({
   onToggleTrades,
   showLevels,
   onToggleLevels,
+  onSelectTrade,
   height = 620,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -230,6 +235,79 @@ export default function KLinePanel({
       chartRef.current = null
     }
   }, [result, klineData, showTrades, showLevels, markerCount])
+
+  // 图上点选交易：把每笔的开仓 / 平仓点转成像素，命中半径内即打开该笔明细。
+  // 以「按下 → 抬起位移 < 4px」区分点击与拖动、平移，避免缩放拖图时误弹窗。
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el || !result || !showTrades || result.trades.length === 0) return
+    let downX = 0
+    let downY = 0
+    const onPointerDown = (e: MouseEvent) => {
+      downX = e.clientX
+      downY = e.clientY
+    }
+    const onPointerUp = (e: MouseEvent) => {
+      const chart = chartRef.current
+      if (!chart) return
+      if (Math.abs(e.clientX - downX) > 4 || Math.abs(e.clientY - downY) > 4) return
+      const rect = el.getBoundingClientRect()
+      const px = e.clientX - rect.left
+      const py = e.clientY - rect.top
+      // 每笔交易贡献「开仓 / 平仓」两个点，数组下标 i 对应交易 i >> 1
+      const points = result.trades.flatMap((t) => [
+        { timestamp: t.entryTime, value: t.entryPrice },
+        { timestamp: t.exitTime, value: t.exitPrice },
+      ])
+      let coords: Partial<{ x: number; y: number }>[]
+      try {
+        const converted = chart.convertToPixel(points)
+        coords = Array.isArray(converted) ? converted : [converted]
+      } catch {
+        return
+      }
+      let best = -1
+      let bestDist = Number.POSITIVE_INFINITY
+      coords.forEach((c, i) => {
+        if (typeof c.x !== 'number' || typeof c.y !== 'number') return
+        const dist = Math.hypot(c.x - px, c.y - py)
+        if (dist < bestDist) {
+          bestDist = dist
+          best = i >> 1
+        }
+      })
+      if (best >= 0 && bestDist <= MARKER_HIT_RADIUS) {
+        onSelectTrade?.(result.trades[best])
+        return
+      }
+      // 没点中标记时退一步：把点击位置换算回数据坐标，打开「覆盖该根 K 线」的那笔交易。
+      // klinecharts 可能返回 timestamp，也可能只返回 dataIndex（按数据数组下标）。
+      let ts: number | undefined
+      try {
+        const back = chart.convertFromPixel([{ x: px, y: py }])
+        const point = Array.isArray(back) ? back[0] : back
+        if (typeof point?.timestamp === 'number') ts = point.timestamp
+        else if (typeof point?.dataIndex === 'number') {
+          const row = result.candles[point.dataIndex]
+          if (row) ts = row.timestamp
+        }
+      } catch {
+        ts = undefined
+      }
+      if (ts === undefined) return
+      const covering = result.trades.find((t) => t.entryTime <= ts! && ts! <= t.exitTime)
+      if (covering) onSelectTrade?.(covering)
+    }
+    // 用捕获阶段 + 鼠标事件：图表内部（缩放/平移处理）会在冒泡阶段 stopPropagation，
+    // 挂在冒泡阶段会收不到事件；鼠标事件在桌面与触屏上都会派发，兼容性最好。
+    // 这里只读坐标、不阻断传播，图表拖动不受影响。
+    el.addEventListener('mousedown', onPointerDown, true)
+    el.addEventListener('mouseup', onPointerUp, true)
+    return () => {
+      el.removeEventListener('mousedown', onPointerDown, true)
+      el.removeEventListener('mouseup', onPointerUp, true)
+    }
+  }, [result, showTrades, onSelectTrade])
 
   // 容器尺寸变化时重绘
   useEffect(() => {
