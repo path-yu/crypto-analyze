@@ -1260,6 +1260,151 @@ test('M9: strategy.position_size[k] 与 strategy.opentrades 历史引用可用',
   assert.equal(Number(program.plots['Nt'][1]), 1, 'bar1：opentrades=1 + 上一根 0')
 })
 
+/* ================================================================== */
+/* M10 语料收口：HTF security / 行内序列 / map·matrix / 多类型实参泛型    */
+/* ================================================================== */
+
+test('M10: security(symbol, "D", src) 按日线重采样对齐（lookahead_off 语义）', () => {
+  const src = [
+    '//@version=6',
+    'indicator("htf")',
+    'dClose = security(syminfo.tickerid, "D", close)',
+    'dSma = security(syminfo.tickerid, "D", ta.sma(close, 2))',
+    'dUp = security(syminfo.tickerid, "D", close > open)',
+    'plot(dClose, title="DC")',
+    'plot(dSma, title="DS")',
+    'plot(dUp ? 1.0 : 0.0, title="DU")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm10-htf.pine' })
+  assert.deepEqual(
+    comp.diagnostics.filter((d) => d.severity === 'error'),
+    [],
+    JSON.stringify(comp.diagnostics),
+  )
+  assert.ok(
+    !comp.diagnostics.some((d) => d.message.includes('已降级')),
+    '字面量周期应走真 HTF 重采样路径，不该出现降级警告',
+  )
+
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, { timeframe: '1h' })
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+
+  // 参考实现：按 UTC 日分桶，读取「上一根已收盘日线」
+  const dayKey = (ms: number): number => Math.floor(ms / 86_400_000)
+  const keys: number[] = []
+  const bucketOf: number[] = candles.map((c) => {
+    const k = dayKey(c.timestamp)
+    if (!keys.includes(k)) keys.push(k)
+    return keys.indexOf(k)
+  })
+  const dayOpen: number[] = []
+  const dayClose: number[] = []
+  for (let j = 0; j < keys.length; j++) {
+    const idxs = candles.map((_, i) => i).filter((i) => bucketOf[i] === j)
+    dayOpen.push(candles[idxs[0]].open)
+    dayClose.push(candles[idxs[idxs.length - 1]].close)
+  }
+  const sma2 = taLib.sma(dayClose, 2)
+  for (let i = 0; i < candles.length; i++) {
+    const j = bucketOf[i] - 1
+    const expC = j >= 0 ? dayClose[j] : Number.NaN
+    const expS = j >= 0 ? sma2[j] : Number.NaN
+    const expU = j >= 0 && dayClose[j] > dayOpen[j] ? 1 : 0
+    assert.ok(
+      Object.is(Number(program.plots['DC'][i]), expC),
+      `bar=${i} 日线 close 对齐：${program.plots['DC'][i]} ≠ ${expC}`,
+    )
+    assert.ok(
+      Object.is(Number(program.plots['DS'][i]), expS),
+      `bar=${i} 日线 sma2 对齐：${program.plots['DS'][i]} ≠ ${expS}`,
+    )
+    assert.equal(Number(program.plots['DU'][i]), expU, `bar=${i} 日线 close>open`)
+  }
+})
+
+test('M10: 调用结果 [k]（行内序列缓冲）逐 bar 对齐', () => {
+  const src = [
+    '//@version=6',
+    'indicator("inline")',
+    'f(x) => x * 2',
+    'v = f(bar_index)',
+    'p = f(bar_index)[1]',
+    'plot(v, title="V")',
+    'plot(p, title="P")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm10-inline.pine' })
+  assert.deepEqual(
+    comp.diagnostics.filter((d) => d.severity === 'error'),
+    [],
+    JSON.stringify(comp.diagnostics),
+  )
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+  assert.ok(Number.isNaN(Number(program.plots['P'][0])), '第 0 根无上一根 → na')
+  for (let i = 1; i < 6; i++) {
+    assert.equal(Number(program.plots['V'][i]), i * 2)
+    assert.equal(Number(program.plots['P'][i]), (i - 1) * 2, `bar=${i} 行内序列回看`)
+  }
+})
+
+test('M10: map.* 容器与 matrix 的 det/inv/rank 数值正确', () => {
+  const src = [
+    '//@version=6',
+    'indicator("mapmat")',
+    'var m = map.new<string, float>()',
+    'mat = matrix.new<float>(2, 2, 0.0)',
+    'if bar_index == 0',
+    '    map.put(m, "a", 1.5)',
+    '    map.put(m, "b", 2.5)',
+    '    matrix.set(mat, 0, 0, 1.0)',
+    '    matrix.set(mat, 0, 1, 2.0)',
+    '    matrix.set(mat, 1, 0, 3.0)',
+    '    matrix.set(mat, 1, 1, 4.0)',
+    'inv = matrix.inv(mat)',
+    'out = map.size(m) + map.get(m, "a") + matrix.get(mat, 1, 1) + matrix.det(mat) + matrix.rank(mat)',
+    'plot(out, title="Out")',
+    'plot(matrix.get(inv, 0, 0), title="Inv00")',
+    'plot(map.contains(m, "b") ? 1.0 : 0.0, title="HasB")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm10-mapmat.pine' })
+  assert.deepEqual(
+    comp.diagnostics.filter((d) => d.severity === 'error'),
+    [],
+    JSON.stringify(comp.diagnostics),
+  )
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+  // size=2 + get("a")=1.5 + (1,1)=4 + det=-2 + rank=2 → 7.5
+  assert.equal(Number(program.plots['Out'][0]), 7.5)
+  // inv([[1,2],[3,4]]) = [[-2, 1], [1.5, -0.5]]
+  assert.ok(Math.abs(Number(program.plots['Inv00'][0]) - -2) < 1e-9)
+  assert.equal(Number(program.plots['HasB'][0]), 1)
+})
+
+test('M10: 多类型实参泛型调用（map.new<string, float>()）可解析', () => {
+  const src = [
+    '//@version=6',
+    'indicator("generic2")',
+    'var mm = map.new<string, string>()',
+    'if bar_index == 0',
+    '    map.put(mm, "k", "v")',
+    'plot(map.size(mm), title="N")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm10-generic.pine' })
+  assert.deepEqual(
+    comp.diagnostics.filter((d) => d.severity === 'error'),
+    [],
+    JSON.stringify(comp.diagnostics),
+  )
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+  assert.equal(Number(program.plots['N'][0]), 1)
+})
+
 test('M9: 新增 ta 函数（rsi/hma/alma/linreg/barssince/valuewhen/mfi）数值合理', () => {
   const src = [
     '//@version=6',

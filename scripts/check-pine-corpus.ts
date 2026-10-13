@@ -2,7 +2,7 @@
  * Pine 语料批量体检：对目录下的每个 .pine 执行「编译 → 逐 bar 运行」，
  * 汇总诊断与运行期异常，用于找出编译器缺失的语法/内置特性。
  *
- * 用法：npx tsx scripts/check-pine-corpus.ts [目录]
+ * 用法：npx tsx scripts/check-pine-corpus.ts [目录] [合成 K 线数量]
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -17,8 +17,10 @@ const dir = path.isAbsolute(process.argv[2] ?? '')
   ? (process.argv[2] as string)
   : path.resolve(ROOT, process.argv[2] ?? 'server/pine/tv')
 
-/** 确定性合成 K 线（600 根，含趋势段与震荡段） */
-function synthCandles(n = 600): Candle[] {
+const bars = Number(process.argv[3] ?? 600)
+
+/** 确定性合成 K 线（含趋势段与震荡段） */
+function synthCandles(n = bars): Candle[] {
   const out: Candle[] = []
   let price = 100
   for (let i = 0; i < n; i++) {
@@ -82,7 +84,7 @@ for (const file of files) {
   rows.push(row)
 }
 
-console.log(`\n===== Pine 语料体检：${dir} （${files.length} 个脚本） =====\n`)
+console.log(`\n===== Pine 语料体检：${dir} （${files.length} 个脚本，${bars} 根 K 线） =====\n`)
 let okCompile = 0
 let okRun = 0
 for (const r of rows) {

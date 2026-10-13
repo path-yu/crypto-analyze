@@ -271,6 +271,14 @@ const DAYOFWEEK_MEMBERS: Record<string, number> = {
 /** 时间分量调用（`year(time)` / `month(time)` / `hour(time)` …，缺省用当前 bar 时间） */
 const TIME_PART_FNS = new Set(['year', 'month', 'dayofmonth', 'hour', 'minute', 'second', 'weekofyear'])
 
+/**
+ * `security()` 的字面量周期是否可重采样（与 runtime 的 parseTfSpec 保持一致）：
+ * `60`（=60 分钟）、`1D` / `D`、`W`、`M`、`1h` …
+ */
+function isHtfTimeframe(tf: string): boolean {
+  return /^(\d*)([SmhdWMD]?)$/.test(tf.trim()) && tf.trim() !== ''
+}
+
 /** `text.format_*` 等绘图枚举（回测不消费，按 0 占位） */
 function isTextEnumMember(path: string): boolean {
   return path.startsWith('text.format_') || path.startsWith('text.style_')
@@ -333,8 +341,16 @@ class Codegen {
   private readonly precalcTuples: { names: string[]; call: CallExpr }[] = []
   /** 预计算元组的元素名（按单条数组引用） */
   private readonly precalcTupleNames = new Set<string>()
-  /** 需要逐 bar 序列跟踪的顶层标量（`__s_<name>` 数组，供 ta `*At` 变体使用） */
+  /** 必须逐 bar 记录序列的顶层标量（`__s_<name>` 数组，供 ta `*At` 变体使用） */
   private readonly serTrack = new Set<string>()
+  /**
+   * 行内序列缓冲：`f(...)[k]`（调用结果被 `[k]` 引用）→
+   * 位置键 `line:col` → 模块级数组名。逐 bar 记录调用结果，读取时按 k 回看。
+   */
+  private readonly inlineSeries = new Map<string, string>()
+  private inlineSeq = 0
+  /** 历史引用容器归属：逐 bar 标量用下标对齐数组（`__s_*`），其余（var / 常量）才需要环形缓冲 */
+  private readonly ringNames = new Map<string, number>()
   /** 用户函数中「被 [k] 引用的形参」→ 隐藏历史参数（调用点透传序列容器） */
   private readonly fnHistParams = new Map<string, string[]>()
   /** 用户函数中「被 [k] 引用的局部变量」：函数名 → (局部名 → 最大引用深度) */
@@ -347,6 +363,9 @@ class Codegen {
   private wantsTr = false
   /** 正在做初始化期代码生成（此时 ta 调用按整条数组求值，不生成 *At） */
   private initPhase = false
+  /** HTF 域编译（`security()`）：内置序列改读重采样数组；标量域则由 htfAlign 负责对齐 */
+  private htfOverride: string | null = null
+  private htfAlign: string | null = null
   /** 已发出过的警告（去重） */
   private readonly warned = new Set<string>()
 
@@ -414,8 +433,8 @@ class Codegen {
     lines.push(
       '  let __ctx = { flat: true, positionSize: 0, prevPositionSize: 0, avgPrice: NaN, side: null }',
     )
-    // 环形缓冲（历史引用）
-    for (const [name, k] of this.histNeed) {
+    // 环形缓冲（仅 var 状态 / 初始化期常量；逐 bar 标量走 __s_* 数组）
+    for (const [name, k] of this.ringNames) {
       lines.push(`  const __h_${name} = __pine.makeRing(${k + 1})`)
     }
     // ctx 成员的历史引用（`strategy.position_size[1]` 等）
@@ -435,6 +454,10 @@ class Codegen {
     // 整条序列喂给 ta 的 *At 变体，而不是退化成标量。
     for (const name of this.serTrack) {
       lines.push(`  const __s_${name} = []`)
+    }
+    // 行内序列缓冲（`f(...)[k]` 的逐 bar 结果）
+    for (const arr of this.inlineSeries.values()) {
+      lines.push(`  const ${arr} = []`)
     }
     // 函数局部序列：提升为模块级状态（`__fl_<fn>_<name>`）并配环形缓冲
     for (const [fnName, locals] of this.fnLocalSeries) {
@@ -540,7 +563,29 @@ class Codegen {
 
     // 分类完成后再统计历史引用：此时才分得清 A 类数组 / var 状态 / C 类标量
     this.collectHistRefs(this.program.body)
+    // 容器归属：逐 bar 标量的 [k] 走下标对齐数组（值不再随写入时点漂移），
+    // 其余（var 状态 / 初始化期常量）才用环形缓冲
+    for (const [name, k] of this.histNeed) {
+      if (this.stepScalars.has(name)) this.serTrack.add(name)
+      else this.ringNames.set(name, k)
+    }
+    // 行内序列缓冲：`f(...)[k]` 这类「调用结果被 [k] 引用」的情形
+    this.collectInlineSeries(this.program.body)
     this.collectExits(this.program.body)
+  }
+
+  /**
+   * 收集「调用结果被 `[k]` 引用」的表达式（`f(...)[k]`）。
+   * 结果按位置键共享一条逐 bar 数组：读取处用 `__pine.serRead` 先记录当根结果再回看。
+   */
+  private collectInlineSeries(stmts: Stmt[]): void {
+    this.walkExprs(stmts, (e) => {
+      if (e.kind !== 'index' || e.object.kind !== 'call') return
+      const key = `${e.line}:${e.col}`
+      if (!this.inlineSeries.has(key)) {
+        this.inlineSeries.set(key, `__is_${this.inlineSeq++}`)
+      }
+    })
   }
 
   /** `[a, b, c] = ta.macd(...)` 这类元组型 ta 调用的元素个数；非元组调用返回 null */
@@ -1021,7 +1066,8 @@ class Codegen {
     for (const path of this.memberHist.keys()) {
       out.push(`__pine.push(__hm_${memberRingName(path)}, ${this.memberValueOf(path)})`)
     }
-    for (const name of this.histNeed.keys()) {
+    // `var` 状态的历史引用：每根 bar 无条件推入当前值（`:=` 可能一年才发生一次）
+    for (const name of this.ringNames.keys()) {
       if (this.vars.has(name)) out.push(`__pine.push(__h_${name}, ${this.jsVar(name)})`)
     }
     if (this.meta.kind === 'strategy') {
@@ -1162,9 +1208,7 @@ class Codegen {
       } else {
         lines.push(`${js} = ${rhs}`)
       }
-      if (this.histNeed.has(name) && !this.vars.has(name)) {
-        lines.push(`__pine.push(__h_${name}, ${js})`)
-      }
+      // `var` 状态由 step 序言逐 bar 推入；逐 bar 标量已由 `__s_*` 数组承载（写入即对齐下标）
       if (this.serTrack.has(name)) {
         lines.push(`__pine.serSet(__s_${name}, __index, ${js})`)
       }
@@ -1203,9 +1247,7 @@ class Codegen {
         out.push(`${pad}let ${js} = ${tmp}[${i}]`)
         this.declareLocal(name)
       }
-      if (this.histNeed.has(name) && !this.vars.has(name)) {
-        out.push(`${pad}__pine.push(__h_${name}, ${js})`)
-      }
+      // 环形缓冲只服务 var 状态（序言逐 bar 推入）；逐 bar 标量走下标对齐数组
       if (this.serTrack.has(name)) {
         out.push(`${pad}__pine.serSet(__s_${name}, __index, ${js})`)
       }
@@ -1477,6 +1519,12 @@ class Codegen {
   }
 
   private ident(name: string, node: Expr): string {
+    // HTF 标量域（`security()` 取数表达式）：内置序列按「上一根已收盘 HTF bar」对齐
+    if (this.htfAlign && BUILTIN_SERIES.has(name)) {
+      const tf = JSON.stringify(this.htfAlign)
+      const arr = name === 'time_close' || name === 'time_tradingday' ? 'time' : name
+      return `__pine.htfAt(__pine.htf(${tf}).${arr}, __index, ${tf})`
+    }
     switch (name) {
       case 'open':
         return 'C.open[__index]'
@@ -1615,14 +1663,49 @@ class Codegen {
         // 函数局部序列：提升后的环形缓冲
         const hoisted = this.fnLocalCtx?.get(name)
         if (hoisted) return `__pine.hist(${hoisted.ring}, ${k})`
-        // 逐 bar 标量的环形缓冲（不能被跟踪数组替代：条件赋值时环形缓冲更保守）
-        if (this.histNeed.has(name)) return `__pine.hist(__h_${name}, ${k})`
       }
-      // 内置序列 / 预计算数组 / 跟踪标量 / 嵌套 ta 调用：整条数组 + 下标回看
+      // ta 序列调用：直接生成「标量 *At + 下标偏移」，避免每次读都重算整条数组
+      if (base.kind === 'call') {
+        const call = base
+        const path = this.calleePath(call.callee)
+        const fn = path
+          ? path.length === 2 && path[0] === 'ta'
+            ? path[1]
+            : path.length === 1
+              ? path[0]
+              : null
+          : null
+        const atFns = fn
+          ? SERIES_AT_FNS.has(fn) ||
+            TA_OHLC_FNS.has(fn) ||
+            fn === 'atr' ||
+            fn === 'tr' ||
+            fn === 'sar' ||
+            fn === 'stoch' ||
+            fn === 'valuewhen' ||
+            fn === 'pivothigh' ||
+            fn === 'pivotlow'
+          : false
+        if (fn && atFns) {
+          const at = this.taAtCall(call, fn, `(__index - ${k})`)
+          if (at) return at
+        }
+      }
+      // 内置序列 / 预计算数组 / 逐 bar 标量跟踪数组 / 嵌套 ta 调用：整条数组 + 下标回看
       const ref = this.seriesRef(base)
       if (ref) {
         const idx = ref.offset === 0 ? '__index' : `(__index - ${ref.offset})`
         return `__pine.at(${ref.arr}, ${idx}, ${k})`
+      }
+      // 其余（var 状态 / 初始化期常量）：环形缓冲
+      if (base.kind === 'ident' && this.ringNames.has(base.name)) {
+        return `__pine.hist(__h_${base.name}, ${k})`
+      }
+      // 调用结果（用户函数 / 无法映射为序列的 ta 调用）：行内序列缓冲，
+      // 先记录当根结果再按 k 回看（`__pine.serRead`）
+      if (base.kind === 'call') {
+        const arr = this.inlineSeries.get(`${e.line}:${e.col}`)
+        if (arr) return `__pine.serRead(${arr}, __index, ${k}, ${this.expr(base)})`
       }
     }
     if (base.kind === 'member') {
@@ -1640,6 +1723,11 @@ class Codegen {
   }
 
   private seriesArrayOf(name: string): string {
+    // HTF 域：内置序列改读重采样数组（`security()` 的取数表达式）
+    if (this.htfOverride) {
+      const n = name === 'time_close' || name === 'time_tradingday' ? 'time' : name
+      return `__pine.htf(${JSON.stringify(this.htfOverride)}).${n}`
+    }
     switch (name) {
       case 'time':
       case 'time_close':
@@ -1761,6 +1849,10 @@ class Codegen {
     // matrix.* ：运行时实现常见矩阵运算（回测用不到的重型算子按 na 降级）
     if (path && path[0] === 'matrix' && path[1]) {
       return `__pine.matrix.${path[1]}(${this.callArgs(e).join(', ')})`
+    }
+    // map.* ：以 JS Map 承载的键值容器
+    if (path && path[0] === 'map' && path[1]) {
+      return `__pine.map.${path[1]}(${this.callArgs(e).join(', ')})`
     }
     // `chart.point.from_time/from_index/new(...)`：绘图坐标对象（回测不消费）
     if (path && path[0] === 'chart' && path[1] === 'point') {
@@ -1902,15 +1994,16 @@ class Codegen {
 
   /**
    * `step` 内的 ta 调用：把序列实参解析成整条数组，用 `*At` 变体取当前 bar 值。
+   * `idxExpr` 为「当前 bar 下标表达式」，`f(...)[k]` 场景传入 `(__index - k)`。
    * 返回 null 表示无法映射（调用方回退到整数组形式）。
    */
-  private taAtCall(e: CallExpr, fn: string): string | null {
+  private taAtCall(e: CallExpr, fn: string, idxExpr = '__index'): string | null {
     const pos = this.positionalArgs(e)
     if (fn === 'atr') {
       // v4 `atr(len)` / v6 `ta.atr(len)`：以内置 OHLC 为源
       if (pos.length <= 1) {
         const len = pos[0] ? this.expr(pos[0].value) : '14'
-        return `__pine.ta.atrAt(C.high, C.low, C.close, __index, ${len}, 'RMA')`
+        return `__pine.ta.atrAt(C.high, C.low, C.close, ${idxExpr}, ${len}, 'RMA')`
       }
       // v6 `ta.atr(high, low, close, len)`
       if (pos.length >= 4) {
@@ -1918,22 +2011,22 @@ class Codegen {
         const ls = this.seriesRef(pos[1].value)
         const cs = this.seriesRef(pos[2].value)
         if (hs && ls && cs) {
-          return `__pine.ta.atrAt(${hs.arr}, ${ls.arr}, ${cs.arr}, __index, ${this.expr(pos[3].value)}, 'RMA')`
+          return `__pine.ta.atrAt(${hs.arr}, ${ls.arr}, ${cs.arr}, ${idxExpr}, ${this.expr(pos[3].value)}, 'RMA')`
         }
       }
       return null
     }
-    if (fn === 'tr') return '__pine.ta.trAt(C.high, C.low, C.close, __index)'
+    if (fn === 'tr') return `__pine.ta.trAt(C.high, C.low, C.close, ${idxExpr})`
     // 源序列固定为内置 OHLC(V)：直接走整数组形式（结果再按下标取）
     if (TA_OHLC_FNS.has(fn)) {
       const extra = pos.map((p) => this.expr(p.value))
-      return `__pine.ta.${fn}At(C.high, C.low, C.close, __index, ${extra.join(', ')})`
+      return `__pine.ta.${fn}At(C.high, C.low, C.close, ${idxExpr}, ${extra.join(', ')})`
     }
     // `ta.sar(start, inc, max)`：高低价固定为内置序列
     if (fn === 'sar') {
       if (pos.length < 3) return null
       const a = pos.map((p) => this.expr(p.value))
-      return `__pine.ta.sarAt(C.high, C.low, __index, ${a[0]}, ${a[1]}, ${a[2]})`
+      return `__pine.ta.sarAt(C.high, C.low, ${idxExpr}, ${a[0]}, ${a[1]}, ${a[2]})`
     }
     // `ta.valuewhen(condition, source, occurrence)` → `valuewhenAt(src, i, cond, occ)`
     if (fn === 'valuewhen') {
@@ -1941,7 +2034,7 @@ class Codegen {
       const srcRef = pos[1] ? this.seriesRef(pos[1].value) : null
       if (condRef && srcRef && condRef.offset === 0 && srcRef.offset === 0) {
         const occ = pos[2] ? this.expr(pos[2].value) : '0'
-        return `__pine.ta.valuewhenAt(${srcRef.arr}, __index, ${condRef.arr}, ${occ})`
+        return `__pine.ta.valuewhenAt(${srcRef.arr}, ${idxExpr}, ${condRef.arr}, ${occ})`
       }
       return null
     }
@@ -1951,7 +2044,7 @@ class Codegen {
       const hiRef = pos[1] ? this.seriesRef(pos[1].value) : null
       const loRef = pos[2] ? this.seriesRef(pos[2].value) : null
       if (srcRef && hiRef && loRef && pos[3]) {
-        return `__pine.ta.stochAt(${srcRef.arr}, __index, ${hiRef.arr}, ${loRef.arr}, ${this.expr(pos[3].value)})`
+        return `__pine.ta.stochAt(${srcRef.arr}, ${idxExpr}, ${hiRef.arr}, ${loRef.arr}, ${this.expr(pos[3].value)})`
       }
       return null
     }
@@ -1965,14 +2058,15 @@ class Codegen {
       const left = pos[two ? 0 : 1]
       const right = pos[two ? 1 : 2]
       if (srcRef && left && right) {
-        return `__pine.ta.${fn}At(${srcRef}, __index, ${this.expr(left.value)}, ${this.expr(right.value)})`
+        return `__pine.ta.${fn}At(${srcRef}, ${idxExpr}, ${this.expr(left.value)}, ${this.expr(right.value)})`
       }
       return null
     }
     if (!SERIES_AT_FNS.has(fn)) return null
     const first = pos[0] ? this.seriesRef(pos[0].value) : null
     if (!first) return null
-    const idx = first.offset === 0 ? '__index' : `(__index - ${first.offset})`
+    const idx = first.offset === 0 ? idxExpr : first.offset < 0 ? null : `(${idxExpr} - ${first.offset})`
+    if (!idx) return null
     const rest = pos.slice(1).map((a) => this.expr(a.value))
     const tail = rest.length ? `, ${rest.join(', ')}` : ''
     return `__pine.ta.${fn}At(${first.arr}, ${idx}${tail})`
@@ -2001,12 +2095,137 @@ class Codegen {
     return `(__pine.gt(${a}, ${b}) || __pine.lt(${a}, ${b}))`
   }
 
-  /** v4 `security()` / `request.security()`：多标的取值未实现，降级为「取当前序列」 */
+  /** v4 `security()` / `request.security()`：字面量周期 + 纯序列取值 → 真 HTF 重采样；否则降级 */
   private securityCall(e: CallExpr): string {
     const pos = this.positionalArgs(e)
-    const src = pos[2] ?? pos[1]
-    this.warn('security()/request.security() 已降级为当前序列取值（忽略 symbol 与 timeframe 参数）', e)
-    return src ? this.expr(src.value) : 'NaN'
+    const srcArg = pos[2] ?? pos[1]
+    const tfArg = pos[1]
+    const tf = tfArg ? this.literalOf(tfArg.value) : undefined
+    const lookaheadOn = e.args.some(
+      (a) => a.name === 'lookahead' && this.dottedPath(a.value) === 'barmerge.lookahead_on',
+    )
+    if (!this.initPhase && typeof tf === 'string' && srcArg && !lookaheadOn) {
+      const htf = this.tryHtfCall(tf, srcArg.value)
+      if (htf) return htf
+    }
+    if (lookaheadOn) {
+      this.warn(
+        'security(..., lookahead = barmerge.lookahead_on) 暂不支持，已降级为当前序列取值',
+        e,
+      )
+    } else {
+      this.warn('security()/request.security() 已降级为当前序列取值（忽略 symbol 与 timeframe 参数）', e)
+    }
+    return srcArg ? this.expr(srcArg.value) : 'NaN'
+  }
+
+  /**
+   * 尝试把 `security(symbol, tf, src)` 编译成真 HTF 取值（`lookahead_off` 语义）：
+   *   1. `src` 是 ta 序列调用（`ta.ema(close, n)`）→ 在重采样数组上整数组求值后对齐；
+   *   2. `src` 是仅由内置序列 / 常量构成的标量表达式（`close > open`）→ 逐标识符对齐。
+   * 其余形态（含 step 标量、用户函数、其它 security）返回 null，交由降级路径处理。
+   */
+  private tryHtfCall(tf: string, src: Expr): string | null {
+    if (!isHtfTimeframe(tf)) return null
+    if (src.kind === 'call') {
+      const call = src
+      const fn = this.taSeriesFnOf(call)
+      if (fn) {
+        if (!call.args.every((a) => this.isHtfSeriesArg(a.value))) return null
+        const prevOverride = this.htfOverride
+        const prevInit = this.initPhase
+        this.htfOverride = tf
+        this.initPhase = true
+        try {
+          const arr = this.taArrayCall(call, fn)
+          return `__pine.htfAt(${arr}, __index, ${JSON.stringify(tf)})`
+        } finally {
+          this.htfOverride = prevOverride
+          this.initPhase = prevInit
+        }
+      }
+    }
+    if (!this.isHtfScalarExpr(src)) return null
+    const prevAlign = this.htfAlign
+    this.htfAlign = tf
+    try {
+      return this.expr(src)
+    } finally {
+      this.htfAlign = prevAlign
+    }
+  }
+
+  /** 该调用是否为「返回整条序列」的 ta 函数（`ta.sma` / v4 裸 `sma`） */
+  private taSeriesFnOf(e: CallExpr): string | null {
+    const path = this.calleePath(e.callee)
+    if (!path) return null
+    const fn = path.length === 2 && path[0] === 'ta' ? path[1] : path.length === 1 ? path[0] : null
+    if (!fn || !TA_SERIES_FNS.has(fn)) return null
+    if (path.length === 1 && !V4_TA_FUNCS.has(fn)) return null
+    return fn
+  }
+
+  /** HTF 取数表达式的实参：内置序列 / 初始化期常量 / 常量成员 / 纯算术 / 嵌套 ta 序列调用 */
+  private isHtfSeriesArg(e: Expr): boolean {
+    switch (e.kind) {
+      case 'number':
+      case 'string':
+      case 'bool':
+      case 'color':
+      case 'na':
+        return true
+      case 'ident':
+        return BUILTIN_SERIES.has(e.name) || this.createConsts.has(e.name)
+      case 'member': {
+        const path = this.dottedPath(e)
+        return path !== null && path in CONST_MEMBERS
+      }
+      case 'unary':
+        return this.isHtfSeriesArg(e.operand)
+      case 'binary':
+        return this.isHtfSeriesArg(e.left) && this.isHtfSeriesArg(e.right)
+      case 'ternary':
+        return this.isHtfSeriesArg(e.cond) && this.isHtfSeriesArg(e.then) && this.isHtfSeriesArg(e.else)
+      case 'call': {
+        const fn = this.taSeriesFnOf(e)
+        return fn !== null && e.args.every((a) => this.isHtfSeriesArg(a.value))
+      }
+      default:
+        return false
+    }
+  }
+
+  /** HTF 标量表达式：只含内置序列 / 常量（逐个标识符按上一根已收盘 HTF bar 对齐） */
+  private isHtfScalarExpr(e: Expr): boolean {
+    switch (e.kind) {
+      case 'number':
+      case 'string':
+      case 'bool':
+      case 'color':
+      case 'na':
+        return true
+      case 'ident':
+        return BUILTIN_SERIES.has(e.name) || this.createConsts.has(e.name)
+      case 'member': {
+        const path = this.dottedPath(e)
+        return path !== null && path in CONST_MEMBERS
+      }
+      case 'unary':
+        return this.isHtfScalarExpr(e.operand)
+      case 'binary':
+        return this.isHtfScalarExpr(e.left) && this.isHtfScalarExpr(e.right)
+      case 'ternary':
+        return this.isHtfScalarExpr(e.cond) && this.isHtfScalarExpr(e.then) && this.isHtfScalarExpr(e.else)
+      case 'call': {
+        if (e.callee.kind === 'na') return true
+        const path = this.calleePath(e.callee)
+        if (!path || path.length !== 1) return false
+        if (!V4_MATH_FUNCS.has(path[0]) && !CAST_FNS.has(path[0]) && path[0] !== 'nz') return false
+        return e.args.every((a) => this.isHtfScalarExpr(a.value))
+      }
+      default:
+        return false
+    }
   }
 
   /** Pine 的 `timestamp()`：v4 位置参数形式与字符串形式均交由运行时处理 */

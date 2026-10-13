@@ -135,6 +135,56 @@ export function timePartOf(part: string, ...args: unknown[]): number {
   }
 }
 
+/** 周期文本 → 分桶规则（`60` = 60 分钟、`D` / `1D`、`W`、`M`；裸数字按分钟） */
+function parseTfSpec(tf: string): { fixed?: number; week?: boolean; month?: boolean } | null {
+  const m = /^(\d*)([SmhdWMD]?)$/.exec(tf.trim())
+  if (!m || tf.trim() === '') return null
+  const mult = m[1] ? Number(m[1]) : 1
+  const unit = m[2] || 'm'
+  if (!Number.isFinite(mult) || mult <= 0) return null
+  if (unit === 'M') return { month: true }
+  if (unit === 'W') return { week: true }
+  const unitMs: Record<string, number> = { S: 1000, s: 1000, m: 60_000, h: 3_600_000, D: 86_400_000, d: 86_400_000 }
+  const ms = unitMs[unit]
+  if (!ms) return null
+  return { fixed: ms * mult }
+}
+
+/** 某一时刻所属 HTF 分桶的键（桶内所有 bar 共享同一个键） */
+function bucketKeyOf(ms: number, spec: { fixed?: number; week?: boolean; month?: boolean }): number {
+  if (spec.month) {
+    const d = new Date(ms)
+    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)
+  }
+  if (spec.week) {
+    // Pine 的 W 以周一为起点（epoch 日 0 是周四 → +3 天对齐到周一）
+    const day = Math.floor(ms / 86_400_000)
+    return (Math.floor((day + 3) / 7) * 7 - 3) * 86_400_000
+  }
+  const fixed = spec.fixed as number
+  return Math.floor(ms / fixed) * fixed
+}
+
+/** HTF 数据集：按周期重采样出的 OHLCV 序列 + 每根 LTF bar 所属的桶下标 */
+export interface HtfData {
+  open: number[]
+  high: number[]
+  low: number[]
+  close: number[]
+  volume: number[]
+  time: number[]
+  hl2: number[]
+  hlc3: number[]
+  ohlc4: number[]
+  /** 每根 LTF bar 所属桶的下标（用于「上一根已收盘 HTF bar」对齐） */
+  bucketOf: number[]
+  time_close: number[]
+  time_tradingday: number[]
+}
+
+/** 判断 UTC 时刻是否落在已知的 HTF 分桶规则内（供 codegen 校验字面量周期） */
+export { parseTfSpec as pineTfSpec }
+
 /**
  * 逐 bar 标量的序列写入：把当前 bar 的值写到下标 `i`（中间缺位补 na）。
  * 保证 `arr[i] ≡ bar i 的值`，这样数组可以当作真正的序列交给 `*At` 变体计算。
@@ -143,6 +193,15 @@ export function serSet(arr: unknown[], i: number, v: unknown): void {
   if (!(i >= 0)) return
   while (arr.length < i) arr.push(Number.NaN)
   arr[i] = v
+}
+
+/**
+ * 行内序列读取（`f(...)[k]`）：先把当根 bar 的调用结果写入数组，再按 k 回看。
+ * 与 serSet 共用「下标对齐」语义，缺位一律为 na。
+ */
+export function serRead(arr: unknown[], index: number, k: number, value: unknown): unknown {
+  serSet(arr, index, value)
+  return at(arr, index, k)
 }
 
 /**
@@ -350,6 +409,7 @@ export interface PineRuntime {
   hist: typeof hist
   histOf: typeof histOf
   serSet: typeof serSet
+  serRead: typeof serRead
   timestamp: typeof pineTimestamp
   dayofweek: typeof dayOfWeekOf
   timePart: typeof timePartOf
@@ -369,6 +429,7 @@ export interface PineRuntime {
     isseconds: boolean
     isintraday: boolean
     in_seconds: () => number
+    from_seconds: (sec: unknown) => string
   }
   syminfo: { mintick: number } & Record<string, unknown>
   plot: (store: Record<string, unknown[]>, series: unknown, title: string, index: number) => void
@@ -388,6 +449,11 @@ export interface PineRuntime {
   linefill: Record<string, (...args: unknown[]) => unknown>
   array: Record<string, (...args: unknown[]) => unknown>
   matrix: Record<string, (...args: never[]) => unknown>
+  map: Record<string, (...args: never[]) => unknown>
+  /** HTF（`security()`）重采样序列访问器：`__pine.htf('D').close` */
+  htf: (tf: unknown) => HtfData
+  /** HTF 对齐取值（`lookahead_off` 语义） */
+  htfAt: (arr: unknown, index: number, tf: unknown) => unknown
   cast: Record<string, (v: unknown) => unknown>
 }
 
@@ -415,6 +481,18 @@ export function createRuntime(
     isseconds: tfUnit === 's',
     isintraday: tfUnit === 's' || tfUnit === 'm' || tfUnit === 'h',
     in_seconds: () => tfMult * (tfUnitSec[tfUnit] ?? 3600),
+    /** `timeframe.from_seconds(240)` → 「4h」这类周期字符串（Pine 的常见返回形式） */
+    from_seconds: (sec: unknown): string => {
+      const s = Math.floor(Number(sec))
+      if (!Number.isFinite(s) || s <= 0) return ''
+      if (s === 604800) return '1W'
+      if (s === 2592000) return '1M'
+      if (s === 86400) return '1D'
+      if (s % 86400 === 0) return `${s / 86400}D`
+      if (s % 3600 === 0) return `${s / 3600}h`
+      if (s % 60 === 0) return String(s / 60)
+      return `${s}S`
+    },
   }
 
   const n = candles.length
@@ -650,43 +728,183 @@ export function createRuntime(
     },
   }
 
-  /** `ta.*` 的当前 bar 变体：先按前缀算整条数组，再取下标 */
-  const seriesAt =
-    <A extends unknown[]>(fn: (src: readonly number[], ...rest: A) => readonly (number | boolean)[]) =>
-    (arr: unknown, index: number, ...rest: A): unknown => {
-      if (!Array.isArray(arr) || !Number.isFinite(index) || index < 0) return Number.NaN
-      const out = fn(arr.slice(0, Math.floor(index) + 1), ...rest)
-      return index < out.length ? out[index] : Number.NaN
+  /** HTF 重采样数据集（按周期缓存；`bucketOf[i]` = 第 i 根 LTF bar 所属桶） */
+  const htfCache = new Map<string, HtfData | null>()
+  const emptyHtf: HtfData = {
+    open: [], high: [], low: [], close: [], volume: [], time: [],
+    hl2: [], hlc3: [], ohlc4: [], bucketOf: [], time_close: [], time_tradingday: [],
+  }
+  const htfData = (tf: string): HtfData | null => {
+    if (htfCache.has(tf)) return htfCache.get(tf) ?? null
+    const spec = parseTfSpec(tf)
+    if (!spec) {
+      htfCache.set(tf, null)
+      return null
     }
-
-  const atrAt = (
-    high: unknown,
-    low: unknown,
-    close: unknown,
-    index: number,
-    length: unknown,
-    smoothing?: unknown,
-  ): number => {
-    if (!Array.isArray(high) || !Array.isArray(low) || !Array.isArray(close)) return Number.NaN
-    if (!Number.isFinite(index) || index < 0) return Number.NaN
-    const i = Math.floor(index)
-    const out = taLib.atr(
-      high.slice(0, i + 1),
-      low.slice(0, i + 1),
-      close.slice(0, i + 1),
-      Number(length),
-      (smoothing as 'RMA' | 'SMA' | 'EMA' | 'WMA' | undefined) ?? 'RMA',
-    )
-    return i < out.length ? out[i] : Number.NaN
+    const d: HtfData = {
+      open: [], high: [], low: [], close: [], volume: [], time: [],
+      hl2: [], hlc3: [], ohlc4: [], bucketOf: new Array<number>(n),
+      time_close: [], time_tradingday: [],
+    }
+    const keyToIdx = new Map<number, number>()
+    for (let i = 0; i < n; i++) {
+      const key = bucketKeyOf(timestamp[i], spec)
+      const idx = keyToIdx.get(key)
+      if (idx === undefined) {
+        const j = d.open.length
+        keyToIdx.set(key, j)
+        d.open.push(open[i])
+        d.high.push(high[i])
+        d.low.push(low[i])
+        d.close.push(close[i])
+        d.volume.push(volume[i])
+        d.time.push(key)
+        d.bucketOf[i] = j
+      } else {
+        d.high[idx] = Math.max(d.high[idx], high[i])
+        d.low[idx] = Math.min(d.low[idx], low[i])
+        d.close[idx] = close[i]
+        d.volume[idx] += volume[i]
+        d.bucketOf[i] = idx
+      }
+    }
+    for (let j = 0; j < d.open.length; j++) {
+      d.hl2.push((d.high[j] + d.low[j]) / 2)
+      d.hlc3.push((d.high[j] + d.low[j] + d.close[j]) / 3)
+      d.ohlc4.push((d.open[j] + d.high[j] + d.low[j] + d.close[j]) / 4)
+      d.time_close.push(j + 1 < d.open.length ? d.time[j + 1] : d.time[j] + (spec.fixed ?? 86_400_000))
+      d.time_tradingday.push(d.time[j])
+    }
+    htfCache.set(tf, d)
+    return d
   }
 
-  const trAt = (high: unknown, low: unknown, close: unknown, index: number): number => {
-    if (!Array.isArray(high) || !Array.isArray(low) || !Array.isArray(close)) return Number.NaN
-    if (!Number.isFinite(index) || index < 0) return Number.NaN
-    const i = Math.floor(index)
-    const out = taLib.trueRange(high.slice(0, i + 1), low.slice(0, i + 1), close.slice(0, i + 1))
-    return i < out.length ? out[i] : Number.NaN
+  /** `security()` 的 HTF 序列访问器：`__pine.htf('D').close` */
+  const htf = (tf: unknown): HtfData => htfData(String(tf)) ?? emptyHtf
+
+  /**
+   * HTF 对齐取值：取「当前 bar 所属桶的上一根**已收盘** HTF bar」的值
+   * （对应 `lookahead_off`，与 TradingView 的非重绘语义一致）。
+   */
+  const htfAt = (arr: unknown, index: number, tf: unknown): unknown => {
+    if (!Array.isArray(arr) || !(index >= 0)) return Number.NaN
+    const d = htfData(String(tf))
+    if (!d) return Number.NaN
+    const j = (d.bucketOf[Math.floor(index)] ?? 0) - 1
+    return j >= 0 && j < arr.length ? arr[j] : Number.NaN
   }
+
+  /**
+   * `ta.*` 的当前 bar 变体：按当前 bar 取值。
+   *
+   * 两条路径：
+   *   1. 已知窗口的算子（sma / highest / linreg / change …）：只取「最近 window 个元素」
+   *      重算并取末位 —— 变长数组下也是 O(window)，总代价 O(n·window)；
+   *   2. 递归算子（ema / rma / rsi / hma …）：整数组结果缓存，固定长度数组只算一次。
+   *
+   * 因果型 ta 函数在「整条数组」与「前缀切片」上的第 i 个值一致，
+   * 因此缓存/切片两条路都与逐 bar 语义等价。
+   */
+  const seriesAt = (
+    fn: (src: readonly number[], ...rest: never[]) => readonly (number | boolean)[],
+    window?: { arg: number; extra?: number },
+  ) => {
+    const cache = new WeakMap<object, Map<string, { len: number; out: readonly (number | boolean)[] }>>()
+    return (arr: unknown, index: number, ...rest: never[]): unknown => {
+      if (!Array.isArray(arr) || !Number.isFinite(index) || index < 0) return Number.NaN
+      const i = Math.floor(index)
+      if (window) {
+        const lenRaw = Number(rest[window.arg])
+        if (Number.isFinite(lenRaw) && lenRaw >= 1) {
+          const need = Math.floor(lenRaw) + (window.extra ?? 0)
+          const from = Math.max(0, i + 1 - need)
+          const out = fn(arr.slice(from, i + 1), ...rest)
+          return out.length ? out[out.length - 1] : Number.NaN
+        }
+      }
+      const key = JSON.stringify(rest)
+      const byKey = cache.get(arr)
+      const hit = byKey?.get(key)
+      let out = hit && hit.len === arr.length ? hit.out : undefined
+      if (!out) {
+        out = fn(arr, ...rest)
+        const m = byKey ?? new Map<string, { len: number; out: readonly (number | boolean)[] }>()
+        m.set(key, { len: arr.length, out })
+        if (!byKey) cache.set(arr, m)
+      }
+      return i < out.length ? out[i] : Number.NaN
+    }
+  }
+
+  /** 单序列算子的窗口声明（`arg` = 长度参数在 rest 中的下标；`extra` = 额外需要的历史点数） */
+  const WINDOW_LEN = { arg: 0, extra: 0 }
+  const WINDOW_LEN1 = { arg: 0, extra: 1 }
+
+  /**
+   * 多序列输入的 `*At` 变体（`atrAt` / `trAt` / `sarAt`）：
+   * 参数形态为「若干整条数组 + 当前 bar 下标 + 其余标量」，同样带整数组结果缓存。
+   */
+  const multiAt = (
+    fn: (...args: never[]) => readonly (number | boolean)[],
+    arrayCount: number,
+  ) => {
+    const cache = new WeakMap<object, Map<string, { len: number; out: readonly (number | boolean)[] }>>()
+    return (...args: unknown[]): unknown => {
+      const index = Number(args[arrayCount])
+      if (!Number.isFinite(index) || index < 0) return Number.NaN
+      const arrs = args.slice(0, arrayCount)
+      if (!arrs.every((a) => Array.isArray(a))) return Number.NaN
+      const rest = args.slice(arrayCount + 1)
+      const key = JSON.stringify(rest)
+      const first = arrs[0] as object
+      const len = (arrs[0] as unknown[]).length
+      const byKey = cache.get(first)
+      const hit = byKey?.get(key)
+      let out = hit && hit.len === len ? hit.out : undefined
+      if (!out) {
+        out = fn(...(arrs as never[]), ...(rest as never[]))
+        const m = byKey ?? new Map<string, { len: number; out: readonly (number | boolean)[] }>()
+        m.set(key, { len, out })
+        if (!byKey) cache.set(first, m)
+      }
+      const i = Math.floor(index)
+      return i < out.length ? out[i] : Number.NaN
+    }
+  }
+
+  const atrAt = multiAt(
+    (high, low, close, length, smoothing) =>
+      taLib.atr(
+        high as unknown as number[],
+        low as unknown as number[],
+        close as unknown as number[],
+        Number(length),
+        (smoothing as 'RMA' | 'SMA' | 'EMA' | 'WMA') ?? 'RMA',
+      ),
+    3,
+  )
+
+  const trAt = multiAt(
+    (high, low, close) =>
+      taLib.trueRange(
+        high as unknown as number[],
+        low as unknown as number[],
+        close as unknown as number[],
+      ),
+    3,
+  )
+
+  const sarAt = multiAt(
+    (high, low, start, inc, max) =>
+      taLib.sar(
+        high as unknown as number[],
+        low as unknown as number[],
+        Number(start),
+        Number(inc),
+        Number(max),
+      ),
+    2,
+  )
 
   /**
    * 交叉的当前 bar 变体：`crossunderAt(a, b, i, offA, offB)` 语义为
@@ -713,34 +931,28 @@ export function createRuntime(
 
   const taNs: typeof taLib & TaAtFns = {
     ...taLib,
-    smaAt: seriesAt(taLib.sma),
+    smaAt: seriesAt(taLib.sma, WINDOW_LEN),
     emaAt: seriesAt(taLib.ema),
     rmaAt: seriesAt(taLib.rma),
-    wmaAt: seriesAt(taLib.wma),
-    highestAt: seriesAt(taLib.highest),
-    lowestAt: seriesAt(taLib.lowest),
+    wmaAt: seriesAt(taLib.wma, WINDOW_LEN),
+    highestAt: seriesAt(taLib.highest, WINDOW_LEN),
+    lowestAt: seriesAt(taLib.lowest, WINDOW_LEN),
     hmaAt: seriesAt(taLib.hma),
     almaAt: seriesAt(taLib.alma),
     rsiAt: seriesAt(taLib.rsi),
-    changeAt: seriesAt(taLib.change),
-    momAt: seriesAt(taLib.mom),
-    rocAt: seriesAt(taLib.roc),
-    stdevAt: seriesAt(taLib.stdev),
-    varianceAt: seriesAt(taLib.variance),
-    devAt: seriesAt(taLib.dev),
-    risingAt: seriesAt(taLib.rising),
-    fallingAt: seriesAt(taLib.falling),
+    changeAt: seriesAt(taLib.change, WINDOW_LEN1),
+    momAt: seriesAt(taLib.mom, WINDOW_LEN1),
+    rocAt: seriesAt(taLib.roc, WINDOW_LEN1),
+    stdevAt: seriesAt(taLib.stdev, WINDOW_LEN),
+    varianceAt: seriesAt(taLib.variance, WINDOW_LEN),
+    devAt: seriesAt(taLib.dev, WINDOW_LEN),
+    risingAt: seriesAt(taLib.rising, WINDOW_LEN1),
+    fallingAt: seriesAt(taLib.falling, WINDOW_LEN1),
     stochAt: seriesAt(taLib.stoch),
-    linregAt: seriesAt(taLib.linreg),
+    linregAt: seriesAt(taLib.linreg, WINDOW_LEN),
     barssinceAt: seriesAt(taLib.barssince),
     valuewhenAt: seriesAt(taLib.valuewhen),
-    sarAt: (high: unknown, low: unknown, index: number, start: number, inc: number, max: number) => {
-      if (!Array.isArray(high) || !Array.isArray(low)) return Number.NaN
-      if (!Number.isFinite(index) || index < 0) return Number.NaN
-      const i = Math.floor(index)
-      const out = taLib.sar(high.slice(0, i + 1), low.slice(0, i + 1), start, inc, max)
-      return i < out.length ? out[i] : Number.NaN
-    },
+    sarAt,
     /** dmi / mfi 的元组或标量结果按下标取（i 落在 tupleIdx 指定的那一项上） */
     dmiAt: (
       high: unknown,
@@ -849,6 +1061,110 @@ export function createRuntime(
       is_triangular: (): boolean => true,
       is_stochastic: (m: unknown): boolean =>
         rowsOf(m).every((row) => row.every((v) => num(v) >= 0 && num(v) <= 1)),
+      trace: (m: unknown): number => {
+        const a = rowsOf(m)
+        return a.reduce<number>((s, row, i) => s + num(row[i]), 0)
+      },
+      /** 行列式（高斯消元，复杂度 O(n³)） */
+      det: (m: unknown): number => {
+        const a = rowsOf(m).map((row) => row.map(num))
+        const n = a.length
+        if (n === 0 || a.some((row) => row.length !== n)) return Number.NaN
+        let det = 1
+        for (let c = 0; c < n; c++) {
+          let pivot = c
+          for (let r = c + 1; r < n; r++) {
+            if (Math.abs(a[r][c]) > Math.abs(a[pivot][c])) pivot = r
+          }
+          if (a[pivot][c] === 0) return 0
+          if (pivot !== c) {
+            const tmp = a[pivot]
+            a[pivot] = a[c]
+            a[c] = tmp
+            det = -det
+          }
+          det *= a[c][c]
+          for (let r = c + 1; r < n; r++) {
+            const f = a[r][c] / a[c][c]
+            for (let k = c; k < n; k++) a[r][k] -= f * a[c][k]
+          }
+        }
+        return det
+      },
+      /** 逆矩阵（Gauss-Jordan；奇异矩阵返回 na 占位） */
+      inv: (m: unknown): unknown => {
+        const a = rowsOf(m).map((row) => row.map(num))
+        const n = a.length
+        if (n === 0 || a.some((row) => row.length !== n)) return Number.NaN
+        const aug = a.map((row, i) => [
+          ...row,
+          ...Array.from({ length: n }, (_, j) => (i === j ? 1 : 0)),
+        ])
+        for (let c = 0; c < n; c++) {
+          let pivot = c
+          for (let r = c + 1; r < n; r++) {
+            if (Math.abs(aug[r][c]) > Math.abs(aug[pivot][c])) pivot = r
+          }
+          if (aug[pivot][c] === 0) return Number.NaN
+          const tmp = aug[pivot]
+          aug[pivot] = aug[c]
+          aug[c] = tmp
+          const pv = aug[c][c]
+          for (let k = 0; k < 2 * n; k++) aug[c][k] /= pv
+          for (let r = 0; r < n; r++) {
+            if (r === c) continue
+            const f = aug[r][c]
+            if (f === 0) continue
+            for (let k = 0; k < 2 * n; k++) aug[r][k] -= f * aug[c][k]
+          }
+        }
+        return aug.map((row) => row.slice(n))
+      },
+      /** 秩（对行阶梯形非零行计数） */
+      rank: (m: unknown): number => {
+        const a = rowsOf(m).map((row) => row.map(num))
+        const rows = a.length
+        const cols = a[0]?.length ?? 0
+        let rank = 0
+        for (let c = 0; c < cols && rank < rows; c++) {
+          let pivot = -1
+          for (let r = rank; r < rows; r++) {
+            if (a[r][c] !== 0) {
+              pivot = r
+              break
+            }
+          }
+          if (pivot < 0) continue
+          const tmp = a[pivot]
+          a[pivot] = a[rank]
+          a[rank] = tmp
+          for (let r = rank + 1; r < rows; r++) {
+            const f = a[r][c] / a[rank][c]
+            if (f === 0) continue
+            for (let k = c; k < cols; k++) a[r][k] -= f * a[rank][k]
+          }
+          rank++
+        }
+        return rank
+      },
+      /** 整数幂（快速幂） */
+      pow: (m: unknown, n: unknown): unknown => {
+        let e = Math.floor(Number(n))
+        if (!Number.isFinite(e) || e < 0) return Number.NaN
+        const multiply = ns.multiply as (x: unknown, y: unknown) => unknown
+        let base: unknown = m
+        let out: unknown = null
+        while (e > 0) {
+          if (e & 1) out = out === null ? base : multiply(out, base)
+          base = multiply(base, base)
+          e >>= 1
+        }
+        if (out === null) {
+          const a = rowsOf(m)
+          out = a.map((row, i) => row.map((_, j) => (i === j ? 1 : 0)))
+        }
+        return out
+      },
     }
     // 其余矩阵算子（逆/特征/分解等）：回测不消费，统一返回 na 占位
     return new Proxy(ns, {
@@ -859,6 +1175,60 @@ export function createRuntime(
           void args
           return Number.NaN
         }
+      },
+    }) as Record<string, (...args: never[]) => unknown>
+  })()
+
+  /** `map.*`：以 JS Map 承载（Pine 的 map 保持插入序、键唯一） */
+  const mapNs = (() => {
+    const asMap = (m: unknown): Map<unknown, unknown> => (m instanceof Map ? m : new Map())
+    const ns: Record<string, (...args: never[]) => unknown> = {
+      new: (): Map<unknown, unknown> => new Map(),
+      put: (m: unknown, k: unknown, v: unknown): void => {
+        asMap(m).set(k, v)
+      },
+      get: (m: unknown, k: unknown): unknown => {
+        const map = asMap(m)
+        return map.has(k) ? map.get(k) : Number.NaN
+      },
+      contains: (m: unknown, k: unknown): boolean => asMap(m).has(k),
+      remove: (m: unknown, k: unknown): void => {
+        asMap(m).delete(k)
+      },
+      clear: (m: unknown): void => {
+        asMap(m).clear()
+      },
+      size: (m: unknown): number => asMap(m).size,
+      keys: (m: unknown): unknown[] => [...asMap(m).keys()],
+      values: (m: unknown): unknown[] => [...asMap(m).values()],
+      copy: (m: unknown): Map<unknown, unknown> => new Map(asMap(m)),
+      /** 反向查键：第一个值相等的键，找不到返回 na */
+      keyof: (m: unknown, v: unknown): unknown => {
+        for (const [k, val] of asMap(m)) {
+          if (Object.is(val, v) || (Number.isNaN(Number(v)) && Number.isNaN(Number(val)))) return k
+        }
+        return Number.NaN
+      },
+      /** 反向查键（起点版本，Pine v6 的 map.keyof(map, value, occurrence)） */
+      keyof_occurrence: (m: unknown, v: unknown, occ: unknown): unknown => {
+        const want = Math.max(0, Math.floor(Number(occ) || 0))
+        let seen = 0
+        for (const [k, val] of asMap(m)) {
+          if (Object.is(val, v)) {
+            if (seen === want) return k
+            seen++
+          }
+        }
+        return Number.NaN
+      },
+    }
+    // v4/v5 的遗留构造器（`map.new_float_float()` 等）与未实现算子
+    return new Proxy(ns, {
+      get: (target, prop) => {
+        if (typeof prop !== 'string') return undefined
+        if (prop in target) return target[prop]
+        if (prop.startsWith('new')) return (): Map<unknown, unknown> => new Map()
+        return (): unknown => Number.NaN
       },
     }) as Record<string, (...args: never[]) => unknown>
   })()
@@ -881,6 +1251,7 @@ export function createRuntime(
     hist,
     histOf,
     serSet,
+    serRead,
     timestamp: pineTimestamp,
     dayofweek: dayOfWeekOf,
     timePart: timePartOf,
@@ -888,6 +1259,9 @@ export function createRuntime(
     arrClear,
     ta: taNs,
     matrix: matrixNs,
+    map: mapNs,
+    htf,
+    htfAt,
     math: mathNs,
     str: {
       tostring: (v: unknown, fmt?: unknown): string => {

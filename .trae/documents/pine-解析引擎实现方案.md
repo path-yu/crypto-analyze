@@ -602,9 +602,74 @@ apiRouter.post('/pine/backtest', async (req, res) => {
 
 ### 13.6 下一步（TODO，按优先级）
 
-1. `request.security(...)` 的内联表达式做 `[k]`：需要给「多行/内联序列表达式」建立临时序列缓冲
-   （Ichimoku 剩余 2 条）；
-2. HTF / 多标的 `security()` 真取值（含 `lookahead` 语义）；
-3. 逐 bar 标量跟踪数组的 O(n²) 优化（按 bar 增量计算，长周期回测提速）；
-4. `map.*` 命名空间与 `matrix.*` 的重型算子（逆 / 特征值 / 分解）；
-5. 条件赋值身位下的环形缓冲语义（当前按「写入时推入」，与 Pine 的「每 bar 值」存在偏差）。
+> 本轮（§14）已完成的项在此标注 ✅；剩余项顺延到 §14.5。
+
+1. ✅ `request.security(...)` 的内联表达式做 `[k]`：已由「行内序列缓冲」实现（见 §14.1）；
+2. ✅ HTF / 多标的 `security()` 真取值：字面量周期 + 纯序列表达式已走真重采样（见 §14.4）；
+3. ✅ 逐 bar 标量跟踪数组的 O(n²) 优化：窗口算子改 O(window) 重算、递归算子整数组缓存（见 §14.3）；
+4. ✅ `map.*` 命名空间与 `matrix.*` 的重型算子（det / inv / rank / pow / trace，见 §14.3）；
+5. ✅ 条件赋值身位下的环形缓冲语义：逐 bar 标量改「下标对齐数组」（见 §14.2）。
+
+## 14. M11 —— 语料收口：行内序列 / 历史容器 / 性能 / map·matrix / HTF security
+
+### 14.1 行内序列缓冲（`f(...)[k]`）
+
+`request.security(sym, tf, f_regime()[1])` 这类「调用结果被 `[k]` 引用」此前直接报错。
+现在按**位置键**（`line:col`）为每个这样的表达式分配一条模块级数组 `__is_N`，
+读取处生成 `__pine.serRead(__is_N, __index, k, <调用>)`：先写入当根结果再按 k 回看，
+与 `serSet` 共用「下标对齐、缺位为 na」的语义。
+
+- 效果：`Ichimoku.pine` 的 2 条错误清零，`server/pine/` 语料 **7/7 编译 + 运行通过**。
+
+### 14.2 历史容器归属（消除环形缓冲漂移）
+
+逐 bar 标量（C 类）的 `[k]` 原先走「写入时 push」的环形缓冲：若某根 bar 没有写入
+（条件赋值身位），`x[1]` 会静默读到更早的值。现在改为：
+
+| 变量类型 | 容器 | 语义 |
+| --- | --- | --- |
+| 逐 bar 标量（C 类） | `__s_<name>` 下标对齐数组（`serSet`） | `at(arr, i, k)` = 第 i-k 根的值，缺位 na |
+| `var` 状态 | `__h_<name>` 环形缓冲，step 序言逐 bar 推入 | 跨 bar 保持、可 `[k]` 回看 |
+| 函数形参 / 函数局部 | 调用点透传数组 / `__hf_*` 环形缓冲 | 见 §13.2 |
+| `strategy.*` 成员 | `__hm_*` 环形缓冲（序言推入） | `position_size[k]` 等 |
+
+### 14.3 性能与命名空间
+
+- **窗口算子**（sma / wma / highest / lowest / stdev / variance / dev / change / mom / roc /
+  rising / falling / linreg）：`*At` 只取「最近 window 个元素」重算并取末位 → 变长数组下
+  O(window)，整体 O(n·window)；`change/mom/roc/rising/falling` 额外多取 1 个历史点。
+- **递归算子**（ema / rma / rsi / hma / alma / mfi / stoch / barssince / valuewhen 等）：
+  整数组结果按「数组 + 参数」缓存（数组变长时自动失效），固定长度数组（`C.*` / 预计算）只算一次。
+- **`f(...)[k]` 走标量 `*At` + 下标偏移**（`taAtCall(call, fn, '(__index - k)')`），
+  不再每次读都重算整条数组。
+- `map.*`：以 JS Map 承载（`new/put/get/contains/remove/clear/size/keys/values/copy/keyof`），
+  遗留构造器（`map.new_float_float()` 等）由 Proxy 兜底。
+- `matrix.*` 新增 **det / trace / inv / rank / pow**（其余重型算子仍按 na 降级）。
+- `timeframe.from_seconds(sec)`；泛型调用支持多类型实参（`map.new<string, float>()`）。
+
+### 14.4 真 HTF 取值（`security` / `request.security`）
+
+当**周期是字面量**（`"D"` / `"60"` / `"240"` / `"1W"` / `"1M"` …）且取数表达式只依赖
+内置序列与初始化期常量时，改为真重采样：
+
+- 运行时按周期对当前 K 线分桶（`D`/`W`/`M` 用 UTC 日历边界，其余按固定毫秒），
+  生成 HTF 域的 OHLCV / hl2 / hlc3 / ohlc4 数组与「每根 LTF bar 所属桶」映射；
+- 取数表达式在 HTF 域整数组求值（`ta.ema(close, 20)` → 对重采样后的 close 序列求 EMA），
+  再按 `__pine.htfAt(arr, __index, tf)` 读「上一根**已收盘** HTF bar」的值；
+- 标量表达式（`close > open`、`(high+low)/2`）则逐标识符走同一对齐；
+- 明确不支持：`lookahead = barmerge.lookahead_on`（会引入未来数据，仍按降级处理并给警告）、
+  动态周期（`timeframe.period` / input 周期）、多标的（symbol 参数仍被忽略）。
+
+### 14.5 验收与本轮之后的 TODO
+
+- [x] `server/pine/tv` 16 个 TradingView 开源脚本：编译 + 逐 bar 运行 **16/16**
+- [x] `server/pine` 本地脚本（含 Ichimoku / SwiftEdge GEX）：**7/7**（6000 根 K 线下同样全绿）
+- [x] 新增 M10 回归 4 条（HTF 重采样对齐 / 行内序列 / map·matrix / 多类型实参泛型），`npm test` **71/71 通过**
+
+剩余 TODO（按优先级）：
+
+1. 多标的 `security()`（`BITFINEX:BTCUSD` 等）真取数：需要第二份行情数据源与对齐；
+2. `lookahead_on` 的开发中（developing）取值语义；
+3. 递归算子（ema/rsi/hma 等）在变长数组上的增量递推（当前每 bar 仍需 O(i) 重算）；
+4. 绘图对象的真实产出（当前 `line/label/box/table` 为执行但不出图）；
+5. `request.*` 其余成员（`security_lower_tf` / `dividends` / `earnings` 等）。
