@@ -210,6 +210,7 @@ export default function KLinePanel({
             takeProfit1: t.takeProfit1,
             takeProfit2: t.takeProfit2,
             entryPrice: t.entryPrice,
+            exitPrice: t.exitPrice,
             showLevels,
           },
           lock: true,
@@ -262,9 +263,11 @@ export default function KLinePanel({
           )}
           <Tooltip
             title={
-              result?.meta.strategy === 'supertrend'
-                ? '主图绿/红线为 SuperTrend 上下轨（up/dn）；三角标注每笔交易的入场方向与盈亏'
-                : '主图蓝/红线为斐波那契 0.5 回撤趋势线（imba_trend_line），副图为 TSOT 趋势强度；红绿三角标注每笔交易的入场方向与盈亏'
+              (result?.meta.strategy === 'supertrend'
+                ? '主图绿/红线为 SuperTrend 上下轨（up/dn）；'
+                : '主图蓝/红线为斐波那契 0.5 回撤趋势线（imba_trend_line），副图为 TSOT 趋势强度；') +
+              '三角标注每笔交易的入场方向与盈亏；' +
+              '蓝线为该笔入场价、红/绿线为出场价（按盈亏着色），线间淡色区域为持仓区间'
             }
           >
             <InfoOutlinedIcon sx={{ fontSize: 15, color: 'text.secondary' }} />

@@ -248,6 +248,47 @@ function mintickDigits(tickSize: number): number {
   return Math.min(12, Math.max(0, Math.ceil(-Math.log10(tickSize))))
 }
 
+/**
+ * Pine 周期文本 → 秒。
+ *
+ * 约定与 TradingView 一致：纯数字表示**分钟**（"60" = 1 小时），
+ * 另有 "15S"（秒）、"4h"（小时）、"1D"（日）、"1W"（周）、"1M"（月，大写）。
+ * 解析失败时回落到 fallback（通常是当前图表周期）。
+ */
+function timeframeTextToSeconds(text: unknown, fallbackSec: number): number {
+  const raw = String(text ?? '').trim()
+  if (!raw) return fallbackSec
+  const m = /^(\d*)([smhdwSMDW])?$/.exec(raw)
+  if (!m) return fallbackSec
+  const mult = m[1] ? Number(m[1]) : 1
+  const unit = m[2]
+  if (!unit) return mult * 60
+  const unitSec: Record<string, number> = {
+    s: 1,
+    S: 1,
+    m: 60,
+    h: 3600,
+    d: 86400,
+    D: 86400,
+    w: 604800,
+    W: 604800,
+    M: 2592000,
+  }
+  const sec = unitSec[unit]
+  return sec === undefined ? fallbackSec : mult * sec
+}
+
+/** 秒 → Pine 周期文本，与 timeframeTextToSeconds 可往返 */
+function secondsToTimeframeText(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds))
+  if (!Number.isFinite(s) || s <= 0) return '1'
+  if (s % 2592000 === 0) return `${s / 2592000}M`
+  if (s % 604800 === 0) return `${s / 604800}W`
+  if (s % 86400 === 0) return `${s / 86400}D`
+  if (s < 60) return `${s}S`
+  return `${Math.round(s / 60)}`
+}
+
 /* ------------------------------------------------------------------ */
 /* 运行时工厂                                                          */
 /* ------------------------------------------------------------------ */
@@ -263,6 +304,18 @@ export interface PineRuntimeOptions {
 
 /** `*At` 变体的统一签名：序列参数用整条数组传入，另给当前 bar 下标 */
 type AtFn = (...args: never[]) => unknown
+
+/**
+ * 交叉的「直接取值」签名：`(当前A, 上一根A, 当前B, 上一根B) => boolean`。
+ * 用于操作数拿不到整条序列的场景（`var` 变量、条件赋值的顶层标量），
+ * 由生成代码先用环形缓冲取出四个数值再判定穿越。
+ */
+export type CrossValsFn = (
+  curA: unknown,
+  prevA: unknown,
+  curB: unknown,
+  prevB: unknown,
+) => boolean
 
 /**
  * 「多序列 → 元组/序列」的 ta 函数，返回第 tupleIdx 项在当前 bar 的取值。
@@ -323,6 +376,10 @@ export interface TaAtFns {
   crossoverAt: AtFn
   crossunderAt: AtFn
   crossAt: AtFn
+  /** 直接给「当前/上一根」四个数值的交叉判断（见 CrossValsFn） */
+  crossoverVals: CrossValsFn
+  crossunderVals: CrossValsFn
+  crossVals: CrossValsFn
 }
 
 export interface PineRuntime {
@@ -368,7 +425,14 @@ export interface PineRuntime {
     multiplier: number
     isseconds: boolean
     isintraday: boolean
-    in_seconds: () => number
+    isminutes: boolean
+    isdaily: boolean
+    isweekly: boolean
+    ismonthly: boolean
+    /** 不传参取当前周期秒数；传入周期文本（"240" / "1D"…）取该周期的秒数 */
+    in_seconds: (tf?: unknown) => number
+    /** 秒数 → 周期文本（与 in_seconds 可往返） */
+    from_seconds: (seconds: unknown) => string
   }
   syminfo: { mintick: number } & Record<string, unknown>
   plot: (store: Record<string, unknown[]>, series: unknown, title: string, index: number) => void
@@ -405,16 +469,26 @@ export function createRuntime(
   const digits = mintickDigits(tick)
   // timeframe.*：period 用请求里的真实周期，衍生字段按同一份周期换算
   const tfText = opts.timeframe && opts.timeframe.trim() ? opts.timeframe.trim() : '1h'
-  const tfMatch = /^(\d*)([smhdW])$/.exec(tfText)
-  const tfUnitSec: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400, W: 604800 }
-  const tfUnit = tfMatch ? tfMatch[2] : 'h'
-  const tfMult = tfMatch && tfMatch[1] ? Number(tfMatch[1]) : 1
+  const tfSec = timeframeTextToSeconds(tfText, 3600)
+  const tfMatch = /^(\d*)([smhdwSMDW])?$/.exec(tfText)
+  const tfUnitRaw = tfMatch?.[2] ?? ''
+  const tfMult = tfMatch?.[1] ? Number(tfMatch[1]) : 1
   const timeframeNs = {
     period: tfText,
     multiplier: tfMult,
-    isseconds: tfUnit === 's',
-    isintraday: tfUnit === 's' || tfUnit === 'm' || tfUnit === 'h',
-    in_seconds: () => tfMult * (tfUnitSec[tfUnit] ?? 3600),
+    isseconds: tfUnitRaw === 's' || tfUnitRaw === 'S',
+    isintraday: ['s', 'S', 'm', 'h'].includes(tfUnitRaw) || tfUnitRaw === '',
+    isminutes: tfUnitRaw === 'm' || tfUnitRaw === '',
+    isdaily: tfUnitRaw === 'd' || tfUnitRaw === 'D',
+    isweekly: tfUnitRaw === 'w' || tfUnitRaw === 'W',
+    ismonthly: tfUnitRaw === 'M',
+    /** `timeframe.in_seconds()` 取当前周期；`timeframe.in_seconds("240")` 取指定周期的秒数 */
+    in_seconds: (tf?: unknown) =>
+      tf === undefined || tf === null || tf === ''
+        ? tfSec
+        : timeframeTextToSeconds(tf, tfSec),
+    /** `timeframe.from_seconds(14400)` → "240"（分钟数写法，与 in_seconds 可往返） */
+    from_seconds: (seconds: unknown) => secondsToTimeframeText(Number(seconds)),
   }
 
   const n = candles.length
@@ -711,6 +785,25 @@ export function createRuntime(
       return up || down
     }
 
+  /**
+   * 交叉的「直接取值」变体：四个数值由调用方提供（数组或环形缓冲取出的当前/上一根值）。
+   * 判定口径与 crossAt 完全一致：na 一律为 false。
+   */
+  const crossVals =
+    (kind: 'crossover' | 'crossunder' | 'cross') =>
+    (curA: unknown, prevA: unknown, curB: unknown, prevB: unknown): boolean => {
+      if (isNa(curA) || isNa(prevA) || isNa(curB) || isNa(prevB)) return false
+      const a0 = Number(curA)
+      const a1 = Number(prevA)
+      const b0 = Number(curB)
+      const b1 = Number(prevB)
+      const up = a0 > b0 && a1 <= b1
+      const down = a0 < b0 && a1 >= b1
+      if (kind === 'crossover') return up
+      if (kind === 'crossunder') return down
+      return up || down
+    }
+
   const taNs: typeof taLib & TaAtFns = {
     ...taLib,
     smaAt: seriesAt(taLib.sma),
@@ -766,6 +859,9 @@ export function createRuntime(
     crossoverAt: crossAt('crossover'),
     crossunderAt: crossAt('crossunder'),
     crossAt: crossAt('cross'),
+    crossoverVals: crossVals('crossover'),
+    crossunderVals: crossVals('crossunder'),
+    crossVals: crossVals('cross'),
   }
 
   /** 矩阵：以「行数列数 + 一维数据」表示的极简实现（回测常用算子） */

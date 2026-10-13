@@ -1,0 +1,372 @@
+//@version=6
+indicator("Supreme Buy/Sell Signal Indicator V2 by chaitu50c", shorttitle="Supreme V2", overlay=true, max_boxes_count=500, max_labels_count=500)
+
+// =========================================================================
+// INPUT SETTINGS
+// =========================================================================
+
+grp_mode = "Trading Mode"
+en_scalping = input.bool(false, title="Enable Scalping?", group=grp_mode, tooltip="ON: Shows live target boxes and colors the full trend for quick trades.\nOFF: Waits for deeper moves and draws strict stop-loss lines.")
+
+en_slope_filter = en_scalping
+en_sl_blocking  = not en_scalping
+
+grp_targets = "Target System (Active only when Scalping is ON)"
+en_targets = input.bool(true, title="Show Live Target Boxes & Labels", group=grp_targets)
+rr1 = input.float(1.0, "Target 1 — Risk/Reward", minval=0.0, step=0.5, group=grp_targets)
+rr2 = input.float(2.0, "Target 2 — Risk/Reward", minval=0.0, step=0.5, group=grp_targets)
+rr3 = input.float(3.0, "Target 3 — Risk/Reward", minval=0.0, step=0.5, group=grp_targets)
+
+grp_visuals = "Visual Settings"
+buy_color    = input.color(color.new(#089981, 0), title="Buy Signal Color", group=grp_visuals)
+sell_color   = input.color(color.new(#f23645, 0), title="Sell Signal Color", group=grp_visuals)
+en_bar_color = input.bool(true, title="Enable Bar Coloring", group=grp_visuals, tooltip="Colors the candles. In Scalping mode, it paints the whole trend. When OFF, it only paints the specific candle that breaks the stop-loss line.")
+en_static_sl = input.bool(true, title="Enable Static SL & Gray Drawdown", group=grp_visuals, tooltip="Draws a starting line for the trend. If price moves backward and crosses this line, the candles turn gray to warn you. Only works when Scalping is ON.")
+
+// =========================================================================
+// CANDLE STATE CALCULATION
+// =========================================================================
+
+same_session = not session.isfirstbar
+
+is_green = close > open
+is_red   = close < open
+
+prev_green = is_green[1]
+prev_red   = is_red[1]
+prev_high  = high[1]
+prev_low   = low[1]
+
+combo_low  = math.min(low, prev_low)
+combo_high = math.max(high, prev_high)
+
+// =========================================================================
+// LOGIC CALCULATION (CORE CONTINUATION)
+// =========================================================================
+
+raw_buy  = same_session and prev_green and is_green and (close > prev_high)
+raw_sell = same_session and prev_red and is_red and (close < prev_low)
+
+// =========================================================================
+// STATE FILTERING & MEMORY (SLOPE)
+// =========================================================================
+
+var int signal_state = 0
+var float last_buy_price = na
+var float last_sell_price = na
+
+if session.isfirstbar
+    signal_state    := 0
+    last_buy_price  := na
+    last_sell_price := na
+
+valid_buy  = raw_buy and signal_state != 1
+valid_sell = raw_sell and signal_state != -1
+
+mem_buy = valid_buy
+if en_slope_filter and not na(last_buy_price)
+    mem_buy := valid_buy and (close > last_buy_price)
+
+mem_sell = valid_sell
+if en_slope_filter and not na(last_sell_price)
+    mem_sell := valid_sell and (close < last_sell_price)
+
+if valid_buy
+    signal_state   := 1
+    last_buy_price := close
+else if valid_sell
+    signal_state    := -1
+    last_sell_price := close
+
+// =========================================================================
+// STOP-LOSS BLOCKING & BREAKOUT LOGIC
+// =========================================================================
+
+var float active_sl = na
+var int sl_type = 0 
+
+if session.isfirstbar
+    active_sl := na
+    sl_type   := 0
+
+break_buy_sl  = (sl_type == 1) and (close < active_sl)
+break_sell_sl = (sl_type == -1) and (close > active_sl)
+
+if break_buy_sl
+    active_sl := na
+    sl_type   := 0
+else if break_sell_sl
+    active_sl := na
+    sl_type   := 0
+
+allow_plot = not en_sl_blocking or na(active_sl)
+
+final_buy  = mem_buy and allow_plot
+final_sell = mem_sell and allow_plot
+
+if final_buy and en_sl_blocking
+    active_sl := combo_low
+    sl_type   := 1
+else if final_sell and en_sl_blocking
+    active_sl := combo_high
+    sl_type   := -1
+
+// =========================================================================
+// STATIC BASELINE LOGIC (ONLY ACTIVE WHEN SCALPING IS ON)
+// =========================================================================
+
+var float static_sl = na
+var int static_sl_type = 0
+
+if session.isfirstbar
+    static_sl := na
+    static_sl_type := 0
+
+if not en_sl_blocking
+    if final_buy and static_sl_type != 1
+        static_sl := combo_low
+        static_sl_type := 1
+    else if final_sell and static_sl_type != -1
+        static_sl := combo_high
+        static_sl_type := -1
+else
+    static_sl := na
+    static_sl_type := 0
+
+// =========================================================================
+// TARGET SYSTEM (ACTIVE WHEN SCALPING IS ON)
+// =========================================================================
+
+var float live_entry = na
+var float live_sl = na
+var float live_tp1 = na
+var float live_tp2 = na
+var float live_tp3 = na
+
+var int live_dir = 0
+var int live_start = na
+var bool live_active = false
+var int live_end_idx = na
+
+var float trade_high = na
+var float trade_low = na
+var float max_sl_heat = na
+
+var bool tp1_reached = false
+
+bool is_new_buy  = final_buy and live_dir != 1
+bool is_new_sell = final_sell and live_dir != -1
+
+if session.isfirstbar
+    live_active := false
+    live_dir := 0
+    tp1_reached := false
+
+if is_new_buy and not en_sl_blocking
+    live_dir := 1
+    live_entry := close
+    live_sl := combo_low
+    float risk = math.max(math.abs(close - live_sl), syminfo.mintick)
+    float tp1_base = risk * rr1
+    float tp2_base = tp1_base + (risk * (rr2 - rr1))
+    float tp3_base = tp1_base + (risk * (rr3 - rr1))
+    live_tp1 := close + tp1_base
+    live_tp2 := close + tp2_base
+    live_tp3 := close + tp3_base
+    live_start := bar_index
+    live_active := true
+    live_end_idx := bar_index + 4
+    trade_high := close
+    trade_low := close
+    max_sl_heat := -math.max(math.abs(close - live_sl), syminfo.mintick)
+    tp1_reached := false
+
+if is_new_sell and not en_sl_blocking
+    live_dir := -1
+    live_entry := close
+    live_sl := combo_high
+    float risk = math.max(math.abs(close - live_sl), syminfo.mintick)
+    float tp1_base = risk * rr1
+    float tp2_base = tp1_base + (risk * (rr2 - rr1))
+    float tp3_base = tp1_base + (risk * (rr3 - rr1))
+    live_tp1 := close - tp1_base
+    live_tp2 := close - tp2_base
+    live_tp3 := close - tp3_base
+    live_start := bar_index
+    live_active := true
+    live_end_idx := bar_index + 4
+    trade_high := close
+    trade_low := close
+    max_sl_heat := -math.max(math.abs(close - live_sl), syminfo.mintick)
+    tp1_reached := false
+
+if live_active and not en_sl_blocking
+    trade_high := math.max(trade_high, high)
+    trade_low := math.min(trade_low, low)
+    
+    if bar_index > live_start and not tp1_reached
+        float sl_dist = live_dir == 1 ? (live_sl - low) : (high - live_sl)
+        max_sl_heat := math.max(max_sl_heat, sl_dist)
+        
+    if (live_dir == 1 and final_sell) or (live_dir == -1 and final_buy)
+        live_active := false
+
+bool hitTP1 = false
+bool hitTP2 = false
+bool hitTP3 = false
+
+if live_dir != 0 and not (is_new_buy or is_new_sell) and not en_sl_blocking
+    if live_dir == 1
+        hitTP1 := trade_high >= live_tp1
+        hitTP2 := trade_high >= live_tp2
+        hitTP3 := trade_high >= live_tp3
+    else if live_dir == -1
+        hitTP1 := trade_low <= live_tp1
+        hitTP2 := trade_low <= live_tp2
+        hitTP3 := trade_low <= live_tp3
+        
+    if hitTP1
+        tp1_reached := true
+        
+    if live_active
+        live_end_idx := bar_index + 4
+
+var box box_sl = box.new(na, na, na, na)
+var box box_tp = box.new(na, na, na, na)
+
+var label lbl_tp3 = label.new(na, na)
+var label lbl_tp2 = label.new(na, na)
+var label lbl_tp1 = label.new(na, na)
+var label lbl_entry = label.new(na, na)
+var label lbl_sl = label.new(na, na)
+
+if live_dir != 0 and en_targets and not en_sl_blocking
+    color c_sl_bg = color.new(color.red, 85)
+    color c_tp_bg = color.new(color.green, 85)
+    
+    float sl_pts = math.abs(live_entry - live_sl)
+    float tp1_pts = math.abs(live_tp1 - live_entry)
+    float tp2_pts = math.abs(live_tp2 - live_entry)
+    float tp3_pts = math.abs(live_tp3 - live_entry)
+    
+    box.set_lefttop(box_sl, live_start, live_entry)
+    box.set_rightbottom(box_sl, live_end_idx, live_sl)
+    box.set_bgcolor(box_sl, c_sl_bg)
+    box.set_border_color(box_sl, color.new(color.red, 100))
+    
+    box.set_lefttop(box_tp, live_start, live_tp3)
+    box.set_rightbottom(box_tp, live_end_idx, live_entry)
+    box.set_bgcolor(box_tp, c_tp_bg)
+    box.set_border_color(box_tp, color.new(color.green, 100))
+    
+    string tp3_text = "TP3 ▸ " + str.tostring(live_tp3, format.mintick) + " (+" + str.tostring(tp3_pts, format.mintick) + ")" + (hitTP3 ? " ✔" : "")
+    label.set_xy(lbl_tp3, live_end_idx, live_tp3)
+    label.set_text(lbl_tp3, tp3_text)
+    label.set_color(lbl_tp3, color.new(color.green, 10))
+    label.set_style(lbl_tp3, label.style_label_left)
+    label.set_textcolor(lbl_tp3, color.white)
+    label.set_size(lbl_tp3, size.small)
+    
+    string tp2_text = "TP2 ▸ " + str.tostring(live_tp2, format.mintick) + " (+" + str.tostring(tp2_pts, format.mintick) + ")" + (hitTP2 ? " ✔" : "")
+    label.set_xy(lbl_tp2, live_end_idx, live_tp2)
+    label.set_text(lbl_tp2, tp2_text)
+    label.set_color(lbl_tp2, color.new(color.green, 10))
+    label.set_style(lbl_tp2, label.style_label_left)
+    label.set_textcolor(lbl_tp2, color.white)
+    label.set_size(lbl_tp2, size.small)
+    
+    string tp1_text = "TP1 ▸ " + str.tostring(live_tp1, format.mintick) + " (+" + str.tostring(tp1_pts, format.mintick) + ")" + (hitTP1 ? " ✔" : "")
+    label.set_xy(lbl_tp1, live_end_idx, live_tp1)
+    label.set_text(lbl_tp1, tp1_text)
+    label.set_color(lbl_tp1, color.new(color.green, 10))
+    label.set_style(lbl_tp1, label.style_label_left)
+    label.set_textcolor(lbl_tp1, color.white)
+    label.set_size(lbl_tp1, size.small)
+    
+    label.set_xy(lbl_entry, live_end_idx, live_entry)
+    label.set_text(lbl_entry, "Entry ▸ " + str.tostring(live_entry, format.mintick))
+    label.set_color(lbl_entry, color.new(color.green, 30))
+    label.set_style(lbl_entry, label.style_label_left)
+    label.set_textcolor(lbl_entry, color.white)
+    label.set_size(lbl_entry, size.small)
+    
+    string dyn_sl_text = ""
+    color sl_label_color = color.new(color.red, 20)
+    color sl_text_color = color.white
+    
+    if live_active and not tp1_reached
+        float live_dist = live_dir == 1 ? (live_sl - close) : (close - live_sl)
+        string sign = live_dist > 0 ? "+" : ""
+        dyn_sl_text := " ≈ [" + sign + str.tostring(live_dist, format.mintick) + "]"
+        bool is_in_drawdown = (live_dir == 1 and close < live_entry) or (live_dir == -1 and close > live_entry)
+        if is_in_drawdown
+            sl_label_color := color.new(color.yellow, 20)
+            sl_text_color := color.black
+    else
+        string sign = max_sl_heat > 0 ? "+" : ""
+        dyn_sl_text := " ≈ [" + sign + str.tostring(max_sl_heat, format.mintick) + "]"
+        
+    label.set_xy(lbl_sl, live_end_idx, live_sl)
+    label.set_text(lbl_sl, "✗ SL ▸ " + str.tostring(live_sl, format.mintick) + " (-" + str.tostring(sl_pts, format.mintick) + ")" + dyn_sl_text)
+    label.set_color(lbl_sl, sl_label_color)
+    label.set_style(lbl_sl, label.style_label_left)
+    label.set_textcolor(lbl_sl, sl_text_color)
+    label.set_size(lbl_sl, size.small)
+else
+    box.set_lefttop(box_sl, na, na)
+    box.set_lefttop(box_tp, na, na)
+    label.set_xy(lbl_tp3, na, na)
+    label.set_xy(lbl_tp2, na, na)
+    label.set_xy(lbl_tp1, na, na)
+    label.set_xy(lbl_entry, na, na)
+    label.set_xy(lbl_sl, na, na)
+
+// =========================================================================
+// PLOTTING & VISUALS
+// =========================================================================
+
+var int visual_state = 0
+if session.isfirstbar
+    visual_state := 0
+
+bool plot_buy  = final_buy
+bool plot_sell = final_sell
+
+if en_scalping
+    plot_buy  := final_buy and visual_state != 1
+    plot_sell := final_sell and visual_state != -1
+
+if final_buy
+    visual_state := 1
+else if final_sell
+    visual_state := -1
+
+plotshape(plot_buy ? low : na, title="Buy Signal", location=location.belowbar, color=buy_color, style=shape.triangleup, size=size.tiny)
+plotshape(plot_sell ? high : na, title="Sell Signal", location=location.abovebar, color=sell_color, style=shape.triangledown, size=size.tiny)
+
+plot(active_sl, title="Active Stop Loss Line", color=sl_type == 1 ? color.new(buy_color, 40) : sl_type == -1 ? color.new(sell_color, 40) : na, style=plot.style_linebr, linewidth=2)
+plot(en_static_sl and not en_sl_blocking ? static_sl : na, title="Static Baseline SL", color=static_sl_type == 1 ? color.new(buy_color, 20) : static_sl_type == -1 ? color.new(sell_color, 20) : na, style=plot.style_linebr, linewidth=2)
+
+paint_green = break_sell_sl and not final_buy
+paint_red   = break_buy_sl and not final_sell
+is_gray     = en_static_sl and not en_sl_blocking and ((static_sl_type == 1 and close < static_sl) or (static_sl_type == -1 and close > static_sl))
+
+color b_color = na
+if en_bar_color
+    if en_sl_blocking
+        b_color := paint_green ? buy_color : paint_red ? sell_color : na
+    else
+        b_color := visual_state == 1 ? buy_color : visual_state == -1 ? sell_color : na
+        
+        if is_gray
+            b_color := color.gray
+
+barcolor(b_color, title="Bar Color")
+
+// =========================================================================
+// ALERTS
+// =========================================================================
+
+alertcondition(plot_buy, title="Buy Signal Triggered", message="A Buy condition was met on {{ticker}}.")
+alertcondition(plot_sell, title="Sell Signal Triggered", message="A Sell condition was met on {{ticker}}.")
+alertcondition(break_sell_sl or break_buy_sl, title="SL Line Broken", message="An active Stop Loss line was broken on {{ticker}}.")

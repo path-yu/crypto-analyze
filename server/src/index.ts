@@ -48,7 +48,7 @@ if (fs.existsSync(webDist)) {
       .status(200)
       .type('html')
       .send(
-        '<h1>Crypto Fib Trend Reversals</h1><p>前端尚未构建。请在项目根目录运行 <code>npm run dev</code> 启动 Vite 开发服务器，或 <code>npm run build</code> 生成 web/dist。</p>',
+        '<h1>Crypto Fib Trend Reversals</h1><p>前端尚未构建。请在项目根目录运行 <code>pnpm dev</code> 启动 Vite 开发服务器，或 <code>pnpm build</code> 生成 web/dist。</p>',
       )
   })
 }

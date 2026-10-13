@@ -13,10 +13,10 @@
  * 把 session.isfirstbar 替换为 (bar_index == 0) 后再比，用来判断差异是否全部由它引起。
  *
  * 用法：
- *   npm run compare:pinets
- *   npm run compare:pinets -- --bars 800
- *   npm run compare:pinets -- --live --symbol BTC/USDT:USDT --timeframe 1h --bars 3000
- *   npm run compare:pinets -- --pine server/pine/test.pine
+ *   pnpm compare:pinets
+ *   pnpm compare:pinets --bars 800
+ *   pnpm compare:pinets --live --symbol BTC/USDT:USDT --timeframe 1h --bars 3000
+ *   pnpm compare:pinets --pine server/pine/test.pine
  *
  * 退出码：无实质差异 → 0；存在实质差异 → 1。
  */

@@ -3,7 +3,7 @@
  * 用途：确认该日 02:00 那根 bar 上到底出现几次同向信号，
  *       从而判断金字塔加仓能否生效。
  *
- * 用法：npx tsx scripts/probe-signals.ts
+ * 用法：pnpm exec tsx scripts/probe-signals.ts
  */
 import { fetchKlines } from '../server/src/market/exchange'
 import { DEFAULT_STRATEGY_PARAMS } from '../shared/types'

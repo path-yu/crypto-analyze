@@ -8,7 +8,7 @@
  *   #78 做多 10:00 → 11:00
  * 而本项目改造前只有 2 笔（#35 空、#36 多）。
  *
- * 用法：npx tsx scripts/check-pyramiding.ts [pyramiding]
+ * 用法：pnpm exec tsx scripts/check-pyramiding.ts [pyramiding]
  */
 import { fetchKlines } from '../server/src/market/exchange'
 import { DEFAULT_STRATEGY_PARAMS, TIMEFRAME_MS, type Candle, type Timeframe } from '../shared/types'

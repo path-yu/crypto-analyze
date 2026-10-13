@@ -38,6 +38,13 @@ export interface StrategySignalCore {
   obTakeProfit?: number
   /** 信号风险（用于计算保本触发价） */
   obRisk?: number
+  /**
+   * Pine 的 `strategy.entry(..., qty=…)`：脚本显式指定的下单量（张数 / 币数）。
+   *
+   * 给了它就按固定数量下单（盈亏 = 数量 × 价差，不随权益复利放大），
+   * 与 TradingView 的 qty 口径一致；杠杆只影响占用保证金。
+   */
+  entryQty?: number
   /** Pine 的 `strategy.close_all` → 本根收盘后排队、下一根开盘市价平仓 */
   forceClose?: boolean
 }
@@ -177,6 +184,8 @@ interface PendingEntry {
   takeProfit?: number
   /** 订单块：信号风险（正数），用于按实际成交价推导保本触发价 */
   risk?: number
+  /** Pine：脚本通过 `strategy.entry(qty=…)` 指定的固定下单量 */
+  qty?: number
 }
 
 /** 说明性注释，尽量与 Pine 中 strategy.close 的注释文案对齐 */
@@ -187,6 +196,7 @@ export const EXIT_COMMENT: Record<ExitReason, string> = {
   BreakEven: 'BE',
   Reverse: 'Reversing',
   TrendSwitch: 'Trend Switch Close',
+  ScriptClose: 'Script Close',
   Liquidation: 'Liquidation',
   TimeStop: 'Time stop',
   EndOfData: 'Backtest End',
@@ -296,22 +306,35 @@ class BacktestEngine {
      * 与 `breakEven`（第一目标成交后移动止损）是两套独立机制。
      */
     beTrigger?: number,
+    /**
+     * Pine 的 `strategy.entry(..., qty=…)`：固定下单量。
+     * 给了它就用「数量 × 价格」作为名义价值，不再按权益比例复利放大。
+     */
+    fixedQty?: number,
   ): void {
     if (!Number.isFinite(price) || price <= 0) return
-    const margin = this.cash * this.sizeFraction
-    if (margin <= 0) return
-    const notional = margin * this.leverage
-    const qty = notional / price
+    const fixed = typeof fixedQty === 'number' && Number.isFinite(fixedQty) && fixedQty > 0
+    const marginCap = this.cash * this.sizeFraction
+    if (!fixed && marginCap <= 0) return
+    const notional = fixed ? (fixedQty as number) * price : marginCap * this.leverage
+    const margin = fixed ? notional / this.leverage : marginCap
+    const qty = fixed ? (fixedQty as number) : notional / price
+    // 固定数量时按 TradingView 的口径做资金校验：保证金不足则本轮不下单
+    if (fixed && margin > this.cash) return
     const entryFee = notional * this.feeRate
     if (this.cash - entryFee <= 0) return
 
     this.cash -= entryFee
 
-    const liquidationPrice = this.params.checkLiquidation
-      ? side === 'long'
-        ? price * (1 - 1 / this.leverage)
-        : price * (1 + 1 / this.leverage)
-      : Number.NaN
+    // Pine 脚本按 TradingView 的现货/无杠杆口径撮合：不引入强平。
+    // （TradingView 的 strategy() 没有保证金模型，加进来只会制造差异，
+    //   例如无止损的持仓被 1 倍杠杆公式在 2 倍价处"强平"。）
+    const liquidationPrice =
+      this.params.checkLiquidation && this.params.strategy !== 'pine'
+        ? side === 'long'
+          ? price * (1 - 1 / this.leverage)
+          : price * (1 + 1 / this.leverage)
+        : Number.NaN
 
     const sub: SubOrder = {
       side,
@@ -437,6 +460,8 @@ class BacktestEngine {
       fee: totalFee,
       netPnl,
       pnlPercent: sub.margin > 0 ? (netPnl / sub.margin) * 100 : 0,
+      // 平仓成交已在 reduceSubOrder 里结算进 cash，此处即「本笔了结后的账户余额」
+      balanceAfter: this.cash,
       priceChangePercent: ((exitPrice - sub.entryPrice) / sub.entryPrice) * 100 * sign,
       maxFavorableExcursion: sub.mfePercent,
       maxAdverseExcursion: sub.maePercent,
@@ -497,11 +522,16 @@ class BacktestEngine {
       pending.displayStopLoss,
       // 保本触发价用「实际成交价 ± 风险×beAtR」计算（对齐 avg + longRisk*beAtR）
       this.resolveBeTrigger(pending, price),
+      // Pine 脚本显式指定的固定下单量（若有）
+      pending.qty,
     )
   }
 
   /** 计算保本触发价：成交价 ± 风险 × beAtR（多单在开仓价上方触发，空单在下方） */
   private resolveBeTrigger(pending: PendingEntry, fillPrice: number): number {
+    // Pine 脚本的保本由脚本自己用 strategy.exit 更新止损实现，
+    // 引擎不代为移动（否则等于给脚本外加了一套保本逻辑）。
+    if (this.params.strategy === 'pine') return Number.NaN
     if (pending.risk === undefined || !Number.isFinite(pending.risk)) return Number.NaN
     const cfg = this.params.orderBlock
     if (!cfg.useBE || !(cfg.beAtR > 0)) return Number.NaN
@@ -730,9 +760,9 @@ class BacktestEngine {
       }
       const sig = series.signals[i]
 
-      // Pine：strategy.close_all(comment="Time stop") → 收盘判定、下一根开盘市价平仓
+      // Pine：strategy.close(id) / strategy.close_all() → 当根收盘判定，下一根开盘市价平仓
       if (params.strategy === 'pine' && sig.forceClose && this.position && !this.pendingExit) {
-        this.pendingExit = 'TimeStop'
+        this.pendingExit = 'ScriptClose'
       }
 
       // A2. 订单块：保本触发（等价于 Pine 在收盘时更新 longStop/shortStop）
@@ -835,6 +865,11 @@ class BacktestEngine {
         // 订单块：区域回踩信号 → 下一根开盘市价进场，同时挂出
         // 区域止损（stop）与固定盈亏比目标（limit），二者构成 OCO；整仓离场。
         const inPos = this.position !== null
+        // Pine 脚本可以用 strategy.entry(qty=…) 指定固定下单量（订单块策略不带该字段）
+        const entryQty =
+          Number.isFinite(sig.entryQty ?? NaN) && (sig.entryQty as number) > 0
+            ? (sig.entryQty as number)
+            : undefined
         if (wantLong && !inPos && this.canAddSameDirection('long', true)) {
           const stopLoss = Number.isFinite(sig.obStopLoss ?? NaN) ? (sig.obStopLoss as number) : NaN
           const takeProfit = Number.isFinite(sig.obTakeProfit ?? NaN)
@@ -842,9 +877,21 @@ class BacktestEngine {
             : NaN
           const risk = Number.isFinite(sig.obRisk ?? NaN) ? (sig.obRisk as number) : undefined
           if (this.fillNextBarOpen) {
-            this.pendingEntry = { side: 'long', stopLoss, takeProfit, risk }
+            this.pendingEntry = { side: 'long', stopLoss, takeProfit, risk, qty: entryQty }
           } else {
-            this.addSubOrder('long', bar.close, i, bar.timestamp, stopLoss, NaN, takeProfit, NaN, NaN)
+            this.addSubOrder(
+              'long',
+              bar.close,
+              i,
+              bar.timestamp,
+              stopLoss,
+              NaN,
+              takeProfit,
+              NaN,
+              NaN,
+              NaN,
+              entryQty,
+            )
           }
         } else if (wantShort && !inPos && this.canAddSameDirection('short', true)) {
           const stopLoss = Number.isFinite(sig.obStopLoss ?? NaN) ? (sig.obStopLoss as number) : NaN
@@ -853,9 +900,21 @@ class BacktestEngine {
             : NaN
           const risk = Number.isFinite(sig.obRisk ?? NaN) ? (sig.obRisk as number) : undefined
           if (this.fillNextBarOpen) {
-            this.pendingEntry = { side: 'short', stopLoss, takeProfit, risk }
+            this.pendingEntry = { side: 'short', stopLoss, takeProfit, risk, qty: entryQty }
           } else {
-            this.addSubOrder('short', bar.close, i, bar.timestamp, stopLoss, NaN, takeProfit, NaN, NaN)
+            this.addSubOrder(
+              'short',
+              bar.close,
+              i,
+              bar.timestamp,
+              stopLoss,
+              NaN,
+              takeProfit,
+              NaN,
+              NaN,
+              NaN,
+              entryQty,
+            )
           }
         }
       } else {
@@ -886,7 +945,13 @@ class BacktestEngine {
       }
 
       // C2. 订单块：时间止损（收盘判定 → 下一根开盘市价平仓）
-      if (params.exitStrategy === 'Zone OCO' && this.position) {
+      //     仅对原生订单块策略生效：Pine 脚本的离场完全由脚本自身决定
+      //     （strategy.exit / close / close_all），引擎不再附加时间止损。
+      if (
+        params.exitStrategy === 'Zone OCO' &&
+        params.strategy !== 'pine' &&
+        this.position
+      ) {
         const maxBars = params.orderBlock.maxBars
         if (maxBars > 0) {
           const alive = this.position.subs.find((s) => this.isAlive(s))

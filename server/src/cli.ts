@@ -2,8 +2,8 @@
  * 命令行回测 —— 无需前端即可跑一遍策略并打印报告。
  *
  * 用法示例：
- *   npm run backtest -- --symbol BTC/USDT:USDT --timeframe 1h --bars 5000 --leverage 5
- *   npm run backtest -- --symbol ETH/USDT:USDT --timeframe 15m --since 2025-01-01 --exit "Fixed Percent"
+ *   pnpm backtest --symbol BTC/USDT:USDT --timeframe 1h --bars 5000 --leverage 5
+ *   pnpm backtest --symbol ETH/USDT:USDT --timeframe 15m --since 2025-01-01 --exit "Fixed Percent"
  */
 
 import fs from 'node:fs'

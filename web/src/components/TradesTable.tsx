@@ -28,7 +28,14 @@ import { EXIT_REASON_LABEL, dateTime, money, num, pct, price } from '../utils/fo
 import { UP_COLOR, DOWN_COLOR } from '../theme'
 import { tradesToCsv } from '../utils/report'
 
-type SortKey = 'id' | 'entryTime' | 'netPnl' | 'pnlPercent' | 'barsHeld' | 'priceChangePercent'
+type SortKey =
+  | 'id'
+  | 'entryTime'
+  | 'netPnl'
+  | 'pnlPercent'
+  | 'balanceAfter'
+  | 'barsHeld'
+  | 'priceChangePercent'
 
 const REASON_COLOR: Record<string, string> = {
   TP1: UP_COLOR,
@@ -37,7 +44,9 @@ const REASON_COLOR: Record<string, string> = {
   BreakEven: '#8a94a6',
   Reverse: '#ffb01f',
   TrendSwitch: '#5b8cff',
+  ScriptClose: '#5b8cff',
   Liquidation: '#ff2244',
+  TimeStop: '#ffb01f',
   EndOfData: '#8a94a6',
 }
 
@@ -113,6 +122,7 @@ export default function TradesTable({ result }: { result: BacktestResult }) {
     { key: 'priceChangePercent', label: '价格变动', align: 'right' },
     { key: 'netPnl', label: '净盈亏', align: 'right' },
     { key: 'pnlPercent', label: '收益率', align: 'right' },
+    { key: 'balanceAfter', label: '余额', align: 'right' },
     { key: 'barsHeld', label: '持仓', align: 'right' },
     { key: null, label: '平仓原因', align: 'center' },
   ]
@@ -216,6 +226,12 @@ export default function TradesTable({ result }: { result: BacktestResult }) {
                   <TableCell align="right" sx={{ color, fontWeight: 600 }}>
                     {pct(t.pnlPercent)}
                   </TableCell>
+                  <TableCell
+                    align="right"
+                    sx={{ fontVariantNumeric: 'tabular-nums', color: 'text.secondary' }}
+                  >
+                    {money(t.balanceAfter)}
+                  </TableCell>
                   <TableCell align="right">{t.barsHeld}</TableCell>
                   <TableCell align="center">
                     <Chip
@@ -315,6 +331,7 @@ export default function TradesTable({ result }: { result: BacktestResult }) {
                   ['杠杆', `${detail.leverage}x`],
                   ['手续费', money(detail.fee)],
                   ['毛利润', money(detail.grossPnl)],
+                  ['平仓后余额', money(detail.balanceAfter)],
                   ['最大有利幅度', `${num(detail.maxFavorableExcursion, 2)}%`],
                   ['最大不利幅度', `${num(detail.maxAdverseExcursion, 2)}%`],
                   ['平仓说明', detail.comment],

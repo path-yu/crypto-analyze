@@ -19,8 +19,16 @@
 - **导出**：交易明细 CSV、HTML 回测报告
 - **Pine 脚本策略（`pine`）**：粘贴 / 载入 `.pine` 源码，后端实时编译为 TypeScript 并在沙箱中执行，逐根 K 线产出信号后交给同一套撮合引擎；支持 `strategy.entry/exit` 与 `indicator` + `plotshape` 两种驱动方式
 - **脚本编辑器**：CodeMirror 6 + 自写 Pine v6 语法高亮（注释 / 字符串 / 颜色字面量 / 关键字 / 类型 / 内置命名空间 / 运算符），可在右侧 Drawer 弹窗中放大编辑
-- **脚本本地保存**：编辑器内命名保存，落盘到 `.cache/pine-scripts.json`；已保存脚本直接出现在「策略」下拉菜单里，选中即载入并实时编译
-- **CLI 回测** 与一批诊断脚本（`npm run diag:*`、`npm run pine`、`npm run compare:pinets`）
+- **脚本本地保存**：编辑器内命名保存，**每个脚本单独一个文件夹**，源码与编译产物放在一起（便于直接进 git）：
+
+  ```
+  server/pine/<脚本名>/
+    <脚本名>.pine    原始 Pine 源码
+    <脚本名>.ts      编译器生成的 TypeScript
+  ```
+
+  另有 `.cache/pine-scripts.json` 作为索引（记录 id / 名称 / 时间 / 目录名）；索引丢失时会扫描 `server/pine/` 下已有的脚本目录重建列表。已保存脚本直接出现在「策略」下拉菜单里，选中即载入并实时编译
+- **CLI 回测** 与一批诊断脚本（`pnpm diag:*`、`pnpm pine`、`pnpm compare:pinets`）
 
 ## 技术栈
 
@@ -33,29 +41,30 @@
 
 ## 快速开始
 
-要求 Node.js >= 20。
+要求 Node.js >= 20，包管理器统一用 **pnpm**（版本已在 `package.json` 的 `packageManager` 里锁定为 `pnpm@11.17.0`，corepack 会自动切换）：
 
 ```bash
-npm install
-npm run dev          # 同时启动 API(8787) 与 Vite 前端(5273)
+corepack enable      # 首次使用：让 corepack 接管 pnpm 版本
+pnpm install
+pnpm dev             # 同时启动 API(8787) 与 Vite 前端(5273)
 ```
 
 打开 http://localhost:5273 即可使用。
 
 ```bash
-npm run dev:prod     # 构建前端产物后启动（生产模式预览）
-npm run build        # 类型检查 + 构建 web/dist
-npm start            # 生产模式启动（由 Express 托管 web/dist）
-npm test             # 运行指标/引擎单元测试
-npm run typecheck    # 前后端类型检查
-npm run clean:cache  # 清理 K 线缓存（每个品种/周期保留最新 3 个；加 -- --all 全部清空）
+pnpm dev:prod       # 构建前端产物后启动（生产模式预览）
+pnpm build          # 类型检查 + 构建 web/dist
+pnpm start          # 生产模式启动（由 Express 托管 web/dist）
+pnpm test           # 运行指标/引擎/落盘等单元测试
+pnpm typecheck      # 前后端类型检查
+pnpm clean:cache    # 清理 K 线缓存（每个品种/周期保留最新 3 个；加 --all 全部清空）
 ```
 
 命令行回测（无需前端）：
 
 ```bash
-npm run backtest -- --symbol BTC/USDT:USDT --timeframe 1h --bars 5000 --leverage 5
-npm run backtest -- --symbol ETH/USDT:USDT --timeframe 15m --since 2025-01-01 --exit "Fixed Percent"
+pnpm backtest --symbol BTC/USDT:USDT --timeframe 1h --bars 5000 --leverage 5
+pnpm backtest --symbol ETH/USDT:USDT --timeframe 15m --since 2025-01-01 --exit "Fixed Percent"
 ```
 
 环境变量：
@@ -105,7 +114,7 @@ scripts/                     开发启动与诊断脚本
 | POST | `/api/pine/compile` | 实时编译 Pine 源码，返回 TS 产物、诊断与元信息（编辑器打字时调用） |
 | POST | `/api/pine/backtest` | Pine 脚本回测（额外携带 `source` / `inputs`） |
 | GET | `/api/pine/examples` | 内置示例脚本（`server/pine/*.pine`） |
-| GET / POST / DELETE | `/api/pine/scripts` | 已保存脚本的列表 / 保存（同名即更新）/ 删除 |
+| GET / POST / DELETE | `/api/pine/scripts` | 已保存脚本的列表 / 保存（同名即更新，写 `server/pine/<目录>/` 下的 `.pine` + `.ts`）/ 删除 |
 
 ## 策略参数
 
@@ -167,8 +176,8 @@ Node **不会**自动使用系统的 Internet 选项代理（浏览器会使用�
 优先级：`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` 环境变量 → Windows 系统代理（WinINET，即浏览器用的那个）。
 
 ```bash
-HTTPS_PROXY=http://127.0.0.1:7890 npm run dev   # 显式指定
-DISABLE_PROXY=1 npm run dev                     # 强制直连（本地代理未启动时）
+HTTPS_PROXY=http://127.0.0.1:7890 pnpm dev   # 显式指定
+DISABLE_PROXY=1 pnpm dev                     # 强制直连（本地代理未启动时）
 ```
 
 启动日志会打印当前生效的代理：
@@ -187,7 +196,7 @@ DISABLE_PROXY=1 npm run dev                     # 强制直连（本地代理未
 
 行情按「ccxt 实时接口 → Binance Vision 归档 → 本地缓存」的顺序获取，缓存位于 `.cache/klines/`（已在 .gitignore 中忽略，属运行时数据、**故意不进版本库**）。全程只使用公开行情接口，无需 API Key。
 
-缓存策略：文件名形如 `<数据源>_<品种>_<周期>_<起始>_<结束>.json`，时间按周期取整；读取时只要已有文件**覆盖**请求区间且尾部足够新（同一根 K 线内）就直接复用，不会因为 `until = 当前时间` 的毫秒漂移而反复新建文件。同一「数据源 + 品种 + 周期」最多保留 3 个文件（写入时自动淘汰旧的），也可随时执行 `npm run clean:cache` 手动清理。若需要绝对最新的数据（例如刚收盘的那根 K 线），清理缓存或在请求里传 `useCache: false` 跳过缓存即可。
+缓存策略：文件名形如 `<数据源>_<品种>_<周期>_<起始>_<结束>.json`，时间按周期取整；读取时只要已有文件**覆盖**请求区间且尾部足够新（同一根 K 线内）就直接复用，不会因为 `until = 当前时间` 的毫秒漂移而反复新建文件。同一「数据源 + 品种 + 周期」最多保留 3 个文件（写入时自动淘汰旧的），也可随时执行 `pnpm clean:cache` 手动清理。若需要绝对最新的数据（例如刚收盘的那根 K 线），清理缓存或在请求里传 `useCache: false` 跳过缓存即可。
 
 ## 免责声明
 

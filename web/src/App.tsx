@@ -55,6 +55,14 @@ const STRATEGY_LABEL: Record<StrategyKind, string> = {
   pine: 'Pine 脚本',
 }
 
+/** 顶栏大标题用的完整策略名（比 Chip 里的短名更长，便于一眼看出当前策略） */
+const STRATEGY_TITLE: Record<StrategyKind, string> = {
+  'fib-trend': 'Fibonacci Trend Reversals',
+  supertrend: 'SuperTrend STRATEGY',
+  'order-block': 'Volume Order Block Retest',
+  pine: 'Pine 脚本',
+}
+
 /** 收起后只保留的窄轨宽度 */
 const PANEL_RAIL_W = 44
 /** 面板展开时的宽度范围（拖拽把手在该区间内调节） */
@@ -194,11 +202,16 @@ export default function App() {
     [pineScripts],
   )
 
-  /** 保存当前源码：同名即更新，落盘后刷新列表并选中这一份 */
+  /**
+   * 保存当前源码：同名即更新。
+   * 落盘到 `server/pine/<脚本名目录>/`，源码 .pine 与编译产物 .ts 同目录存放，
+   * 保存后刷新列表并选中这一份；返回值供编辑器提示具体路径。
+   */
   const handleSavePine = useCallback(async () => {
     const saved = await savePineScript(pineName.trim(), pineSource)
     await refreshPineScripts()
     setPineScriptId(saved.id)
+    return saved
   }, [pineName, pineSource, refreshPineScripts])
 
   /** 删除当前载入的脚本（编辑器里的源码保留） */
@@ -251,6 +264,14 @@ export default function App() {
 
   const report = result?.report
   const strategyLabel = result ? STRATEGY_LABEL[result.meta.strategy] : ''
+  /**
+   * 顶栏标题：跟随左侧「策略」下拉实时切换（不必等回测完成）。
+   * Pine 脚本用当前脚本名，未命名时回落到「Pine 脚本」。
+   */
+  const strategyTitle =
+    params.strategy === 'pine'
+      ? pineName.trim() || STRATEGY_TITLE.pine
+      : STRATEGY_TITLE[params.strategy]
   const headline = report
     ? `${strategyLabel} · ${report.symbol} ${report.timeframe} · ${report.leverage}x · ${money(
         report.initialCapital,
@@ -286,7 +307,7 @@ export default function App() {
               <InsightsIcon sx={{ color: 'primary.main' }} />
               <Box>
                 <Typography variant="h6" sx={{ fontSize: 17, lineHeight: 1.2 }}>
-                  Fibonacci Trend Reversals
+                  {strategyTitle}
                 </Typography>
                 <Typography variant="caption" color="text.secondary">
                   ccxt 公开合约行情 · TypeScript 回测引擎 · KLineChart 可视化

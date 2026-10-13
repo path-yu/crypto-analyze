@@ -8,9 +8,9 @@
  *      自动退化为内置迷你走势图与纯文本输出，不影响核心链路的验证。
  *
  * 用法：
- *   npx tsx scripts/test-ccxt-example.ts                 # 默认 okx / BTC/USD / 15m
- *   npx tsx scripts/test-ccxt-example.ts okx ETH/USDT 1h
- *   npx tsx scripts/test-ccxt-example.ts binance BTC/USDT 1h
+ *   pnpm exec tsx scripts/test-ccxt-example.ts                 # 默认 okx / BTC/USD / 15m
+ *   pnpm exec tsx scripts/test-ccxt-example.ts okx ETH/USDT 1h
+ *   pnpm exec tsx scripts/test-ccxt-example.ts binance BTC/USDT 1h
  */
 
 import { execSync } from 'node:child_process'
@@ -188,7 +188,7 @@ async function main(): Promise<void> {
   if (missing.length > 0) {
     console.log(
       `未安装的展示依赖：${missing.join(', ')}（已用内置降级方案替代）。` +
-        `\n如需 1:1 运行原示例：npm i -D ${missing.join(' ')}`,
+        `\n如需 1:1 运行原示例：pnpm add -D ${missing.join(' ')}`,
     )
   }
   if (typeof (ccxt as unknown as { okx?: unknown }).okx === 'function') {
@@ -214,7 +214,7 @@ main()
           ? `  · 走的是代理 ${proxy}，但连接仍失败：确认代理进程在运行、端口正确（或改用 HTTPS_PROXY=... 指定）`
           : '  · 疑似网络不可达：若浏览器能打开该交易所而这里不行，多半是代理问题 ——\n' +
             '    Node 默认不使用 Windows 系统代理，可显式指定：\n' +
-            '      HTTPS_PROXY=http://127.0.0.1:7890 npx tsx scripts/test-ccxt-example.ts okx BTC/USDT 15m',
+            '      HTTPS_PROXY=http://127.0.0.1:7890 pnpm exec tsx scripts/test-ccxt-example.ts okx BTC/USDT 15m',
       )
       console.error('  · 也可换一家可达的交易所对比，例如 gate / bybit / bitget')
       console.error('  · 或放宽超时：TIMEOUT_MS=60000')

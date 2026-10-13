@@ -35,6 +35,11 @@ export interface PineSignal {
   obStopLoss: number
   obTakeProfit: number
   obRisk: number
+  /**
+   * `strategy.entry(..., qty=…)` 指定的下单量（张数 / 币数）。
+   * NaN = 脚本未指定，由引擎按「仓位比例 × 杠杆」决定。
+   */
+  entryQty?: number
   /** `strategy.close_all()` → 引擎下一根开盘市价平仓 */
   forceClose?: boolean
 }
@@ -67,6 +72,7 @@ export function emptyPineSignal(): PineSignal {
     obStopLoss: Number.NaN,
     obTakeProfit: Number.NaN,
     obRisk: Number.NaN,
+    entryQty: Number.NaN,
   }
 }
 

@@ -1366,3 +1366,164 @@ test('M8: v4 裸内置函数 / input / security / timestamp 编译零 error 且�
     )
   }
 })
+
+/* ================================================================== */
+/* M10 历史引用补全：函数调用 f(...)[k] / var 口径 / 类型限定符 / 周期换算 */
+/* ================================================================== */
+
+test('M10: 用户函数调用结果的 [k] 历史引用与 Pine 一致（f(...)[k]）', () => {
+  const src = [
+    '//@version=6',
+    'indicator("fnhist")',
+    'f() =>',
+    '    close * 3',
+    'g(v) =>',
+    '    v * 2',
+    'plot(f()[1], title="A")',
+    'plot(g(close)[1], title="B")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm10-fnhist.pine' })
+  assert.deepEqual(comp.diagnostics.filter((d) => d.severity === 'error'), [])
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+
+  assert.ok(isNa(Number(program.plots['A'][0])), '第 0 根应为 na')
+  for (let i = 1; i < candles.length; i++) {
+    const prev = candles[i - 1].close
+    assert.ok(
+      Math.abs(Number(program.plots['A'][i]) - prev * 3) < 1e-9,
+      `bar=${i} f()[1]: ${program.plots['A'][i]} ≠ ${prev * 3}`,
+    )
+    assert.ok(
+      Math.abs(Number(program.plots['B'][i]) - prev * 2) < 1e-9,
+      `bar=${i} g(close)[1]: ${program.plots['B'][i]} ≠ ${prev * 2}`,
+    )
+  }
+})
+
+test('M10: 实参无法在 bar 顶部求值时给出明确报错，而不是静默算错', () => {
+  const src = [
+    '//@version=6',
+    'indicator("unsafe")',
+    'f(v) =>',
+    '    v * 2',
+    'y = close',
+    'z = f(y)[1]',
+    'plot(z)',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm10-unsafe.pine' })
+  const errors = comp.diagnostics.filter((d) => d.severity === 'error')
+  assert.equal(errors.length, 1, JSON.stringify(comp.diagnostics))
+  assert.match(errors[0].message, /历史引用仅支持/)
+})
+
+test('M10: var 变量的 [k] 与 Pine 一致（首根 na，其后取上一根的值）', () => {
+  const src = [
+    '//@version=6',
+    'indicator("varhist")',
+    'var float x = 0.0',
+    'x := close',
+    'plot(x[1], title="V")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm10-varhist.pine' })
+  assert.deepEqual(comp.diagnostics.filter((d) => d.severity === 'error'), [])
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+
+  assert.ok(isNa(Number(program.plots['V'][0])), '第 0 根没有上一根，应为 na')
+  for (let i = 1; i < candles.length; i++) {
+    const expected = candles[i - 1].close
+    assert.ok(
+      Math.abs(Number(program.plots['V'][i]) - expected) < 1e-9,
+      `bar=${i} x[1]: ${program.plots['V'][i]} ≠ ${expected}`,
+    )
+  }
+})
+
+test('M10: 类型限定符形参（series float / simple int）可编译且数值正确', () => {
+  const src = [
+    '//@version=6',
+    'indicator("typed")',
+    'f(series float data, simple int n) =>',
+    '    data * n',
+    'plot(f(close, 3), title="V")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm10-typed.pine' })
+  assert.deepEqual(comp.diagnostics.filter((d) => d.severity === 'error'), [])
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+  for (let i = 0; i < candles.length; i++) {
+    const expected = candles[i].close * 3
+    assert.ok(
+      Math.abs(Number(program.plots['V'][i]) - expected) < 1e-9,
+      `bar=${i}: ${program.plots['V'][i]} ≠ ${expected}`,
+    )
+  }
+})
+
+test('M10: timeframe.from_seconds 与 in_seconds(tf) 可往返', () => {
+  const src = [
+    '//@version=6',
+    'indicator("tf")',
+    'plot(timeframe.in_seconds(timeframe.from_seconds(14400)), title="A")',
+    'plot(timeframe.in_seconds("240"), title="B")',
+    'plot(timeframe.in_seconds("1D"), title="C")',
+    'plot(timeframe.in_seconds(), title="D")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm10-tf.pine' })
+  assert.deepEqual(comp.diagnostics.filter((d) => d.severity === 'error'), [])
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, { timeframe: '1h' })
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+
+  assert.equal(Number(program.plots['A'][5]), 14400, '4h 往返')
+  assert.equal(Number(program.plots['B'][5]), 14400, '"240" = 240 分钟')
+  assert.equal(Number(program.plots['C'][5]), 86400, '"1D"')
+  assert.equal(Number(program.plots['D'][5]), 3600, '当前图表周期 1h')
+})
+
+/* ================================================================== */
+/* M11 交叉族：操作数是 var / 条件赋值标量时也要按「穿越」判定，而非当前 bar 比较 */
+/* ================================================================== */
+
+test('M11: crossover/crossunder 的操作数为 var 变量时按真实穿越判定', () => {
+  const src = [
+    '//@version=6',
+    'indicator("x")',
+    'var float up = na',
+    'var float dn = na',
+    'if bar_index == 2',
+    '    up := 103.0',
+    '    dn := 99.0',
+    'plot(ta.crossover(close, up) ? 1 : 0, title="X")',
+    'plot(ta.crossunder(close, dn) ? 1 : 0, title="Y")',
+  ].join('\n')
+  const comp = compilePine(src, { sourceName: 'm11-cross-var.pine' })
+  const diags = comp.diagnostics.filter((d) => d.severity === 'error' || d.severity === 'warning')
+  assert.deepEqual(diags, [], '不应再有「参数无法映射为序列」的警告')
+  assert.match(comp.ts, /crossoverVals/, '应走环形缓冲的取值通路')
+
+  const candles = synthCandles()
+  const program = runPineProgram(comp.ts, candles, {})
+  for (let i = 0; i < candles.length; i++) program.step(i, FLAT_CTX as never)
+
+  // 参考实现：水平线在第 2 根被设为 103 / 99，之后保持不变；
+  // 该根上 `up[1]` / `dn[1]` 仍为 na，按 Pine 语义不构成穿越。
+  const expectUp: number[] = []
+  const expectDn: number[] = []
+  for (let i = 3; i < candles.length; i++) {
+    const cur = candles[i].close
+    const prev = candles[i - 1].close
+    if (cur > 103 && prev <= 103) expectUp.push(i)
+    if (cur < 99 && prev >= 99) expectDn.push(i)
+  }
+  assert.ok(expectUp.length > 0 && expectDn.length > 0, '合成序列应同时包含上穿与下穿')
+
+  const gotUp = candles.map((_, i) => i).filter((i) => Number(program.plots['X'][i]) === 1)
+  const gotDn = candles.map((_, i) => i).filter((i) => Number(program.plots['Y'][i]) === 1)
+  assert.deepEqual(gotUp, expectUp, '上穿点位应与参考实现一致')
+  assert.deepEqual(gotDn, expectDn, '下穿点位应与参考实现一致')
+})

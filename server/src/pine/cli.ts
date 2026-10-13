@@ -2,8 +2,8 @@
  * Pine 命令行工具 —— 无需前端即可编译脚本、跑回测并打印报告。
  *
  * 用法示例：
- *   npm run pine -- server/pine/test.pine --dump-ts output/pine/test.ts
- *   npm run pine -- server/pine/test.pine --symbol BTC/USDT:USDT --timeframe 1h --bars 3000
+ *   pnpm pine server/pine/test.pine --dump-ts output/pine/test.ts
+ *   pnpm pine server/pine/test.pine --symbol BTC/USDT:USDT --timeframe 1h --bars 3000
  */
 
 import fs from 'node:fs'
@@ -52,7 +52,7 @@ async function main(): Promise<void> {
   const file = positional[0]
   if (!file) {
     console.error(
-      '用法：npm run pine -- <file.pine> [--dump-ts <out.ts>] [--symbol … --timeframe … --bars …]',
+      '用法：pnpm pine <file.pine> [--dump-ts <out.ts>] [--symbol … --timeframe … --bars …]',
     )
     process.exit(1)
   }

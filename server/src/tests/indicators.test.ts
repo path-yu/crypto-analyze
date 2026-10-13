@@ -1,6 +1,6 @@
 /**
  * 指标层与回测引擎的正确性测试。
- * 运行： npx tsx --test server/src/tests/*.test.ts
+ * 运行： pnpm exec tsx --test server/src/tests/*.test.ts
  */
 
 import assert from 'node:assert/strict'

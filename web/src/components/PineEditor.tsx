@@ -42,8 +42,8 @@ export interface PinePanelState {
   selectedId: string | null
   /** 策略下拉里选中一份已保存脚本（null = 切回内置策略或示例） */
   onSelect: (id: string | null) => void
-  /** 保存当前源码到本地缓存 */
-  onSave: () => Promise<void>
+  /** 保存当前源码：写穿到 server/pine/<目录>/ 下的 .pine 与 .ts，返回落盘记录 */
+  onSave: () => Promise<SavedPineScript>
   /** 删除当前载入的已保存脚本 */
   onDelete: () => Promise<void>
   /** 是否在右侧 Drawer 弹窗中放大编辑（面板内的紧凑编辑器让位） */
@@ -154,14 +154,22 @@ export default function PineEditor({
     }
   }
 
-  /** 保存：写穿到服务端本地缓存（.cache/pine-scripts.json），同名即更新 */
+  /**
+   * 保存：写穿到服务端 `server/pine/<目录>/` 下，源码 `.pine` 与编译产物 `.ts`
+   * 放在同一个文件夹里（便于直接进 git）；同名即更新，索引记在 .cache 下。
+   */
   const doSave = async () => {
     setBusy(true)
     setSaveNote(null)
     setSaveError(null)
     try {
-      await onSave()
-      setSaveNote(`已保存到本地缓存 · ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`)
+      const saved = await onSave()
+      const time = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+      setSaveNote(
+        saved.tsPath
+          ? `已保存 · ${saved.pinePath} + ${saved.tsPath}（${saved.tsBytes ?? 0} 字节）· ${time}`
+          : `已保存源码 · ${saved.pinePath ?? saved.name}（未生成编译产物）· ${time}`,
+      )
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : '保存失败')
     } finally {

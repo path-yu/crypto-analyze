@@ -1,0 +1,104 @@
+//@version=6
+strategy(title="BTC_Short_Only_TV01_v6", overlay=true, max_bars_back=3000, initial_capital=1000, commission_value=0.1)
+
+//////////// BTC / 纯做空策略 (Pine Script v6) /////////////////////
+
+// 计算 MACD
+[macdLine, macdSignalLine, macdHist] = ta.macd(close, 12, 26, 7)  
+
+_rsi_len = 14 
+leverage = 1
+
+float atrValue = 0.0
+bool bPositionOpened = false
+float stockPositionSize = 0.0 
+float volatilityPercentage = 0.0
+bool bDisplayArrow = false 
+bool bEMAIsFalling = false
+bool bSMAIsFalling = false
+bool bSMASlowIsFalling = false
+bool bMACDIsFalling = false
+
+// v6 中 input.float 用法更新
+float stopLoss = input.float(5.0, title="StopLoss in %") 
+float positionSize = 1000.0
+float currentPrice = close 
+float stopLossPrice = 0.0
+float entryPrice = 0.0
+
+// === 回测时间窗口 ===
+int FromDay   = 01
+int FromMonth = 01
+int FromYear  = 2020
+
+int ToDay     = 14
+ToMonth       = 05
+int ToYear    = 2029
+
+// v6 时间戳函数
+int start     = timestamp(FromYear, FromMonth, FromDay, 00, 00)  
+int finish    = timestamp(ToYear, ToMonth, ToDay, 23, 59)        
+window()      => time >= start and time <= finish ? true : false 
+
+// 函数定义：检测下降趋势
+IsFalling(series float data, int loopBack) =>
+    bool bIsFalling = true
+    for n = 1 to loopBack
+        if data[n] < data[n-1]
+            bIsFalling := false
+        continue
+    bIsFalling
+    
+// -----------------------------------------------------------
+
+emaLength = 20
+smaLength = 100
+smaSlowLength = 200
+ 
+float emaVal = ta.ema(close, emaLength) 
+float smaVal = ta.sma(close, smaLength)
+float smaSlowVal = ta.sma(close, smaSlowLength)
+
+plot(smaVal, color=color.green)
+plot(smaSlowVal, color=color.orange)
+plot(emaVal, color=color.yellow)
+
+// 重载上一根 K 线的历史状态
+stopLossPrice := na(stopLossPrice[1]) ? 0.0 : stopLossPrice[1]
+entryPrice := na(entryPrice[1]) ? 0.0 : entryPrice[1]
+bPositionOpened := na(bPositionOpened[1]) ? false : bPositionOpened[1]
+positionSize := na(positionSize[1]) ? 1000.0 : positionSize[1]
+stockPositionSize := na(stockPositionSize[1]) ? 0.0 : stockPositionSize[1]
+
+// 反转为检测各项指标向下
+bEMAIsFalling := IsFalling(emaVal, 2) 
+bSMAIsFalling := IsFalling(smaVal, 3)
+bMACDIsFalling := IsFalling(macdLine, 3)
+bSMASlowIsFalling := IsFalling(smaSlowVal, 10)
+
+atrValue := ta.atr(14)
+volatilityPercentage := (atrValue / currentPrice) * 100 
+ 
+if (window()) 
+    // 1. 检查做空开仓条件（寻找空头趋势）
+    if (bPositionOpened == false and bSMASlowIsFalling == true and bMACDIsFalling == true and bEMAIsFalling == true and bSMAIsFalling == true and emaVal < smaVal and smaVal > currentPrice)
+        
+        // 计算做空仓位大小
+        stockPositionSize := (positionSize * leverage) / currentPrice 
+        
+        // 计算做空止损价：由于是做空，价格上涨会亏损，止损价在上方 (1 + 止损%)
+        stopLossPrice := currentPrice * (1.0 + stopLoss / 100.0) 
+        
+        // v6 字符串转换使用 str.tostring
+        strategy.entry("myShortPosition", strategy.short, qty=stockPositionSize, comment="SELL at " + str.tostring(currentPrice))
+        entryPrice := currentPrice 
+        bPositionOpened := true  
+        bDisplayArrow := true 
+        
+    // 2. 检查做空平仓/止损条件
+    if (bPositionOpened == true and (currentPrice >= stopLossPrice or ta.crossover(emaVal[1], smaVal[1])))
+        strategy.close("myShortPosition", comment=str.tostring(currentPrice)) 
+        
+        bPositionOpened := false 
+        bDisplayArrow := true 
+        entryPrice := 0.0

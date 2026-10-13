@@ -6,9 +6,9 @@
  * 逐项排查到底是「策略实现有问题」还是「行情数据覆盖不足」。
  *
  * 用法：
- *   npx tsx scripts/diagnose-trade-count.ts
- *   npx tsx scripts/diagnose-trade-count.ts --symbol BTC/USDT:USDT --tv-trades 79
- *   npx tsx scripts/diagnose-trade-count.ts --since 2026-01-01 --until 2026-10-12
+ *   pnpm exec tsx scripts/diagnose-trade-count.ts
+ *   pnpm exec tsx scripts/diagnose-trade-count.ts --symbol BTC/USDT:USDT --tv-trades 79
+ *   pnpm exec tsx scripts/diagnose-trade-count.ts --since 2026-01-01 --until 2026-10-12
  *
  * 核心结论通常是：
  *   交易所（Gate 等）只提供「最近 10000 根」K 线，
@@ -198,7 +198,7 @@ async function main() {
     console.log(`  ${C.bold}③ 如何验证策略逻辑本身正确${C.reset}`)
     console.log(`     · 在 TradingView 与本地用「相同的周期 + 相同的标的 + 相同区间」`)
     console.log(`     · 且区间不超过 ${LOOKBACK[exchange].toLocaleString()} 根上限，此时交易笔数应接近`)
-    console.log(`     · 或运行单元测试：npm test（27 项确定性用例，覆盖各种入场/出场分支）`)
+    console.log(`     · 或运行单元测试：pnpm test（确定性用例，覆盖各种入场/出场分支）`)
     console.log()
   }
 

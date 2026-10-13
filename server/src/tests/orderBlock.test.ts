@@ -3,7 +3,7 @@
  *  1) 状态机指标层（脉冲 → 区域 → 回踩 → 消耗 / 失效 / 重叠）
  *  2) 引擎的 Zone OCO 撮合（下一根开盘入场、OCO 止盈止损、保本触发、时间止损、滑点）
  *
- * 运行：npx tsx --test server/src/tests/*.test.ts
+ * 运行：pnpm exec tsx --test server/src/tests/*.test.ts
  */
 
 import assert from 'node:assert/strict'
@@ -12,7 +12,7 @@ import { describe, it } from 'node:test'
 import type { Candle, StrategyParams } from '../../../shared/types'
 import { DEFAULT_ORDER_BLOCK, DEFAULT_STRATEGY_PARAMS } from '../../../shared/types'
 import { emptyOrderBlockSignal, OrderBlockTracker } from '../indicators/orderBlock'
-import { runBacktest, type StrategySeriesCore } from '../backtest/engine'
+import { runBacktest, type StrategySeriesCore, type StrategySignalCore } from '../backtest/engine'
 
 const near = (a: number, b: number, eps = 1e-9) =>
   assert.ok(Math.abs(a - b) < eps, `期望 ${b}，实际 ${a}`)
@@ -296,5 +296,152 @@ describe('回测引擎 · 订单块离场（Zone OCO）', () => {
     near(t.entryPrice, 100.6, 1e-9)
     assert.equal(t.exitReason, 'StopLoss')
     near(t.exitPrice, 97.8, 1e-9)
+  })
+
+  it('每笔交易都记录平仓后的账户余额（初始资金 + 累计净盈亏）', () => {
+    const candles = bars([
+      flat(),
+      flat(),
+      flat(),
+      flat(),
+      flat(),
+      [100, 100.2, 99.8, 100], // #1 信号：止损 98、目标 103
+      [100.5, 101, 100.4, 100.8], // #1 入场（开盘 100.5）
+      [101, 103.5, 100.8, 103], // #1 触及目标离场
+      [103, 103.2, 102.8, 103], // #2 信号：止损 100、目标 110
+      [103.5, 104, 103.2, 103.8], // #2 入场
+      [104, 110.5, 103.9, 110], // #2 触及目标离场
+    ])
+    const signals = candles.map(() => emptyOrderBlockSignal())
+    signals[5] = {
+      ...emptyOrderBlockSignal(),
+      canLong: true,
+      atrLongStop: 98,
+      obStopLoss: 98,
+      obTakeProfit: 103,
+      obRisk: 2,
+    }
+    signals[9] = {
+      ...emptyOrderBlockSignal(),
+      canLong: true,
+      atrLongStop: 100,
+      obStopLoss: 100,
+      obTakeProfit: 110,
+      obRisk: 3,
+    }
+
+    const { trades } = runBacktest({ candles, series: { signals }, params: OB_PARAMS })
+
+    assert.equal(trades.length, 2)
+    const cap = OB_PARAMS.initialCapital
+    near(trades[0].balanceAfter, cap + trades[0].netPnl, 1e-6)
+    near(trades[1].balanceAfter, cap + trades[0].netPnl + trades[1].netPnl, 1e-6)
+    assert.ok(trades[1].balanceAfter > cap, '两笔均为盈利单，余额应高于初始资金')
+  })
+
+  it('Pine：strategy.entry(qty=…) 按固定下单量成交，不随权益复利', () => {
+    const candles = bars([
+      flat(),
+      flat(),
+      flat(),
+      flat(),
+      flat(),
+      [100, 100.2, 99.8, 100], // #1 信号（固定 0.5 张）
+      [100.5, 101, 100.4, 100.8], // #1 入场 100.5（下一根开盘）
+      [101, 103.5, 100.8, 103], // #1 触及目标离场
+      [103, 103.2, 102.8, 103], // #2 信号（同样固定 0.5 张）
+      [103.5, 104, 103.2, 103.8], // #2 入场 103.5
+      [104, 110.5, 103.9, 110], // #2 触及目标离场
+    ])
+    // entryQty 是 Pine 侧的下单量字段，按引擎的信号接口收窄类型
+    const signals = candles.map<StrategySignalCore>(() => emptyOrderBlockSignal())
+    signals[5] = {
+      ...emptyOrderBlockSignal(),
+      canLong: true,
+      atrLongStop: 98,
+      obStopLoss: 98,
+      obTakeProfit: 103,
+      obRisk: 2,
+      entryQty: 0.5,
+    }
+    signals[8] = {
+      ...emptyOrderBlockSignal(),
+      canLong: true,
+      atrLongStop: 100,
+      obStopLoss: 100,
+      obTakeProfit: 110,
+      obRisk: 3,
+      entryQty: 0.5,
+    }
+
+    const { trades } = runBacktest({ candles, series: { signals }, params: OB_PARAMS })
+
+    assert.equal(trades.length, 2)
+    // 两笔数量都等于脚本指定的 0.5，第二笔没有因为权益增长而放大
+    near(trades[0].qty, 0.5, 1e-9)
+    near(trades[1].qty, 0.5, 1e-9)
+    near(trades[0].notional, 0.5 * 100.5, 1e-6)
+    near(trades[1].notional, 0.5 * 103.5, 1e-6)
+    // 盈亏只由数量 × 价差决定（手续费 0）
+    near(trades[0].netPnl, 0.5 * (103 - 100.5), 1e-6)
+    near(trades[1].netPnl, 0.5 * (110 - 103.5), 1e-6)
+  })
+})
+
+/* ------------------------------------------------------------------ */
+/* 3) Pine 脚本语义：引擎只做 OCO 撮合，不附加时间止损 / 保本            */
+/* ------------------------------------------------------------------ */
+
+describe('回测引擎 · Pine 脚本离场语义', () => {
+  /** 与订单块相同的参数，但 strategy 换成 pine（离场完全由脚本自身决定） */
+  const PINE_PARAMS: StrategyParams = {
+    ...OB_PARAMS,
+    strategy: 'pine',
+    orderBlock: { ...OB_PARAMS.orderBlock, maxBars: 2, useBE: true, beAtR: 1 },
+  }
+
+  it('orderBlock.maxBars 不作用于 Pine 脚本（脚本没写时间止损就不能有）', () => {
+    const candles = bars([
+      flat(),
+      flat(),
+      flat(),
+      flat(),
+      flat(),
+      [100, 100.2, 99.8, 100], // 信号：止损 90、目标 200（都不会触发）
+      [100.5, 101, 100.4, 100.8], // 入场
+      [100.6, 101, 100, 100.5], // 持仓 1 根
+      [100.5, 101, 100, 100.5], // 持仓 2 根（原生订单块策略会在此触发时间止损）
+      [100.8, 101, 100, 100.5],
+    ])
+    const { trades } = runBacktest({
+      candles,
+      series: seriesWithLong(candles, 5, 90, 200),
+      params: PINE_PARAMS,
+    })
+
+    assert.equal(trades.length, 1)
+    assert.equal(trades[0].exitReason, 'EndOfData', 'Pine 脚本不应被引擎加时间止损')
+  })
+
+  it('保本移动不作用于 Pine 脚本（脚本自己用 strategy.exit 更新止损才算数）', () => {
+    const candles = bars([
+      flat(),
+      flat(),
+      flat(),
+      flat(),
+      flat(),
+      [100, 100.2, 99.8, 100], // 信号：止损 98，风险 2 → 原生策略会在 100.5+2 处移动保本
+      [100.5, 101, 100.4, 100.8], // 入场 100.5
+      [101, 103, 100.9, 102.5], // high 103 已越过 102.5
+      [102, 102.5, 100, 100.2], // 回落击穿 100.5：原生策略会以保本价离场
+    ])
+    const { trades } = runBacktest({
+      candles,
+      series: seriesWithLong(candles, 5, 98, 108),
+      params: PINE_PARAMS,
+    })
+
+    assert.equal(trades.length, 1)
+    assert.equal(trades[0].exitReason, 'EndOfData', 'Pine 脚本不应被引擎移动保本')
   })
 })

@@ -203,12 +203,12 @@ async function main() {
   console.log()
 
   if (!fs.existsSync(path.join(ROOT, 'node_modules'))) {
-    fail('未找到 node_modules，请先执行: npm install')
+    fail('未找到 node_modules，请先执行: pnpm install')
     process.exit(1)
   }
   if (!fs.existsSync(path.join(ROOT, 'web', 'node_modules')) &&
       !fs.existsSync(path.join(ROOT, 'node_modules', 'vite'))) {
-    fail('缺少前端依赖，请先执行: npm install')
+    fail('缺少前端依赖，请先执行: pnpm install')
     process.exit(1)
   }
 

@@ -4,7 +4,7 @@
  * 对比同一个区间在「旧路径（ccxt 交易所）」与「新路径（Vision 全历史）」
  * 下的可得根数与交易样本量。
  *
- * 用法：npx tsx scripts/test-vision.ts
+ * 用法：pnpm exec tsx scripts/test-vision.ts
  */
 import { fetchKlines } from '../server/src/market/exchange'
 import { DEFAULT_STRATEGY_PARAMS, type Timeframe } from '../shared/types'

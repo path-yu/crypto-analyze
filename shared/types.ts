@@ -102,13 +102,35 @@ export interface PineCompileMeta {
   alerts: { title: string; message: string }[]
 }
 
-/** 保存到本地缓存的 Pine 脚本（`.cache/pine-scripts.json`） */
+/**
+ * 已保存的 Pine 脚本。
+ *
+ * 每份脚本在 `server/pine/<目录>/` 下单独一个文件夹，源码与编译产物放在一起
+ * （便于直接纳入 git 版本管理）：
+ *
+ * ```
+ * server/pine/Signal Suite/
+ *   Signal Suite.pine   原始 Pine 源码
+ *   Signal Suite.ts     编译器生成的 TypeScript
+ * ```
+ *
+ * 索引另存于 `.cache/pine-scripts.json`（记录 id / 名称 / 时间 / 目录名）；
+ * 索引丢失时会扫描 `server/pine/` 下的各脚本目录自动重建列表。
+ */
 export interface SavedPineScript {
   id: string
   /** 脚本名：下拉菜单展示用，同名保存视为更新 */
   name: string
   /** 原始 Pine 源码 */
   source: string
+  /** 落盘目录名（`server/pine/<dir>/`）；仅存在于索引中的历史数据可能缺省 */
+  dir?: string
+  /** 源码文件相对项目根的路径，例如 `server/pine/Signal Suite/Signal Suite.pine` */
+  pinePath?: string
+  /** 编译产物相对项目根的路径；编译失败时缺省 */
+  tsPath?: string
+  /** 编译产物字节数 */
+  tsBytes?: number
   createdAt: number
   updatedAt: number
 }
@@ -362,6 +384,7 @@ export type ExitReason =
   | 'BreakEven'    // 保本止损
   | 'Reverse'      // 反手平仓
   | 'TrendSwitch'  // 趋势反转平仓
+  | 'ScriptClose'  // Pine 脚本主动平仓（strategy.close / close_all）
   | 'Liquidation'  // 强平
   | 'TimeStop'     // 时间止损（持仓超过 N 根 K 线，市价平仓）
   | 'EndOfData'    // 回测结束时强制平仓
@@ -417,6 +440,13 @@ export interface Trade {
   netPnl: number
   /** 相对保证金的收益率 */
   pnlPercent: number
+  /**
+   * 该笔交易全部平仓后的账户余额（= 初始资金 + 截至该笔为止的累计净盈亏）。
+   *
+   * 注意这是「已实现」口径：同时持有多笔子订单（金字塔加仓）时，
+   * 其他未平仓部分的浮盈浮亏不计入。
+   */
+  balanceAfter: number
   /** 相对开仓价的收益率 */
   priceChangePercent: number
   maxFavorableExcursion: number

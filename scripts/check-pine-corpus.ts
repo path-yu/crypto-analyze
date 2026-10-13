@@ -2,7 +2,7 @@
  * Pine 语料批量体检：对目录下的每个 .pine 执行「编译 → 逐 bar 运行」，
  * 汇总诊断与运行期异常，用于找出编译器缺失的语法/内置特性。
  *
- * 用法：npx tsx scripts/check-pine-corpus.ts [目录]
+ * 用法：pnpm exec tsx scripts/check-pine-corpus.ts [目录]
  */
 import fs from 'node:fs'
 import path from 'node:path'

@@ -4,7 +4,7 @@
  * 目的：TradingView 能取到完整历史，验证本机网络环境下
  *       是否也能通过某种交易所 / 端点 / 分页方式拿到更早的数据。
  *
- * 用法：npx tsx scripts/probe-history-depth.ts
+ * 用法：pnpm exec tsx scripts/probe-history-depth.ts
  */
 import ccxt from 'ccxt'
 import type { ExchangeId } from '../shared/types'

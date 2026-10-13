@@ -33,6 +33,17 @@ import type {
 } from './ast'
 import { isIdent, isOp, PineError, type Token } from './tokens'
 
+/**
+ * Pine v6 类型限定符：写在类型之前，例如 `series float data`、`simple int n`。
+ * 解析时把它们与后面的类型一起当作「类型前缀」消费掉。
+ */
+const TYPE_QUALS = new Set(['series', 'simple', 'const', 'input'])
+
+/** 判断 token 是否为复合赋值运算符（`+=` 等） */
+function isCompoundOp(t: Token | undefined): boolean {
+  return t?.kind === 'op' && COMPOUND_ASSIGN[t.text] !== undefined
+}
+
 /** Pine v6 复合赋值：语法层脱糖成 `x := x <op> v` */
 const COMPOUND_ASSIGN: Record<string, string> = {
   '+=': '+',
@@ -351,6 +362,19 @@ class Parser {
         target = { kind: 'ident', name: name.text, line: name.line, col: name.col }
       } else if (
         t0?.kind === 'ident' &&
+        TYPE_QUALS.has(t0.text) &&
+        t1?.kind === 'ident' &&
+        t2?.kind === 'ident' &&
+        (isOp(this.peek(3), '=') || isOp(this.peek(3), ':=') || isCompoundOp(this.peek(3)))
+      ) {
+        // 带限定符的类型化声明：series float atr = ... / simple int n := ...
+        typeName = `${t0.text} ${t1.text}`
+        this.next() // 限定符
+        this.next() // 类型
+        const name = this.expectIdent()
+        target = { kind: 'ident', name: name.text, line: name.line, col: name.col }
+      } else if (
+        t0?.kind === 'ident' &&
         t1?.kind === 'ident' &&
         (isOp(t2, '=') || isOp(t2, ':='))
       ) {
@@ -441,12 +465,30 @@ class Parser {
     if (this.atKind('dedent')) this.next()
   }
 
+  /**
+   * 读取类型前缀。支持两种写法：
+   *   - 裸类型：`float v` / `array<float> H` / `line[] xs`
+   *   - v6 类型限定符 + 类型：`series float data` / `simple int n` / `const string s`
+   */
   private readTypePrefix(): { text: string; len: number } | null {
     const t0 = this.peek()
     if (t0?.kind !== 'ident') return null
-    if (isOp(this.peek(1), '<')) {
+
+    if (TYPE_QUALS.has(t0.text)) {
+      const inner = this.readTypeAt(this.pos + 1)
+      if (!inner) return null
+      return { text: `${t0.text} ${inner.text}`, len: 1 + inner.len }
+    }
+    return this.readTypeAt(this.pos)
+  }
+
+  /** 从 tokens[pos] 处读取一个类型（含泛型与 `[]` 后缀） */
+  private readTypeAt(pos: number): { text: string; len: number } | null {
+    const t0 = this.tokens[pos]
+    if (t0?.kind !== 'ident') return null
+    if (isOp(this.tokens[pos + 1], '<')) {
       let depth = 0
-      for (let i = this.pos + 1; i < this.tokens.length; i++) {
+      for (let i = pos + 1; i < this.tokens.length; i++) {
         const t = this.tokens[i]
         if (t.kind === 'newline' || t.kind === 'eof') break
         if (t.kind !== 'op') continue
@@ -455,16 +497,16 @@ class Parser {
           depth--
           if (depth === 0) {
             const text = this.tokens
-              .slice(this.pos, i + 1)
+              .slice(pos, i + 1)
               .map((x) => x.text)
               .join('')
-            return { text, len: i + 1 - this.pos }
+            return { text, len: i + 1 - pos }
           }
         }
       }
       return null
     }
-    if (isOp(this.peek(1), '[') && isOp(this.peek(2), ']')) {
+    if (isOp(this.tokens[pos + 1], '[') && isOp(this.tokens[pos + 2], ']')) {
       return { text: `${t0.text}[]`, len: 3 }
     }
     return { text: t0.text, len: 1 }

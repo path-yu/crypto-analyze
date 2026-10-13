@@ -1,0 +1,163 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+strategy("Volume-Confirmed Support/Resistance Breakout Strategy", shorttitle = "Vol S/R Breakout",
+     overlay = true, initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
+     commission_type = strategy.commission.percent, commission_value = 0.01,
+     slippage = 2, pyramiding = 0)
+
+// Concept:
+// - Support/Resistance = confirmed swing pivots (classic structure, not repainting on live bar).
+// - Entries only trigger when price closes through a level AND volume is elevated vs its
+//   recent average, filtering out low-conviction/thin breakouts.
+// - Optional EMA trend filter to only take breakouts in the direction of the larger trend.
+// - Stops anchor to the broken structural level (old swing low/high) with a small ATR buffer;
+//   targets are ATR-multiple based.
+// - Symbol-agnostic: works on any index, stock, futures or crypto chart with real traded
+//   volume. Avoid spot FX / thin OTC symbols, where volume data isn't meaningful. Adjust
+//   initial_capital / position size to fit the instrument you run it on.
+
+//════════════════════════════════════
+//     ✧  INPUTS  ✧
+//════════════════════════════════════
+const string g_sr    = "✧ Support / Resistance ✧"
+const string g_vol   = "✧ Volume Confirmation ✧"
+const string g_trend = "✧ Trend Filter ✧"
+const string g_risk  = "✧ Risk Management ✧"
+const string g_date  = "✧ Backtest Range ✧"
+const string g_vis   = "✧ Visuals ✧"
+
+// --- Support / Resistance ---
+pivotLeft  = input.int(10, "Pivot Left Bars",  minval = 1, group = g_sr)
+pivotRight = input.int(10, "Pivot Right Bars", minval = 1, group = g_sr, tooltip = "Pivot confirms 'pivotRight' bars after it forms — inherent to swing-structure detection, not lookahead.")
+
+// --- Volume Confirmation ---
+volLength     = input.int(20, "Volume Average Length", minval = 1, group = g_vol)
+volMultiplier = input.float(1.5, "Volume Surge Multiplier", minval = 1.0, step = 0.1, group = g_vol, tooltip = "Needs real traded volume — works on stocks, futures, crypto, most index proxies. Spot FX volume is not meaningful.")
+
+// --- Trend Filter ---
+useTrendFilter = input.bool(true, "Require EMA trend filter", group = g_trend)
+emaLength      = input.int(200, "EMA Length", minval = 1, group = g_trend)
+
+// --- Risk Management ---
+atrLength     = input.int(14, "ATR Length", minval = 1, group = g_risk)
+atrStopMult   = input.float(1.5, "ATR Stop Multiplier", minval = 0.1, step = 0.1, group = g_risk)
+atrTargetMult = input.float(3.0, "ATR Target Multiplier", minval = 0.1, step = 0.1, group = g_risk)
+useStructStop = input.bool(true, "Use broken swing level as stop (else pure ATR)", group = g_risk)
+stopBufferAtr = input.float(0.25, "Structural Stop ATR Buffer", minval = 0.0, step = 0.05, group = g_risk)
+
+// --- Backtest Range ---
+startDate = input.time(timestamp("01 Jan 2018 00:00 +0000"), "Start Date", group = g_date)
+endDate   = input.time(timestamp("31 Dec 2025 00:00 +0000"), "End Date",   group = g_date)
+
+// --- Visuals ---
+colorCandles         = input.bool(true, "Color candles by position", group = g_vis)
+enableGlow           = input.bool(true, "Glow effect on S/R lines", group = g_vis)
+showChannelGradient  = input.bool(true, "Gradient fill inside S/R channel", group = g_vis, tooltip = "Fades from each line toward the channel midpoint, like a heat gradient rather than a flat fill.")
+bullColor            = input.color(#0097a7, "Bullish / Long Color", group = g_vis)
+bearColor            = input.color(#ff195f, "Bearish / Short Color", group = g_vis)
+
+//════════════════════════════════════
+//     CALCULATIONS
+//════════════════════════════════════
+
+// --- Support / Resistance (pivot based) ---
+float ph = ta.pivothigh(high, pivotLeft, pivotRight)
+float pl = ta.pivotlow(low, pivotLeft, pivotRight)
+
+var float resistance = na
+var float support    = na
+
+if not na(ph)
+    resistance := ph
+if not na(pl)
+    support := pl
+
+// --- Volume confirmation ---
+float avgVolume   = ta.sma(volume, volLength)
+bool  volumeSurge = volume > avgVolume * volMultiplier
+
+// --- Trend filter ---
+float emaVal      = ta.ema(close, emaLength)
+bool  trendUpOk   = not useTrendFilter or close > emaVal
+bool  trendDownOk = not useTrendFilter or close < emaVal
+
+// --- ATR for stops/targets ---
+float atrVal = ta.atr(atrLength)
+
+// --- Date range filter ---
+bool inRange = time >= startDate and time <= endDate
+
+//════════════════════════════════════
+//     ENTRY LOGIC
+//════════════════════════════════════
+bool longBreakout  = not na(resistance) and ta.crossover(close, resistance)  and volumeSurge and trendUpOk   and inRange
+bool shortBreakout = not na(support)    and ta.crossunder(close, support)    and volumeSurge and trendDownOk and inRange
+
+var float longStopPrice  = na
+var float longTgtPrice   = na
+var float shortStopPrice = na
+var float shortTgtPrice  = na
+
+if longBreakout
+    strategy.entry("Long", strategy.long)
+    longStopPrice := useStructStop and not na(support) ? support - atrVal * stopBufferAtr : close - atrVal * atrStopMult
+    longTgtPrice  := close + atrVal * atrTargetMult
+    alert("Long breakout — " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+if shortBreakout
+    strategy.entry("Short", strategy.short)
+    shortStopPrice := useStructStop and not na(resistance) ? resistance + atrVal * stopBufferAtr : close + atrVal * atrStopMult
+    shortTgtPrice  := close - atrVal * atrTargetMult
+    alert("Short breakout — " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+//════════════════════════════════════
+//     EXITS
+//════════════════════════════════════
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop = longStopPrice, limit = longTgtPrice)
+
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop = shortStopPrice, limit = shortTgtPrice)
+
+// --- Reset when flat ---
+bool flatNow  = strategy.position_size == 0
+bool flatPrev = strategy.position_size[1] != 0
+if flatNow and flatPrev
+    longStopPrice  := na
+    longTgtPrice   := na
+    shortStopPrice := na
+    shortTgtPrice  := na
+
+//════════════════════════════════════
+//     VISUALS
+//════════════════════════════════════
+
+// --- Position-based candle coloring ---
+color posColor = strategy.position_size > 0 ? bullColor : strategy.position_size < 0 ? bearColor : na
+
+plotcandle(open, high, low, close, "Position Coloring",
+     colorCandles ? posColor : na, colorCandles ? posColor : na,
+     bordercolor = colorCandles ? posColor : na,
+     display = display.all - display.status_line - display.price_scale)
+
+// --- Support / Resistance lines, each with a double-layer glow (wide/soft outer,
+//     narrower/denser inner, solid core) rather than a single translucent copy ---
+plot(enableGlow ? resistance : na, "Resistance Glow Outer", color = color.new(bearColor, 88), linewidth = 7, style = plot.style_linebr)
+plot(enableGlow ? resistance : na, "Resistance Glow Inner", color = color.new(bearColor, 75), linewidth = 4, style = plot.style_linebr)
+p_res = plot(resistance, "Resistance", color = bearColor, style = plot.style_linebr, linewidth = 1)
+
+plot(enableGlow ? support : na, "Support Glow Outer", color = color.new(bullColor, 88), linewidth = 7, style = plot.style_linebr)
+plot(enableGlow ? support : na, "Support Glow Inner", color = color.new(bullColor, 75), linewidth = 4, style = plot.style_linebr)
+p_sup = plot(support, "Support", color = bullColor, style = plot.style_linebr, linewidth = 1)
+
+float midChannel = (not na(resistance) and not na(support)) ? (resistance + support) / 2 : na
+p_mid = plot(showChannelGradient ? midChannel : na, "Channel Midline", display = display.none, editable = false)
+
+fill(p_res, p_mid, resistance, midChannel, color.new(bearColor, 65), color.new(bearColor, 100), title = "Resistance Side Gradient")
+fill(p_mid, p_sup, midChannel, support,    color.new(bullColor, 100), color.new(bullColor, 65), title = "Support Side Gradient")
+
+plot(useTrendFilter ? emaVal : na, "EMA Trend", color = color.new(color.gray, 40))
+
+plotshape(longBreakout,  title = "Long Signal",  location = location.belowbar, style = shape.triangleup,   size = size.small, color = bullColor)
+plotshape(shortBreakout, title = "Short Signal", location = location.abovebar, style = shape.triangledown, size = size.small, color = bearColor)

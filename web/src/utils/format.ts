@@ -106,7 +106,9 @@ export const EXIT_REASON_LABEL: Record<string, string> = {
   BreakEven: '保本离场',
   Reverse: '反手平仓',
   TrendSwitch: '趋势反转平仓',
+  ScriptClose: '脚本平仓',
   Liquidation: '强制平仓',
+  TimeStop: '时间止损',
   EndOfData: '回测结束平仓',
 }
 

@@ -5,8 +5,8 @@
  * 传 --all 则清空全部缓存（下次回测会自动重新下载）。
  *
  * 用法：
- *   npm run clean:cache
- *   npm run clean:cache -- --all
+ *   pnpm clean:cache
+ *   pnpm clean:cache --all
  */
 import fs from 'node:fs'
 import path from 'node:path'

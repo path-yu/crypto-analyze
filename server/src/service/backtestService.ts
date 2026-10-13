@@ -333,6 +333,7 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
     supertrendDirection: (s as Partial<SupertrendSeries['signals'][number]>).supertrendDirection,
     obStopLoss: (s as Partial<OrderBlockSignal>).obStopLoss,
     obTakeProfit: (s as Partial<OrderBlockSignal>).obTakeProfit,
+    entryQty: (s as Partial<PineSignal>).entryQty,
   }))
 
   const warnings: string[] = []

@@ -327,8 +327,25 @@ class Codegen {
   private readonly histNeed = new Map<string, number>()
   /** 被 `[k]` 引用的 ctx 成员路径（`strategy.position_size` → 最大深度） */
   private readonly memberHist = new Map<string, number>()
+  /**
+   * 带历史引用的「调用点」：`f(...)[k]`（键为调用 AST 节点，同一调用点复用同一槽位）。
+   *
+   * 内置 ta 序列调用由预计算数组处理；用户函数与其它调用的结果没有整条数组，
+   * 这里按调用点分配一个逐 bar 求值的槽位 `__cv_<id>` + 环形缓冲 `__hc_<id>`：
+   * 每根 K 线在 bar 顶部先求值再入环，于是 `hist(ring, k)` 恰好是第 k 根之前的调用结果。
+   */
+  private readonly callHist = new Map<CallExpr, { id: number; k: number }>()
+  private callHistSeq = 0
   /** `strategy.entry` 的 id → `strategy.exit` 的 stop/limit 表达式 */
   private readonly exitMap = new Map<string, { stop?: Expr; limit?: Expr }>()
+  /**
+   * `strategy.entry(id, …, qty=…)` 的 id → 下单量表达式。
+   *
+   * 指定 qty 时仓位大小由脚本决定（固定张数 / 币数），不随权益复利变化 ——
+   * 这是 TradingView 的 `qty` 口径，与 `default_qty_type = percent_of_equity`
+   * 的「按权益百分比」完全不同。
+   */
+  private readonly entryQtyMap = new Map<string, Expr>()
   /** 顶层元组解构（`[a, b, c] = macd(...)`）：整体作为 A 类预计算元组 */
   private readonly precalcTuples: { names: string[]; call: CallExpr }[] = []
   /** 预计算元组的元素名（按单条数组引用） */
@@ -421,6 +438,11 @@ class Codegen {
     // ctx 成员的历史引用（`strategy.position_size[1]` 等）
     for (const [path, k] of this.memberHist) {
       lines.push(`  const __hm_${memberRingName(path)} = __pine.makeRing(${k + 1})`)
+    }
+    // 调用点历史（`f(...)[k]`）：逐 bar 求值槽位 + 环形缓冲
+    for (const [, slot] of this.callHist) {
+      lines.push(`  let __cv_${slot.id} = NaN`)
+      lines.push(`  const __hc_${slot.id} = __pine.makeRing(${slot.k + 1})`)
     }
     // v4 裸 `tr`：按内置 OHLC 预计算整条真实波幅序列
     if (this.wantsTr) {
@@ -757,6 +779,30 @@ class Codegen {
   /** 记录历史引用深度：C 类标量（环形缓冲）与 ctx 成员（成员环形缓冲） */
   private collectHistRefs(stmts: Stmt[]): void {
     this.walkExprs(stmts, (e) => {
+      // 交叉族（ta.crossover / crossunder / cross）的标识符操作数：
+      // 拿不到整条序列时（var 变量、条件赋值的顶层标量）需要环形缓冲提供「上一根」的值。
+      if (e.kind === 'call') {
+        const path = this.calleePath(e.callee)
+        const fnName = path ? path[path.length - 1] : ''
+        if (path && CROSS_FUNCS.has(fnName) && (path.length === 1 || path[0] === 'ta')) {
+          for (const arg of e.args.slice(0, 2)) {
+            const v = arg.value
+            if (v.kind !== 'ident') continue
+            const n = v.name
+            if (
+              BUILTIN_SERIES.has(n) ||
+              this.precalc.has(n) ||
+              this.precalcTupleNames.has(n) ||
+              this.createConsts.has(n) ||
+              (n === 'tr' && this.wantsTr)
+            ) {
+              continue
+            }
+            this.histNeed.set(n, Math.max(this.histNeed.get(n) ?? 0, 1))
+          }
+        }
+        return
+      }
       if (e.kind !== 'index') return
       const k = e.index.kind === 'number' ? e.index.value : 1
       if (e.object.kind === 'ident') {
@@ -776,8 +822,75 @@ class Codegen {
         if (path && (path in CTX_MEMBERS || path.startsWith('strategy.'))) {
           this.memberHist.set(path, Math.max(this.memberHist.get(path) ?? 0, k))
         }
+      } else if (e.object.kind === 'call') {
+        // `f(...)[k]`：内置 ta 序列调用由预计算数组处理；
+        // 其余（用户函数 / math 等）按调用点登记环形缓冲，逐 bar 求值后回看。
+        // 实参必须在「bar 顶部」就能正确求值，否则宁可报错也不静默算错。
+        const call = e.object
+        if (!this.isTaSeriesCall(call) && this.callArgsTopLevelSafe(call)) {
+          const slot = this.callHist.get(call)
+          if (slot) slot.k = Math.max(slot.k, k)
+          else this.callHist.set(call, { id: this.callHistSeq++, k })
+        }
       }
     })
+  }
+
+  /** 该调用是否由 `seriesRef` 按整条数组处理（`ta.*` 序列函数） */
+  private isTaSeriesCall(e: CallExpr): boolean {
+    const path = this.calleePath(e.callee)
+    const fn = path
+      ? path.length === 2 && path[0] === 'ta'
+        ? path[1]
+        : path.length === 1
+          ? path[0]
+          : null
+      : null
+    return fn !== null && TA_SERIES_FNS.has(fn)
+  }
+
+  /**
+   * 调用点的实参能否在「每根 bar 顶部」正确求值。
+   *
+   * 这里只放行：字面量、内置序列（含其 `[k]`/成员形式）、初始化期常量与输入、
+   * ctx 成员（`strategy.*`，bar 顶部已更新为本根的值）、嵌套 ta 序列调用。
+   * 顶层逐 bar 标量与函数局部变量不在放行之列 —— 它们在 bar 顶部还是上一根的值，
+   * 逐 bar 回看会整体错位一根，宁可退回「不支持」的明确报错。
+   */
+  private callArgsTopLevelSafe(e: CallExpr): boolean {
+    return e.args.every((a) => this.isTopLevelEvalable(a.value))
+  }
+
+  private isTopLevelEvalable(e: Expr): boolean {
+    switch (e.kind) {
+      case 'number':
+      case 'string':
+      case 'bool':
+        return true
+      case 'ident': {
+        const n = e.name
+        return (
+          BUILTIN_SERIES.has(n) ||
+          this.precalc.has(n) ||
+          this.precalcTupleNames.has(n) ||
+          this.createConsts.has(n) ||
+          (n === 'tr' && this.wantsTr)
+        )
+      }
+      case 'index':
+        return this.isTopLevelEvalable(e.object)
+      case 'member': {
+        const path = this.dottedPath(e)
+        if (!path) return false
+        const root = path.split('.')[0]
+        // ctx 成员在 step 顶部已更新；其余命名空间量（syminfo./timeframe./barmerge./color. 等）视为常量
+        return path in CTX_MEMBERS || path.startsWith('strategy.') || NAMESPACE_ROOTS.has(root)
+      }
+      case 'call':
+        return this.isTaSeriesCall(e)
+      default:
+        return false
+    }
   }
 
   /** `strategy.exit(..., from_entry="Long", stop=…, limit=…)` → entry id → 出场价 */
@@ -791,6 +904,11 @@ class Codegen {
             const fromEntry = m.get('from_entry')
             const id = fromEntry && fromEntry.kind === 'string' ? fromEntry.value : undefined
             if (id) this.exitMap.set(id, { stop: m.get('stop'), limit: m.get('limit') })
+          } else if (path && path.join('.') === 'strategy.entry') {
+            const m = this.normalizeArgs(s.expr, ['id', 'direction', 'qty', 'limit', 'stop', 'oca_name', 'oca_type', 'comment'])
+            const idExpr = m.get('id')
+            const qty = m.get('qty')
+            if (qty && idExpr && idExpr.kind === 'string') this.entryQtyMap.set(idExpr.value, qty)
           }
         } else if (s.kind === 'if') {
           for (const br of s.branches) visit(br.body)
@@ -1022,10 +1140,23 @@ class Codegen {
       out.push(`__pine.push(__hm_${memberRingName(path)}, ${this.memberValueOf(path)})`)
     }
     for (const name of this.histNeed.keys()) {
-      if (this.vars.has(name)) out.push(`__pine.push(__h_${name}, ${this.jsVar(name)})`)
+      // 第 0 根 K 线没有「上一根」：不入环，让 x[1] 在第 0 根自然为 na
+      // （否则会把 var 的初始值当成 bar -1 的值）
+      if (this.vars.has(name)) {
+        out.push(`if (__index > 0) __pine.push(__h_${name}, ${this.jsVar(name)})`)
+      }
+    }
+    // 调用点历史：先求值当根结果、再入环 ⇒ hist(ring, k) 即「第 k 根之前」的调用结果
+    for (const [node, slot] of this.callHist) {
+      out.push(`__cv_${slot.id} = ${this.expr(node)}`)
+      out.push(`__pine.push(__hc_${slot.id}, __cv_${slot.id})`)
     }
     if (this.meta.kind === 'strategy') {
       out.push('let __entryDir = null')
+      // 当根请求开仓的 entry id：bar 结束时按它重新求值止损 / 止盈（见 entrySnapshotLines）
+      out.push('let __entryId = null')
+      // 脚本显式指定的下单量（strategy.entry 的 qty），NaN = 未指定、按引擎仓位设置
+      out.push('let __entryQty = NaN')
       out.push('let __exitStop = NaN')
       out.push('let __exitLimit = NaN')
       out.push('let __forceClose = false')
@@ -1043,6 +1174,7 @@ class Codegen {
     if (this.meta.kind === 'strategy') {
       return [
         ...pushes,
+        ...this.entrySnapshotLines(),
         'const __obStop = __exitStop',
         'const __obTp = __exitLimit',
         'return {',
@@ -1055,6 +1187,7 @@ class Codegen {
         '  obStopLoss: __obStop,',
         '  obTakeProfit: __obTp,',
         '  obRisk: Number.isFinite(__obStop) ? Math.abs(C.close[__index] - __obStop) : NaN,',
+        '  entryQty: __entryQty,',
         '  forceClose: __forceClose,',
         '}',
       ]
@@ -1394,7 +1527,47 @@ class Codegen {
     const exits = id ? this.exitMap.get(id) : undefined
     const stop = exits?.stop ? this.tryInline(exits.stop) : null
     const limit = exits?.limit ? this.tryInline(exits.limit) : null
-    return `__entryDir = '${direction}'; __exitStop = ${stop ?? 'NaN'}; __exitLimit = ${limit ?? 'NaN'}`
+    const qtyExpr = id ? this.entryQtyMap.get(id) : undefined
+    const qty = qtyExpr ? this.tryInline(qtyExpr) : null
+    // 这里的内联快照只是「尽力而为」的兜底；真正的权威值在 bar 结束时按 __entryId
+    // 重新求值（见 entrySnapshotLines），因为脚本常见写法是先 entry、再给止损变量赋值。
+    return (
+      `__entryDir = '${direction}'; __entryId = ${id ? JSON.stringify(id) : 'null'};` +
+      ` __entryQty = ${qty ?? 'NaN'};` +
+      ` __exitStop = ${stop ?? 'NaN'}; __exitLimit = ${limit ?? 'NaN'}`
+    )
+  }
+
+  /**
+   * bar 结束时的止损 / 止盈快照。
+   *
+   * TradingView 是在**当根收盘**才创建 `strategy.exit` 订单的，所以止损 / 止盈
+   * 应当取脚本执行完整根后的值。若在 `strategy.entry` 处内联求值，遇到常见的
+   * 「先 entry，随后再给 longStop / shortStop 赋值」写法就会拿到赋值前的旧值
+   * （甚至 na —— 表现为持仓完全没有止损，只能力竭到强平）。
+   *
+   * 引用了块内局部变量的表达式在 epilogue 处不可见，`tryInline` 会返回 null，
+   * 这时保留 entry 处的内联结果，避免生成越界引用。
+   */
+  private entrySnapshotLines(): string[] {
+    const branches: string[] = []
+    // 脚本可能只写了 strategy.entry(qty=…) 而没有任何 strategy.exit（离场用 strategy.close），
+    // 因此这里要覆盖两张表的 id 并集
+    for (const id of new Set([...this.exitMap.keys(), ...this.entryQtyMap.keys()])) {
+      const exits = this.exitMap.get(id)
+      const stop = exits?.stop ? this.tryInline(exits.stop) : null
+      const limit = exits?.limit ? this.tryInline(exits.limit) : null
+      const qtyExpr = this.entryQtyMap.get(id)
+      const qty = qtyExpr ? this.tryInline(qtyExpr) : null
+      if (!stop && !limit && !qty) continue
+      const body: string[] = []
+      if (stop) body.push(`__exitStop = ${stop}`)
+      if (limit) body.push(`__exitLimit = ${limit}`)
+      if (qty) body.push(`__entryQty = ${qty}`)
+      branches.push(`if (__entryId === ${JSON.stringify(id)}) { ${body.join('; ')} }`)
+    }
+    if (branches.length === 0) return []
+    return [`if (__entryId !== null) { ${branches.join(' else ')} }`]
   }
 
   /**
@@ -1616,7 +1789,25 @@ class Codegen {
         const hoisted = this.fnLocalCtx?.get(name)
         if (hoisted) return `__pine.hist(${hoisted.ring}, ${k})`
         // 逐 bar 标量的环形缓冲（不能被跟踪数组替代：条件赋值时环形缓冲更保守）
-        if (this.histNeed.has(name)) return `__pine.hist(__h_${name}, ${k})`
+        if (this.histNeed.has(name)) {
+          // `var` 变量在**每根 bar 顶部**入环，那一刻它的值仍是上一根的，
+          // 因此 x[k]（k≥1）对应 hist(ring, k-1)，x[0] 直接读变量本身；
+          // 非 var 标量在自己的赋值之后立刻入环，口径与 hist(ring, k) 一致。
+          if (this.vars.has(name)) {
+            const js = this.jsVar(name)
+            const kNum = e.index.kind === 'number' ? e.index.value : null
+            if (kNum !== null) {
+              return kNum <= 0 ? js : `__pine.hist(__h_${name}, ${kNum - 1})`
+            }
+            return `(${k} <= 0 ? ${js} : __pine.hist(__h_${name}, (${k}) - 1))`
+          }
+          return `__pine.hist(__h_${name}, ${k})`
+        }
+      }
+      // 调用点历史：`f(...)[k]`（逐 bar 求值 + 环形缓冲，见 collectHistRefs）
+      if (base.kind === 'call') {
+        const slot = this.callHist.get(base)
+        if (slot) return `__pine.hist(__hc_${slot.id}, ${k})`
       }
       // 内置序列 / 预计算数组 / 跟踪标量 / 嵌套 ta 调用：整条数组 + 下标回看
       const ref = this.seriesRef(base)
@@ -1634,7 +1825,9 @@ class Codegen {
       line: e.line,
       column: e.col,
       severity: 'error',
-      message: '[k] 历史引用仅支持内置变量、预计算数组与顶层无条件赋值变量',
+      message:
+        '[k] 历史引用仅支持内置变量、预计算数组、顶层无条件赋值变量，' +
+        '以及实参可在每根 K 线顶部求值的函数调用 f(...)[k]',
     })
     return 'NaN'
   }
@@ -1779,7 +1972,11 @@ class Codegen {
     if (path && path[0] === 'syminfo' && path[1] === 'currency') return "''"
     // request.currency_rate：单币种回测按 1 处理（不涉及跨币种换算）
     if (path && path[0] === 'request' && path[1] === 'currency_rate') return '1'
-    if (path && path[0] === 'timeframe' && path[1] === 'in_seconds') return '__pine.timeframe.in_seconds()'
+    // timeframe.in_seconds() 取当前图表周期；timeframe.in_seconds("240") 取指定周期
+    // —— 实参必须原样透传，早先固定成 0 参调用会把 HTF 校验算错。
+    if (path && path[0] === 'timeframe' && path[1] === 'in_seconds') {
+      return `__pine.timeframe.in_seconds(${this.callArgs(e).join(', ')})`
+    }
 
     // 用户函数 / 方法调用（形参含 [k] 历史引用时追加隐藏的序列容器实参）
     if (path && path.length === 1 && this.userFuncs.has(path[0])) {
@@ -1993,12 +2190,46 @@ class Codegen {
     if (ra && rb) {
       return `__pine.ta.${fn}At(${ra.arr}, ${rb.arr}, __index, ${ra.offset}, ${rb.offset})`
     }
+    // 至少一侧拿不到整条序列（var 变量、条件赋值的顶层标量）：改由环形缓冲
+    // 分别取「当前值」与「上一根的值」，判定口径与整条数组一致，
+    // 不再退化成只看当前 bar 的近似比较。
+    const pa = this.crossOperand(pos[0]?.value, ra)
+    const pb = this.crossOperand(pos[1]?.value, rb)
+    if (pa && pb) {
+      return `__pine.ta.${fn}Vals(${pa.cur}, ${pa.prev}, ${pb.cur}, ${pb.prev})`
+    }
     const a = pos[0] ? this.expr(pos[0].value) : 'NaN'
     const b = pos[1] ? this.expr(pos[1].value) : 'NaN'
     this.warn(`${fn}() 的参数无法映射为序列，已按当前 bar 的数值比较近似`, e)
     if (fn === 'crossover') return `__pine.gt(${a}, ${b})`
     if (fn === 'crossunder') return `__pine.lt(${a}, ${b})`
     return `(__pine.gt(${a}, ${b}) || __pine.lt(${a}, ${b}))`
+  }
+
+  /**
+   * 交叉操作数的「当前值 / 上一根值」表达式。
+   *
+   * 优先整条数组（`at(arr, idx, 0|1)`）；数组不可得时退回环形缓冲：
+   *  - `var` 变量在每根 bar 顶部入环，`hist(ring, 0)` 才是上一根的值；
+   *  - 非 var 顶层标量在赋值之后入环，上一根对应 `hist(ring, 1)`。
+   * 两者都拿不到时返回 null，由调用方给出警告并退化为当前 bar 比较。
+   */
+  private crossOperand(
+    e: Expr | undefined,
+    ref: { arr: string; offset: number } | null,
+  ): { cur: string; prev: string } | null {
+    if (!e) return null
+    if (ref) {
+      const idx = ref.offset === 0 ? '__index' : `(__index - ${ref.offset})`
+      return { cur: `__pine.at(${ref.arr}, ${idx}, 0)`, prev: `__pine.at(${ref.arr}, ${idx}, 1)` }
+    }
+    if (e.kind === 'ident' && this.histNeed.has(e.name) && !BUILTIN_SERIES.has(e.name)) {
+      const prev = this.vars.has(e.name)
+        ? `__pine.hist(__h_${e.name}, 0)`
+        : `__pine.hist(__h_${e.name}, 1)`
+      return { cur: this.jsVar(e.name), prev }
+    }
+    return null
   }
 
   /** v4 `security()` / `request.security()`：多标的取值未实现，降级为「取当前序列」 */

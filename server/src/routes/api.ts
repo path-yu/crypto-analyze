@@ -253,7 +253,11 @@ apiRouter.get('/pine/scripts', (_req: Request, res: Response) => {
 
 /**
  * 保存脚本：POST /api/pine/scripts  { name, source }
- * 同名视为更新（就地覆盖），换名即新增；写入后立即落盘，重启服务仍在。
+ *
+ * 同名视为更新（就地覆盖），换名即新增；落盘位置：
+ *   server/pine/<脚本名目录>/<脚本名目录>.pine   原始源码
+ *   server/pine/<脚本名目录>/<脚本名目录>.ts     编译产物（保存时顺带编译一次）
+ * 另外在 .cache/pine-scripts.json 记一份索引，重启服务仍在。
  */
 apiRouter.post('/pine/scripts', (req: Request, res: Response) => {
   try {
@@ -266,7 +270,14 @@ apiRouter.post('/pine/scripts', (req: Request, res: Response) => {
     } catch (e) {
       throw new ValidationError(e instanceof Error ? e.message : '脚本名不合法')
     }
-    res.json({ ok: true, data: savePineScript(name, source) })
+    // 编译失败也照样保存源码（源码比产物重要），此时只写 .pine
+    let ts: string | undefined
+    try {
+      ts = compilePineCached(source, { sourceName: name }).ts
+    } catch {
+      ts = undefined
+    }
+    res.json({ ok: true, data: savePineScript(name, source, ts) })
   } catch (err) {
     fail(res, err)
   }
