@@ -663,7 +663,9 @@ apiRouter.post('/pine/backtest', async (req, res) => {
 ### 14.5 验收与本轮之后的 TODO
 
 - [x] `server/pine/tv` 16 个 TradingView 开源脚本：编译 + 逐 bar 运行 **16/16**
-- [x] `server/pine` 本地脚本（含 Ichimoku / SwiftEdge GEX）：**7/7**（6000 根 K 线下同样全绿）
+- [x] `server/pine` 本地脚本（含 Ichimoku / SwiftEdge GEX）：**7/7**
+- [x] 长周期体检（6000 根 K 线，`check-pine-corpus.ts <dir> 6000`）：`server/pine/tv` **16/16**，
+  耗时 31.3s → 10.6s（§14.3 的窗口重算 + 整数组缓存）
 - [x] 新增 M10 回归 4 条（HTF 重采样对齐 / 行内序列 / map·matrix / 多类型实参泛型），`npm test` **71/71 通过**
 
 剩余 TODO（按优先级）：
