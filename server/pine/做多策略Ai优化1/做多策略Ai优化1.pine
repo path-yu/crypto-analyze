@@ -1,0 +1,164 @@
+//@version=4
+// ============================================================================
+// BTC_Long_Only_TV01 —— 复盘优化版（推荐配置）
+//
+// 与原脚本的唯一差别集中在「风险管理层」，入场条件、EMA20/SMA100/SMA200、
+// MACD(12,26,7)、ATR(14) 的口径完全保持一致：
+//
+//   ① 保本止损（新增，默认开启）：浮盈达到 1×ATR% 后，把止损上移到开仓价。
+//      —— 原脚本那个 5% 固定止损全年几乎不触发（3 个周期合计仅 4 次），风险
+//         敞口实际上全靠滞后的 EMA/SMA 死叉兜底；复盘显示亏损单里绝大多数都
+//         曾浮盈 0.5% 以上（1H 15/19、2H 6/7、4H 3/3），保本止损能把这些单子
+//         从亏损拉回成本附近。这是复盘后**唯一在两年（样本内熊市年 + 样本外
+//         牛市年）里都不掉链子**的改动：2H 样本内 +4.7pt、4H 样本内 +3.2pt，
+//         样本外 4H +2.0pt、2H 仅 -2.8pt。
+//
+//   ② 死叉离场保留原样（默认 useCrossExit=1）。
+//      —— 复盘确认死叉离场滞后（多单被死叉平掉后价格平均还能同向再走
+//         2.3%~5.7%；盈利单平均回吐 4.5~6.0 个百分点，捕获率仅 35%~55%），
+//         但把它改成「仅浮亏时离场（useCrossExit=2）」或「完全取消（=0）」后，
+//         策略会退化成「一次开仓长期持有」：3 年回测里只剩 1 笔交易、最大回撤
+//         从 -18% 恶化到 -53%。收益更高但风险特征已不是同一个策略，
+//         因此不作为默认，仅保留开关供按行情/风险偏好切换。
+//
+// 被验证后**否决**的两项改动（本文件里已关闭，保留开关便于复现）：
+//   · ATR 移动止损（trailAtrMult）：即使改成「保本激活后才生效」，仍明显加剧
+//     交易频次（2H 从 10 笔涨到 23~38 笔），双窗口均值不升反降 —— 止损比原
+//     5% 更紧，把趋势单提前切碎。
+//   · 修正 IsRising 的反向逻辑（useTrendFilter=1）：该函数名为「上涨」、实现
+//     却是「未上涨」，修正后入场条件被大幅放宽（1H 从 28 笔升到 82 笔），
+//     收益反而下降 —— 这个反向条件在样本内是有效的过滤器（见复盘文档 §4.1）。
+//
+// 已知口径说明：本项目撮合引擎对 Pine 脚本采用「信号 bar 收盘判定、下一根
+// 开盘市价成交」（与 TradingView 未设 process_orders_on_close 的默认一致），
+// 止损不会被盘中触发，实际成交可能差于设定值（实测最差 -5.96%）。
+// ============================================================================
+strategy(title="BTC_Long_Only_TV01_opt", overlay=true, max_bars_back=3000, initial_capital=1000, commission_value=0.1)
+
+[macdLine, macdSignalLine, macdHist] = macd(close, 12, 26, 7)
+
+leverage = 1
+positionSize = 1000
+
+// --- 风险管理层参数（默认值 = 复盘结论推荐值）---
+float stopLossPct    = input(5.0, "StopLoss in %", type=input.float)
+float beAtrMult      = input(1.0, "BreakEven trigger (xATR%) 0=off", type=input.float)
+float trailAtrMult   = input(0.0, "Trailing stop (xATR%) 0=off", type=input.float)
+float trailAfterBE   = input(1.0, "Trail only after BreakEven armed (1/0)", type=input.float)
+float useCrossExit   = input(1.0, "Cross exit: 0=off 1=always 2=only-if-losing", type=input.float)
+float useTrendFilter = input(0.0, "True-rising momentum filter (1/0)", type=input.float)
+
+FromDay   = 01
+FromMonth = 01
+FromYear  = 2020
+ToDay     = 14
+ToMonth   = 05
+ToYear    = 2029
+
+start  = timestamp(FromYear, FromMonth, FromDay, 00, 00)
+finish = timestamp(ToYear, ToMonth, ToDay, 23, 59)
+window() => time >= start and time <= finish
+
+// --- 原始函数（名字与实现相反，见文件头说明；保持原样以复现原策略）---
+IsRising(data, loopBack) =>
+    bIsRising = true
+    for n = 1 to loopBack
+        if data[n] > data[n-1]
+            bIsRising := false
+        continue
+    bIsRising
+
+// --- 状态变量 ---
+float currentPrice = close
+float entryPrice = 0.0
+float stopLossPrice = 0.0
+float highestCloseSinceEntry = 0.0
+bool  bPositionOpened = false
+bool  bBreakEvenArmed = false
+float atrValue = 0.0
+float atrPct = 0.0
+
+// --- 指标（与原脚本一致）---
+ema     = ema(close, 20)
+sma     = sma(close, 100)
+smaSlow = sma(close, 200)
+
+plot(sma, color=color.green)
+plot(smaSlow, color=color.orange)
+plot(ema, color=color.yellow)
+
+// --- 上一根状态结转 ---
+stopLossPrice := na(stopLossPrice[1]) ? 0.0 : stopLossPrice[1]
+entryPrice := na(entryPrice[1]) ? 0.0 : entryPrice[1]
+highestCloseSinceEntry := na(highestCloseSinceEntry[1]) ? 0.0 : highestCloseSinceEntry[1]
+bPositionOpened := na(bPositionOpened[1]) ? false : bPositionOpened[1]
+bBreakEvenArmed := na(bBreakEvenArmed[1]) ? false : bBreakEvenArmed[1]
+
+// --- 动量条件（原反向逻辑 / 修正版，可切换）---
+bEMAIsRising      := IsRising(ema, 2)
+bSMAIsRising      := IsRising(sma, 3)
+bMACDIsRising     := IsRising(macdLine, 3)
+bMACDHistIsRising := IsRising(macdHist, 1)
+bSMASlowIsRising  := IsRising(smaSlow, 10)
+bMACDSignalIsRising = IsRising(macdSignalLine, 3)
+
+bEMAIsRisingTrue     = ema[0] > ema[2]
+bSMAIsRisingTrue     = sma[0] > sma[3]
+bMACDIsRisingTrue    = macdLine[0] > macdLine[3]
+bSMASlowIsRisingTrue = smaSlow[0] > smaSlow[10]
+
+bMomentumOriginal = bSMASlowIsRising and bMACDIsRising and bEMAIsRising and bSMAIsRising
+bMomentumTrueRise = bSMASlowIsRisingTrue and bMACDIsRisingTrue and bEMAIsRisingTrue and bSMAIsRisingTrue
+bMomentumUse = useTrendFilter >= 0.5 ? bMomentumTrueRise : bMomentumOriginal
+
+atrValue := atr(14)
+atrPct := (atrValue / currentPrice) * 100
+
+if (window())
+    // ---- 开仓：条件与原脚本一致 ----
+    if (bPositionOpened == false and bMomentumUse == true and ema[0] > sma[0] and sma[0] < currentPrice)
+        stockPositionSize = (positionSize*leverage)/currentPrice
+        entryPrice := currentPrice
+        stopLossPrice := currentPrice * (1 - stopLossPct/100)
+        highestCloseSinceEntry := currentPrice
+        bBreakEvenArmed := false
+        bPositionOpened := true
+        strategy.entry("myPosition", strategy.long, qty=stockPositionSize, comment="BUY at " + tostring(currentPrice))
+
+    // ---- 持仓管理：保本（+ 可选移动止损）----
+    if (bPositionOpened == true)
+        highestCloseSinceEntry := math.max(highestCloseSinceEntry, currentPrice)
+        if (beAtrMult > 0 and bBreakEvenArmed == false and currentPrice >= entryPrice * (1 + beAtrMult*atrPct/100))
+            bBreakEvenArmed := true
+        if (trailAtrMult > 0)
+            stopLossPrice := math.max(stopLossPrice, highestCloseSinceEntry * (1 - trailAtrMult*atrPct/100))
+        if (bBreakEvenArmed == true)
+            stopLossPrice := math.max(stopLossPrice, entryPrice)
+
+    // ---- 离场：硬止损 / 保本止损 ----
+    if (bPositionOpened == true and currentPrice <= stopLossPrice)
+        strategy.close("myPosition", comment="STOP " + tostring(currentPrice))
+        bPositionOpened := false
+        entryPrice := 0.0
+        stopLossPrice := 0.0
+        bBreakEvenArmed := false
+        highestCloseSinceEntry := 0.0
+
+    // ---- 离场：EMA/SMA 死叉（默认仅在浮亏时生效）----
+    //   useCrossExit = 1：任何死叉都离场（原脚本行为，用于对照复现）
+    //   useCrossExit = 2：仅浮亏时按死叉离场（推荐）
+    if (bPositionOpened == true and useCrossExit > 0.5 and useCrossExit < 1.5 and crossunder(ema[1], sma[1]))
+        strategy.close("myPosition", comment="CROSS " + tostring(currentPrice))
+        bPositionOpened := false
+        entryPrice := 0.0
+        stopLossPrice := 0.0
+        bBreakEvenArmed := false
+        highestCloseSinceEntry := 0.0
+
+    if (bPositionOpened == true and useCrossExit >= 1.5 and currentPrice <= entryPrice and crossunder(ema[1], sma[1]))
+        strategy.close("myPosition", comment="CROSS-LOSS " + tostring(currentPrice))
+        bPositionOpened := false
+        entryPrice := 0.0
+        stopLossPrice := 0.0
+        bBreakEvenArmed := false
+        highestCloseSinceEntry := 0.0

@@ -533,7 +533,7 @@ export default function ControlPanel({
               min={1}
               max={125}
               suffix="x"
-              tooltip="名义价值 = 保证金 × 杠杆；杠杆越高，同等价格波动下的盈亏放大越多，也越容易触及强平"
+              tooltip="名义价值 = 保证金 × 杠杆；杠杆越高，同等价格波动下的盈亏放大越多，也越容易触及强平。（Pine 脚本默认由脚本内 qty 定仓位，此处不生效，见下方开关）"
               onChange={(v) => set('leverage', Math.round(v))}
             />
             <NumField
@@ -543,7 +543,7 @@ export default function ControlPanel({
               min={1}
               max={100}
               suffix="%"
-              tooltip="每次开仓使用的保证金占当前权益的百分比"
+              tooltip="每次开仓使用的保证金占当前权益的百分比。（Pine 脚本默认由脚本内 qty 定仓位，此处不生效，见下方开关）"
               onChange={(v) => set('positionSizePercent', v)}
             />
             <NumField
@@ -572,6 +572,32 @@ export default function ControlPanel({
               </Tooltip>
             }
           />
+          {/* Pine 脚本专属：脚本给了 qty 时，由谁决定仓位 */}
+          {params.strategy === 'pine' && (
+            <FormControlLabel
+              sx={{ mt: 0.5, display: 'flex', alignItems: 'flex-start' }}
+              control={
+                <Switch
+                  size="small"
+                  sx={{ mt: -0.25 }}
+                  checked={params.useScriptPositionSize}
+                  onChange={(e) => set('useScriptPositionSize', e.target.checked)}
+                />
+              }
+              label={
+                <Tooltip
+                  title={
+                    '开启（TradingView 口径）：名义价值 = 脚本 strategy.entry(qty=…) × 价格，' +
+                    '「杠杆 / 仓位比例」不参与定仓（杠杆只影响保证金与「收益率」列的分母）。\n' +
+                    '关闭（引擎口径）：忽略脚本 qty，名义价值 = 权益 × 仓位比例 × 杠杆，' +
+                    '与 fib / supertrend / order-block 三个策略一致 —— 例如 1000 本金 / 仓位 100% / 杠杆 10 得名义价值 10000。'
+                  }
+                >
+                  <Typography variant="caption">仓位由脚本 qty 决定（TradingView 口径）</Typography>
+                </Tooltip>
+              }
+            />
+          )}
         </Box>
 
         <Divider />
@@ -589,6 +615,8 @@ export default function ControlPanel({
               notched
               value={pine.selectedId ? `saved:${pine.selectedId}` : params.strategy}
               onChange={(e) => selectStrategy(e.target.value)}
+              // 打开下拉时重新拉一次已保存脚本：应用之外新增的脚本目录（IDE / git pull）也能立刻看到
+              onOpen={() => void pine.onRefresh()}
             >
               <MenuItem value="fib-trend">Fibonacci Trend Reversals（IMBA + TSOT）</MenuItem>
               <MenuItem value="supertrend">SuperTrend（KivancOzbilgic）</MenuItem>

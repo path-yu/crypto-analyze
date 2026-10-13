@@ -1,0 +1,97 @@
+//@version=4
+// ============================================================================
+// PumpAmbush —— 埋伏型暴涨捕获（1h）
+//
+// 【为什么是这套规则】先做了纯统计检验（scripts/scan-ambush.ts，20 个币、165k 根 bar、
+// 178 段暴涨），看「启动前的收缩状态」是否真能提前预测，结果（K=72 根预测窗，基线 5.72%）：
+//
+//   信号                          信号段   精度    lift   覆盖暴涨段
+//   S1 量枯竭 volR<0.5            18589   5.1%   0.90   172/178   ← 无效（比随机还差）
+//   S2 波动压缩 atrPct<0.7×240均     1855   5.4%   0.95    88/178   ← 无效
+//   S3 窄幅 48根振幅<35%             371  21.3%   3.72   157/178   ← 唯一有效
+//   S3a 窄幅<20%                    922   4.8%   0.83   110/178   ← 收紧反而变差
+//   S3b 窄幅<25%                    630   8.7%   1.53   132/178   ← 次之
+//   E  首根放量                     8008   7.0%   1.22   165/178   ← 弱
+//   S3b+低位 / +高位 / +缩量 / +站上MA200 / +均线粘合 / +首根放量  ← **全部把 lift 拉回 1 以下**
+//
+// 两条关键结论：
+//   ① 真正的启动前夜特征只有一个：**48 根振幅收敛到 35% 以内**（精度是基线的 3.7 倍，
+//      且覆盖 88% 的暴涨段）。「量枯竭」「波动压缩」这些直觉上的特征实测无效 ——
+//      原因是非暴涨的垃圾币同样长期缩量横盘，它们不具备区分度。
+//   ② **不要给这个条件加任何附加过滤**：低位/高位/缩量/均线/首根放量一律把 lift 打到 1 以下。
+//      极窄（<20%）也不行 —— 那更多是"下跌途中的死水"，而不是启动前夜。
+//
+// 【策略结构】埋伏的天然优势是"风险小、赔率大"：在横盘里布仓，止损放在区间下沿附近；
+// 若 72 根内没启动就时间止损走人；若启动则用 10% 吊灯移动止损跟随主升段
+// （10% 吊灯是上一轮实测的最优离场，见 PumpHunter.pine 的复盘结论）。
+//
+// 【仓位】固定名义价值 qty = notional / 价格。
+// ============================================================================
+strategy(title="PumpAmbush", overlay=true, max_bars_back=500, initial_capital=1000, commission_value=0.055)
+
+// ---------------- 参数 ----------------
+float notional  = input(1000.0, "单笔名义价值 USDT", type=input.float)
+float rangePct  = input(35.0, "48根振幅 < %", type=input.float)
+float maxPos    = input(100.0, "只在区间下 X% 处布仓 (100=不限)", type=input.float)
+float useLowStop = input(0.0, "止损放48根低点下方 (1/0)", type=input.float)
+float slPct     = input(15.0, "初始止损 %（useLowStop=0 时生效）", type=input.float)
+float trailArm  = input(0.0,  "移动止损激活所需浮盈 % (0=立即)", type=input.float)
+float trailPct  = input(10.0, "吊灯移动止损 %", type=input.float)
+float maxBars   = input(72.0, "时间止损 K线数", type=input.float)
+
+// ---------------- 信号：48 根振幅收敛 ----------------
+hi48 = highest(high, 48)
+lo48 = lowest(low, 48)
+range48 = close > 0 ? (hi48 - lo48) / close : 1
+narrow = range48 < rangePct / 100
+// 收盘价在 48 根区间里的位置：0 = 贴近区间最低，100 = 贴近区间最高
+posInRange = hi48 > lo48 ? ((close - lo48) / (hi48 - lo48)) * 100 : 0
+
+plot(hi48, color=color.gray)
+plot(lo48, color=color.gray)
+
+// ---------------- 状态（必须用 var，否则每根 bar 都会重置 → 止损永不触发）----------------
+var float stopPx  = 0.0
+var float entryPx = 0.0
+var float hiSince = 0.0
+var bool  armed   = false
+var float heldN   = 0.0
+var bool  canEnter = true
+
+// 每段横盘只布一次仓：条件消失后才重新武装，避免同一段横盘被反复进出
+if (narrow == false)
+    canEnter := true
+
+if (strategy.position_size <= 0)
+    stopPx := 0.0
+    armed := false
+    hiSince := 0.0
+    heldN := 0.0
+    entryPx := 0.0
+else
+    if (stopPx == 0)
+        entryPx := strategy.position_avg_price
+        // 两种止损口径：固定百分比，或「放在 48 根区间下沿下方 1%」——
+        // 后者让风险随横盘宽度自适应：横盘越窄、风险越小（埋伏型的赔率来自这里）
+        stopPx := useLowStop >= 0.5 ? lo48 * (1 - 0.01) : entryPx * (1 - slPct / 100)
+        hiSince := high
+        armed := false
+        heldN := 0.0
+    else
+        // 先用「上一根收盘已确定」的止损判定离场（不要用本根 high 设、本根 low 触）
+        if (low <= stopPx)
+            strategy.close("A", comment="STOP " + tostring(close))
+            stopPx := 0.0
+        if (stopPx > 0 and heldN >= maxBars and close <= entryPx)
+            strategy.close("A", comment="TIME " + tostring(close))
+            stopPx := 0.0
+
+    hiSince := math.max(hiSince, high)
+    if (trailArm <= 0 or hiSince >= entryPx * (1 + trailArm / 100))
+        stopPx := math.max(stopPx, hiSince * (1 - trailPct / 100))
+    heldN := heldN + 1
+
+// 布仓（引擎在下一根开盘成交）
+if (strategy.position_size <= 0 and canEnter and narrow and posInRange <= maxPos)
+    strategy.entry("A", strategy.long, qty=notional / close, comment="AMBUSH " + tostring(close))
+    canEnter := false

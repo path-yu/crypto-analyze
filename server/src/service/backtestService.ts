@@ -100,6 +100,7 @@ export function normalizeParams(input?: Partial<StrategyParams>): StrategyParams
   p.partialTp = Boolean(p.partialTp)
   p.allowReversePosition = Boolean(p.allowReversePosition)
   p.checkLiquidation = Boolean(p.checkLiquidation)
+  p.useScriptPositionSize = Boolean(p.useScriptPositionSize)
   // 金字塔式加仓：0 = 不限，其余取 1~20 的整数（1 = 不加仓）
   p.pyramiding = Math.round(clamp(p.pyramiding, 0, 20, d.pyramiding))
   // 滑点：0 = 不模拟（TradingView 的 slippage 以 tick 为单位）
@@ -283,7 +284,14 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
     })
     const signals = allCandles.map(() => emptyPineSignal())
     signalProvider = (index, ctx) => {
-      signals[index] = program.step(index, ctx)
+      const s = program.step(index, ctx)
+      /**
+       * `useScriptPositionSize = false`：忽略脚本 `strategy.entry(qty=…)` 指定的下单量，
+       * 让引擎按 UI 的「权益 × 仓位比例 × 杠杆」定名义价值（与其余三个策略一致）。
+       * 置 na 后引擎走非 fixed 路径：margin = 权益 × 仓位比例、notional = margin × 杠杆。
+       */
+      if (!params.useScriptPositionSize) s.entryQty = Number.NaN
+      signals[index] = s
     }
     series = { signals }
     pineArtifact = {

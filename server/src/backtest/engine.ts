@@ -317,10 +317,31 @@ class BacktestEngine {
     const marginCap = this.cash * this.sizeFraction
     if (!fixed && marginCap <= 0) return
     const notional = fixed ? (fixedQty as number) * price : marginCap * this.leverage
-    const margin = fixed ? notional / this.leverage : marginCap
     const qty = fixed ? (fixedQty as number) : notional / price
-    // 固定数量时按 TradingView 的口径做资金校验：保证金不足则本轮不下单
-    if (fixed && margin > this.cash) return
+    /**
+     * 资金门槛：固定数量（Pine 的 `strategy.entry(qty=…)`）时按
+     * 「名义价值 / 引擎杠杆」估算所需保证金，不足则本轮不下单。
+     *
+     * 注意这只是**准入条件**，不代表实际占用 —— 它与下面的 `margin` 刻意解耦，
+     * 否则本金被手续费削减一点之后（1000 → 998.9）就会把后续同额订单全部挡掉。
+     */
+    if (fixed && notional / this.leverage > this.cash) return
+    /**
+     * 占用保证金（= 报告口径里的「保证金」）= 这笔仓位实际占用的自有资金。
+     *
+     * - 引擎口径（脚本没给 qty）：`marginCap`（权益 × 仓位比例），
+     *   名义价值 = marginCap × 杠杆，是一笔真正的杠杆仓；
+     * - 脚本 qty 口径：下单量由脚本给定，引擎杠杆**没有**放大名义价值，
+     *   所以这是一笔 1 倍仓，占用即全额名义价值。
+     *
+     * 记录成 1 倍之后，「收益率 = 净额 / 保证金」才等于「该笔对账户的实际收益率」。
+     * 若仍按 `名义价值 / 杠杆` 记账，就会出现两套口径打架：
+     * 名义价值按 1 倍计、收益率却按杠杆放大（表现为「价格变动 2.28%，
+     * 收益率却显示 +21.68%」、「逐笔收益率加起来推不出账户总收益」）。
+     */
+    const margin = fixed ? notional : marginCap
+    /** 该笔仓位真正的杠杆倍数：脚本 qty 仓位是 1 倍，只有引擎口径才带杠杆 */
+    const positionLeverage = fixed ? 1 : this.leverage
     const entryFee = notional * this.feeRate
     if (this.cash - entryFee <= 0) return
 
@@ -345,7 +366,7 @@ class BacktestEngine {
       remaining: 1,
       notional,
       margin,
-      leverage: this.leverage,
+      leverage: positionLeverage,
       initialStopLoss:
         typeof displayStopLoss === 'number' && Number.isFinite(displayStopLoss)
           ? displayStopLoss

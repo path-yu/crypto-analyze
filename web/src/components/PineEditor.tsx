@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef, useState } from 'react'
+﻿﻿import { useEffect, useRef, useState } from 'react'
 import Accordion from '@mui/material/Accordion'
 import AccordionDetails from '@mui/material/AccordionDetails'
 import AccordionSummary from '@mui/material/AccordionSummary'
@@ -46,6 +46,14 @@ export interface PinePanelState {
   onSave: () => Promise<SavedPineScript>
   /** 删除当前载入的已保存脚本 */
   onDelete: () => Promise<void>
+  /**
+   * 重新拉取已保存脚本列表。
+   *
+   * 列表只在「页面加载 / 保存 / 删除」时刷新，因此在应用之外新增的脚本目录
+   * （IDE、`git pull`、文件管理器拷进来的 `server/pine/<名>/<名>.pine`）不会
+   * 自动出现在策略下拉里 —— 打开下拉时调一次即可看到。
+   */
+  onRefresh: () => Promise<void>
   /** 是否在右侧 Drawer 弹窗中放大编辑（面板内的紧凑编辑器让位） */
   drawerOpen: boolean
   onToggleDrawer: () => void

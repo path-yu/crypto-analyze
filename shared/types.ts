@@ -256,6 +256,20 @@ export interface StrategyParams {
   leverage: number
   /** 每次开仓投入的保证金占当前权益的百分比，默认 100 */
   positionSizePercent: number
+  /**
+   * Pine 脚本用 `strategy.entry(qty=…)` 显式指定下单量时，是否让它决定仓位。
+   *
+   * - `true`：遵循 TradingView 语义，`qty × 价格` 即名义价值，
+   *   此时 `leverage` / `positionSizePercent` **不参与**定仓位
+   *   （`leverage` 仅用于反推占用保证金与「收益率」列的分母）。默认值。
+   * - `false`：忽略脚本的 `qty`，改按 UI 的
+   *   `名义价值 = 权益 × positionSizePercent × leverage` 定仓位
+   *   （与 fib / supertrend / order-block 三个策略一致），
+   *   例如 1000 本金 / 仓位 100% / 杠杆 10 → 名义价值 10000。
+   *
+   * 两者产出的逐笔盈亏相差一个 `leverage` 倍数，因此切换后必须重新回测。
+   */
+  useScriptPositionSize: boolean
   /** 是否启用强平检查（按逐仓 1/leverage 价格波动估算） */
   checkLiquidation: boolean
   /**
@@ -323,6 +337,8 @@ export const DEFAULT_STRATEGY_PARAMS: StrategyParams = {
   initialCapital: 1000,
   leverage: 3,
   positionSizePercent: 100,
+  // 默认遵循 TradingView 语义：脚本给了 qty 就按它定仓位
+  useScriptPositionSize: true,
   checkLiquidation: true,
   // fib / supertrend 原版均未设置 slippage，默认不模拟
   slippageTicks: 0,

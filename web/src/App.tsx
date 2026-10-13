@@ -194,8 +194,10 @@ export default function App() {
       const list = await fetchPineScripts()
       setPineScripts(list)
       setPineScriptId((id) => (id && list.some((s) => s.id === id) ? id : null))
-    } catch {
-      /* 列表拉取失败不影响回测，下次保存或刷新时会再试 */
+    } catch (err) {
+      // 列表拉取失败不影响回测（下次打开下拉 / 保存 / 刷新时会再试），
+      // 但要留下日志，否则「明明脚本在磁盘上、下拉里却没有」会无从排查
+      console.warn('[pine] 已保存脚本列表拉取失败：', err)
     }
   }, [])
 
@@ -251,6 +253,7 @@ export default function App() {
       onSelect: handleSelectPineScript,
       onSave: handleSavePine,
       onDelete: handleDeletePine,
+      onRefresh: refreshPineScripts,
       drawerOpen: pineDrawerOpen,
       onToggleDrawer: togglePineDrawer,
     }),
@@ -262,6 +265,7 @@ export default function App() {
       handleSelectPineScript,
       handleSavePine,
       handleDeletePine,
+      refreshPineScripts,
       pineDrawerOpen,
       togglePineDrawer,
     ],
