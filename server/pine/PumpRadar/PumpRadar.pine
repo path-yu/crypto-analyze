@@ -1,0 +1,87 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// ===========================================================================
+//  PumpRadar —— 暴涨前哨（N-of-M 评分门）
+//  由 9 个暴涨代币（MYX/LAB/RAVE/TRB/BTR/SIREN/BANK/AKE/币安人生）的
+//  事件研究得出：点火前 48 根内，以下四个特征对「启动」有正向区分度
+//  （lift = 信号精度 / 随机基线）：
+//    F1 CVD 走强        lift 2.30   主动买卖占比×量 → EMA → 累积，高于 48 根前
+//    F2 振幅收缩        lift 1.86   24 根振幅低于其 240 根均值的 80%
+//    F3 量能抬升        lift 1.58   6 根均量 / 96 根均量 > 1.2
+//    F4 买卖压力偏多    lift 1.36   48 根主动买量 / 卖量 > 1.2
+//  评分 ≥ 阈值(默认 3/4) 时，下一根开盘做多。
+//  离场：结构止损（24 根最低点下方）+ 吊灯 20%（收盘口径）+ 96 根时间止损。
+//  仓位：建议账户层面按「单笔风险 ≤ 1% 权益」反推名义仓位（详见复盘报告）。
+// ===========================================================================
+
+//@version=6
+strategy("PumpRadar 暴涨前哨", overlay=true,
+     commission_type=strategy.commission.percent, commission_value=0.055,
+     slippage=2, initial_capital=10000, default_qty_type=strategy.percent_of_equity,
+     default_qty_value=12, pyramiding=0)
+
+// ------------------------- 参数 -------------------------
+cvdLen    = input.int(48,  "CVD：Delta EMA 平滑", group="CVD")
+cvdBack   = input.int(48,  "CVD 回看根数", group="CVD")
+rngLen    = input.int(24,  "振幅窗口", group="结构")
+rngSmaLen = input.int(240, "振幅基准均线", group="结构")
+pickLen   = input.int(96,  "量能基准均线", group="量能")
+scoreMin  = input.int(3,   "最低评分 (1~4)", minval=1, maxval=4, group="门")
+
+useSL    = input.bool(true, "结构止损", group="风控")
+slBuf    = input.float(0.5, "止损缓冲 (%)", step=0.1, group="风控",
+     tooltip="止损放在 24 根最低点下方该百分比处")
+useTrail = input.bool(true, "吊灯离场", group="风控")
+trailPct = input.float(20.0, "吊灯回撤 (%)", step=1, group="风控",
+     tooltip="收盘价自进场以来最高收盘回撤该幅度时平仓")
+maxBars  = input.int(96, "时间止损(根) 0=不限", group="风控")
+
+// ------------------------- 特征 -------------------------
+rng      = high - low
+delta    = volume * (rng > 0 ? (close - open) / rng : 0.0)
+deltaEma = ta.ema(delta, cvdLen)
+cvd      = ta.cum(deltaEma)
+f1 = cvd > cvd[cvdBack]
+
+hiN      = ta.highest(high, rngLen)
+loN      = ta.lowest(low, rngLen)
+rangeComp = close > 0 ? (hiN - loN) / close : na
+rangeBase = ta.sma(rangeComp, rngSmaLen)
+f2 = rangeBase > 0 and rangeComp < rangeBase * 0.8
+
+volPickup = ta.sma(volume, 6) / ta.sma(volume, pickLen)
+f3 = volPickup > 1.2
+
+upVol = ta.sma(math.max(delta, 0.0), 48)
+dnVol = ta.sma(math.max(-delta, 0.0), 48)
+f4 = dnVol > 0 and upVol / dnVol > 1.2
+
+score = (f1 ? 1 : 0) + (f2 ? 1 : 0) + (f3 ? 1 : 0) + (f4 ? 1 : 0)
+
+// ------------------------- 交易 -------------------------
+longCond = score >= scoreMin and strategy.position_size == 0
+var float sqStop = na
+var float hiMark = na
+var int   held   = 0
+
+if longCond
+    strategy.entry("Radar", strategy.long)
+    sqStop := ta.lowest(low, 24) * (1 - slBuf / 100)
+    hiMark := close
+    held := 0
+
+if strategy.position_size > 0
+    if useSL
+        strategy.exit("SL", "Radar", stop=sqStop)
+    if useTrail and close < hiMark * (1 - trailPct / 100)
+        strategy.close("Radar", comment="吊灯离场")
+    held := held + 1
+    if maxBars > 0 and held >= maxBars
+        strategy.close("Radar", comment="时间止损")
+else
+    held := 0
+
+// ------------------------- 可视化 -------------------------
+plotshape(longCond, "雷达触发", shape.triangleup,
+     location=location.belowbar, color=color.new(color.orange, 0),
+     textcolor=color.white, text="RADAR", size=size.small)
+bgcolor(score >= scoreMin ? color.new(color.orange, 92) : na, title="评分达标背景")
