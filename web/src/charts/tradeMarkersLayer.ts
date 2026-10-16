@@ -13,9 +13,9 @@
  *   · `trades`   —— 每笔交易的入场/出场点、持仓区间、止损/TP 价位
  *   · `lines`    —— 策略自带的叠加线（imbaTrendLine / supertrendUp / supertrendDn）
  *
- * 点选交易：图层每帧把「标记的屏幕坐标」写进模块级 `tradeHitState`，
- * KLinePanel 在容器 `mouseup` 时按半径命中；未命中时再用 `tradeHitState.timeAt`
- * 把 x 换算回时间，找覆盖该时间的交易（与改造前 klinecharts 的行为一致）。
+ * 点选交易：图层每帧把「三角标记的屏幕坐标」写进模块级 `tradeHitState`，
+ * KLinePanel 在容器 `mouseup` 时按半径命中。只有三角标记能被点中 ——
+ * 点空白处、或点 Vela 自带的 HTML chrome（图例行、工具条等）都不会打开交易明细。
  */
 
 import { registerNativeIndicator, registerRendererLayer } from '@luxalgo/vela/plugin'
@@ -23,6 +23,8 @@ import type { BacktestResult, Trade } from '@shared/types'
 
 /** 图层 id 同时也是原生指标 type 与原生数据通道名 */
 export const TRADE_LAYER_ID = 'stock-trades'
+/** 回放弹窗用的第二套图层 id：payload 独立，且不参与点选 */
+export const TRADE_REPLAY_LAYER_ID = 'stock-trades-replay'
 
 /* ------------------------------------------------------------------ */
 /* payload                                                             */
@@ -47,6 +49,11 @@ export interface IndicatorLinePayload {
   color: string
   /** 逐点；值为 null 表示该根 na（断开） */
   points: { time: number; value: number | null }[]
+  /**
+   * 仅在设置时，于线的可见段右端画一个同名标签。
+   * 主图的策略叠加线不设它（保持原有观感），回放的「盈亏平衡线」会设。
+   */
+  label?: string
 }
 
 export interface TradeLayerPayload {
@@ -104,6 +111,47 @@ export function buildTradeLayerPayload(
   return { showTrades, showLevels, trades, lines }
 }
 
+/**
+ * 回放弹窗用的 payload：只画这一笔交易的入场 / 出场标记与价位线。
+ * 不画策略叠加线 —— 回放窗口与周期都可能与策略原周期不同，那条线对不上。
+ *
+ * `breakEvenPrice` 为「毛盈亏 = 双边手续费」的价格，会画成一条带标签的水平线。
+ */
+export function buildReplayLayerPayload(trade: Trade, breakEvenPrice: number): TradeLayerPayload {
+  const lines: IndicatorLinePayload[] = Number.isFinite(breakEvenPrice)
+    ? [
+        {
+          name: '盈亏平衡线',
+          label: '盈亏平衡线',
+          color: '#ffb01f',
+          points: [
+            { time: trade.entryTime, value: breakEvenPrice },
+            { time: trade.exitTime, value: breakEvenPrice },
+          ],
+        },
+      ]
+    : []
+  return {
+    showTrades: true,
+    showLevels: true,
+    trades: [
+      {
+        side: trade.side,
+        entryTime: trade.entryTime,
+        entryPrice: trade.entryPrice,
+        exitTime: trade.exitTime,
+        exitPrice: trade.exitPrice,
+        profitable: trade.netPnl >= 0,
+        label: `${trade.side === 'long' ? '多' : '空'} ${trade.netPnl >= 0 ? '+' : ''}${trade.pnlPercent.toFixed(1)}%`,
+        stopLoss: trade.stopLoss,
+        takeProfit1: trade.takeProfit1,
+        takeProfit2: trade.takeProfit2,
+      },
+    ],
+    lines,
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* 命中状态（图层每帧写入，KLinePanel 读取）                            */
 /* ------------------------------------------------------------------ */
@@ -115,11 +163,12 @@ interface HitRegion {
   index: number
 }
 
-export const tradeHitState: {
+/** 图层每帧写入的命中状态（宿主读取）：只有三角标记的视口坐标 */
+export interface TradeHitSink {
   regions: HitRegion[]
-  /** 把视口 x 换算回该处 K 线的时间；未渲染过则为 null */
-  timeAt: ((clientX: number) => number | null) | null
-} = { regions: [], timeAt: null }
+}
+
+export const tradeHitState: TradeHitSink = { regions: [] }
 
 /** 点选标记的命中半径（像素），与改造前的 klinecharts 行为保持一致 */
 export const MARKER_HIT_RADIUS = 14
@@ -155,9 +204,11 @@ function drawLayer(
   canvas: HTMLCanvasElement | null,
   args: RenderArgs,
   ctx2d: CanvasRenderingContext2D | null,
+  /** 命中状态出口；null = 只画不记（回放弹窗里的第二张图，不参与点选） */
+  sink: TradeHitSink | null,
 ): void {
   const payload = args.data as TradeLayerPayload | undefined
-  tradeHitState.regions = []
+  if (sink) sink.regions = []
   if (!canvas || !ctx2d) return
 
   const { coords } = args
@@ -168,7 +219,6 @@ function drawLayer(
   ctx2d.clearRect(0, 0, w, h)
 
   if (!payload) {
-    tradeHitState.timeAt = null
     return
   }
 
@@ -293,20 +343,34 @@ function drawLayer(
       ctx2d.fillText(t.label, labelX, labelY + 11)
 
       // 命中区：开仓 / 平仓两个点各一个（视口坐标）
-      tradeHitState.regions.push({ x: rect.left + x1, y: rect.top + yEntry, index })
-      tradeHitState.regions.push({ x: rect.left + x2, y: rect.top + yExit, index })
+      if (sink) {
+        sink.regions.push({ x: rect.left + x1, y: rect.top + yEntry, index })
+        sink.regions.push({ x: rect.left + x2, y: rect.top + yExit, index })
+      }
     })
   }
 
-  /* ---- x → 时间（点空白处时找「覆盖该 K 线」的交易） ---- */
-  const bars = args.bars
-  tradeHitState.timeAt = (clientX: number): number | null => {
-    const x = clientX - rect.left
-    if (bars.length === 0) return null
-    const logical = Math.round(coords.xToLogical(x))
-    if (logical < 0 || logical >= bars.length) return null
-    const time = coords.logicalToTime(logical)
-    return Number.isFinite(time) ? time : bars[Math.max(0, Math.min(bars.length - 1, logical))].time
+  /* ---- 带名字的线（如「盈亏平衡线」） ----
+     标签钉在「可见段的右端」：回放时线一直延伸到画面右侧之外，若按线的末点
+     定位，标签会跑到画布外看不见 —— 所以最后要往画布内夹一下。 */
+  ctx2d.font = '600 10px system-ui, sans-serif'
+  for (const line of payload.lines) {
+    if (!line.label) continue
+    let last: { time: number; value: number | null } | null = null
+    for (let i = line.points.length - 1; i >= 0; i--) {
+      if (line.points[i].value !== null) {
+        last = line.points[i]
+        break
+      }
+    }
+    if (!last || last.value === null) continue
+    const labelW = ctx2d.measureText(line.label).width + 8
+    const lx = Math.max(2, Math.min(coords.width - labelW - 2, xOf(last.time)))
+    const ly = yOf(last.value)
+    ctx2d.fillStyle = 'rgba(14,18,27,0.82)'
+    ctx2d.fillRect(lx, ly - 8, labelW, 14)
+    ctx2d.fillStyle = line.color
+    ctx2d.fillText(line.label, lx + 4, ly + 2)
   }
 }
 
@@ -314,15 +378,21 @@ function drawLayer(
 /* 注册（模块顶层执行一次，import 即生效）                              */
 /* ------------------------------------------------------------------ */
 
-let registered = false
-
-/** 注册图层与原生指标；幂等 */
-export function registerTradeVisuals(): void {
-  if (registered) return
-  registered = true
+/**
+ * 注册一套「渲染图层 + 同名原生指标」，并返回这套自己的 payload 写入口。
+ *
+ * 主图与回放弹窗各注册一套：两套各自持有 payload 变量，互不干扰 ——
+ * 回放弹窗打开时主图仍按自己的回测结果绘制，关掉弹窗后主图也不会被残留的
+ * 单笔 payload 覆盖。
+ */
+function registerTradeLayerPair(
+  id: string,
+  sink: TradeHitSink | null,
+): (payload: TradeLayerPayload) => void {
+  let payload: TradeLayerPayload = emptyTradeLayerPayload()
 
   registerRendererLayer({
-    id: TRADE_LAYER_ID,
+    id,
     placement: 'above-data',
     repaintOnCursor: false,
     create: () => {
@@ -334,20 +404,21 @@ export function registerTradeVisuals(): void {
           ctx2d = c.getContext('2d')
         },
         render(args: RenderArgs) {
-          drawLayer(canvas, args, ctx2d)
+          drawLayer(canvas, args, ctx2d, sink)
         },
         destroy() {
           canvas = null
           ctx2d = null
-          tradeHitState.regions = []
-          tradeHitState.timeAt = null
+          if (sink) {
+            sink.regions = []
+          }
         },
       }
     },
   })
 
   registerNativeIndicator({
-    type: TRADE_LAYER_ID,
+    type: id,
     title: '回测交易标记',
     paneHint: 'price',
     overlay: true,
@@ -358,7 +429,7 @@ export function registerTradeVisuals(): void {
     create: () => {
       let ctx: { pushData(data: unknown): void } | null = null
       const push = (): void => {
-        ctx?.pushData(currentPayload)
+        ctx?.pushData(payload)
       }
       return {
         start(c: unknown) {
@@ -376,14 +447,41 @@ export function registerTradeVisuals(): void {
       }
     },
   })
+
+  return (next: TradeLayerPayload): void => {
+    payload = next
+  }
 }
 
-/** 当前 payload：KLinePanel 在推数据前写入，原生指标据此推给图层 */
-let currentPayload: TradeLayerPayload = { showTrades: false, showLevels: false, trades: [], lines: [] }
+function emptyTradeLayerPayload(): TradeLayerPayload {
+  return { showTrades: false, showLevels: false, trades: [], lines: [] }
+}
 
-/** 更新 payload（不触发重推；由 KLinePanel 显式重启指标或切换行情触发） */
+/** 主图（KLinePanel）的 payload 写入口 */
+let writeMainPayload: ((p: TradeLayerPayload) => void) | null = null
+/** 回放弹窗（TradeReplayDialog）的 payload 写入口 */
+let writeReplayPayload: ((p: TradeLayerPayload) => void) | null = null
+
+/** 注册主图图层与原生指标；幂等（模块顶层调用一次即可） */
+export function registerTradeVisuals(): void {
+  if (writeMainPayload) return
+  writeMainPayload = registerTradeLayerPair(TRADE_LAYER_ID, tradeHitState)
+}
+
+/** 注册回放弹窗图层与原生指标；幂等 */
+export function registerTradeReplayVisuals(): void {
+  if (writeReplayPayload) return
+  writeReplayPayload = registerTradeLayerPair(TRADE_REPLAY_LAYER_ID, null)
+}
+
+/** 更新 payload（不触发重推；由宿主显式重启指标或切换行情触发） */
 export function setTradeLayerPayload(payload: TradeLayerPayload): void {
-  currentPayload = payload
+  writeMainPayload?.(payload)
+}
+
+/** 更新回放弹窗的 payload */
+export function setTradeReplayPayload(payload: TradeLayerPayload): void {
+  writeReplayPayload?.(payload)
 }
 
 /** 供 `onSelectTrade` 复用的交易数组（下标与 payload.trades 一致） */

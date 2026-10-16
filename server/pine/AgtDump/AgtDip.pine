@@ -1,0 +1,85 @@
+//@version=6
+// ============================================================================
+// AgtDip —— AGT（山寨币）1h 「深跌放量后抄底」做多  · v6
+//
+// 【为什么做多而不是做空】同目录 AgtDump.pine 复盘显示：AGT 的下跌段（14 段 ≥30%）
+// 确实存在，但**系统性做空没有稳定优势**：放量长阴信号的精度只有 27%，
+// 赔率算下来 `0.27 × (+19%) − 0.73 × (−10%) < 0`，实测做空基线 −81%。
+// 反过来的镜像赔率 `0.73 × (+10%) − 0.27 × (−19%) > 0`，再加上 AGT 本身
+// 一年买入持有 +1116% 的强上行漂移，所以**同一个信号应该反过来做多（抄底）**。
+//
+// 【入场】已经跌够 + 还在放量砸（恐慌盘）
+//   距 72 根最高 ≤ −dropPct%（默认 25%）
+//   单根跌幅 ≥ revPct%（默认 6%）
+//   成交量 ≥ volMult × SMA(成交量,96)（默认 4×）
+//
+// 【离场】（做多：止损在**下方**）
+//   · 初始止损：entryPx × (1 − slPct%)
+//   · 吊灯移动止损：止损 = max(止损, 持仓最高价 × (1 − trailPct%))，可设激活门槛
+//   · 时间止损：持仓 maxBars 根仍未盈利 → 退出
+//
+// 【仓位】固定名义价值 qty = notional / 价格（TradingView 口径）。
+// ============================================================================
+strategy("AgtDip", overlay=true, max_bars_back=500, initial_capital=100000,
+  default_qty_type=strategy.fixed, default_qty_value=1,
+  commission_type=strategy.commission.percent, commission_value=0.055)
+
+// ---------------- 入场参数 ----------------
+notional = input.float(1000.0, "单笔名义价值 USDT")
+dropPct  = input.float(25.0, "距72根最高 ≤ -%")
+revPct   = input.float(6.0,  "单根跌幅 ≥ %")
+volMult  = input.float(4.0,  "成交量 / 96均量 ≥")
+
+// ---------------- 离场参数 ----------------
+slPct    = input.float(10.0, "初始止损 %")
+trailArm = input.float(15.0, "移动止损激活所需浮盈 % (0=立即)")
+trailPct = input.float(15.0, "吊灯移动止损 %")
+maxBars  = input.float(96.0, "时间止损 K线数")
+
+// ---------------- 指标 ----------------
+volMa = ta.sma(volume, 96)
+volR  = volMa > 0 ? volume / volMa : 0
+barChg = close / close[1] - 1
+hi72  = ta.highest(high, 72)
+dropFromHi = hi72 > 0 ? close / hi72 - 1 : 0
+
+plot(ta.sma(close, 20), color=color.orange)
+plot(ta.sma(close, 50), color=color.green)
+
+entryCond = dropFromHi <= -dropPct / 100 and barChg <= -revPct / 100 and volR >= volMult
+
+// ---------------- 状态（必须用 var）----------------
+var float stopPx  = 0.0
+var float entryPx = 0.0
+var float hiSince = 0.0
+var float heldN   = 0.0
+
+if (strategy.position_size <= 0)
+    stopPx := 0.0
+    entryPx := 0.0
+    hiSince := 0.0
+    heldN := 0.0
+else
+    if (stopPx == 0)
+        entryPx := strategy.position_avg_price
+        stopPx := entryPx * (1 - slPct / 100)
+        hiSince := high
+        heldN := 0.0
+    else
+        // 1) 先用「上一根收盘时已确定」的止损判定离场
+        if (low <= stopPx)
+            strategy.close("L", comment="STOP " + str.tostring(close))
+            stopPx := 0.0
+        if (stopPx > 0 and heldN >= maxBars and close <= entryPx)
+            strategy.close("L", comment="TIME " + str.tostring(close))
+            stopPx := 0.0
+
+    // 2) 再用本根收盘信息更新止损，供下一根使用
+    hiSince := math.max(hiSince, high)
+    if (trailArm <= 0 or hiSince >= entryPx * (1 + trailArm / 100))
+        stopPx := math.max(stopPx, hiSince * (1 - trailPct / 100))
+    heldN := heldN + 1
+
+// 开多（引擎在下一根开盘成交）
+if (strategy.position_size <= 0 and entryCond)
+    strategy.entry("L", strategy.long, qty=notional / close, comment="DIP " + str.tostring(close))

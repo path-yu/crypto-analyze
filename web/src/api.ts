@@ -1,5 +1,6 @@
 import type {
   BacktestResult,
+  Candle,
   ExchangeId,
   Instrument,
   PineCompileMeta,
@@ -98,6 +99,32 @@ export async function runBacktest(body: BacktestRequest): Promise<BacktestResult
 }
 
 export { request }
+
+/* ------------------------------------------------------------------ */
+/* 交易回放用 K 线                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 拉取一段 K 线：以 `until`（毫秒）为锚点向前取 `bars` 根，用于「交易回溯」弹窗。
+ * 服务端 `/api/klines` 只支持「锚点 + 根数」这一种取法（没有 from 参数），
+ * 因此调用方要自己把「起点 → 根数」换算好。
+ */
+export async function fetchKlines(opts: {
+  exchange: ExchangeId
+  symbol: string
+  timeframe: Timeframe
+  bars: number
+  until: number
+}): Promise<Candle[]> {
+  const params = new URLSearchParams({
+    exchange: opts.exchange,
+    symbol: opts.symbol,
+    timeframe: opts.timeframe,
+    bars: String(Math.max(100, Math.min(20000, Math.round(opts.bars)))),
+    until: String(Math.round(opts.until)),
+  })
+  return request<Candle[]>(`/api/klines?${params.toString()}`)
+}
 
 /* ------------------------------------------------------------------ */
 /* Pine 实时编译                                                       */

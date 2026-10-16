@@ -33,7 +33,6 @@ import { buildTheme, UP_COLOR, DOWN_COLOR } from './theme'
 import {
   deletePineScript,
   fetchPineScripts,
-  runBacktest,
   runPineBacktest,
   savePineScript,
 } from './api'
@@ -45,6 +44,7 @@ import EquityPanel from './components/EquityPanel'
 import AnalysisPanel from './components/AnalysisPanel'
 import TradesTable from './components/TradesTable'
 import TradeDetailDialog from './components/TradeDetailDialog'
+import TradeReplayDialog from './components/TradeReplayDialog'
 import ReportPanel from './components/ReportPanel'
 import { dateTime, humanizeError, money, num, pct } from './utils/format'
 
@@ -84,7 +84,17 @@ export default function App() {
   })
   /** 自定义结束日期（YYYY-MM-DD）；空串 = 回测到今天 */
   const [customUntil, setCustomUntil] = useState('')
-  const [params, setParams] = useState<StrategyParams>({ ...DEFAULT_STRATEGY_PARAMS })
+  /**
+   * 本应用现在只跑 Pine 脚本：strategy 固定为 'pine'，并按服务端 normalizeParams
+   * 对 pine 的强制语义（Zone OCO / 不分批止盈 / 不加仓）初始化一次。
+   */
+  const [params, setParams] = useState<StrategyParams>(() => ({
+    ...DEFAULT_STRATEGY_PARAMS,
+    strategy: 'pine',
+    exitStrategy: 'Zone OCO',
+    partialTp: false,
+    pyramiding: 1,
+  }))
   /** Pine 策略源码（strategy === 'pine' 时随回测请求一起提交） */
   const [pineSource, setPineSource] = useState('')
   /** 保存用的脚本名（同名保存即更新同一份） */
@@ -105,6 +115,8 @@ export default function App() {
   const [showTrades, setShowTrades] = useState(true)
   /** 单笔交易明细弹窗（「交易明细」表与 K 线图上的交易标记共用） */
   const [detailTrade, setDetailTrade] = useState<Trade | null>(null)
+  /** 单笔交易 K 线回放弹窗（「交易明细」表每行的「回溯」按钮打开） */
+  const [replayTrade, setReplayTrade] = useState<Trade | null>(null)
   const [showLevels, setShowLevels] = useState(false)
 
   /** 参数面板是否收起（收起时只显示一条窄轨） */
@@ -171,12 +183,8 @@ export default function App() {
         params,
         tickSize,
       }
-      if (params.strategy === 'pine') {
-        if (!pineSource.trim()) throw new Error('请先粘贴 Pine 脚本，或点击「载入示例」')
-        setResult(await runPineBacktest({ ...base, source: pineSource }))
-      } else {
-        setResult(await runBacktest(base))
-      }
+      if (!pineSource.trim()) throw new Error('请先选择一份已保存脚本，或粘贴 / 载入 Pine 源码')
+      setResult(await runPineBacktest({ ...base, source: pineSource }))
       setTab('chart')
       setDetailTrade(null)
     } catch (err) {
@@ -219,9 +227,26 @@ export default function App() {
   )
 
   /**
+   * 首次拿到脚本列表时自动选中第一份 —— 本应用只跑 Pine 脚本，
+   * 「一进页面就有脚本在跑」靠这一步兜住（没有它，首屏只能空着等用户选）。
+   */
+  useEffect(() => {
+    if (pineScriptId || pineScripts.length === 0) return
+    handleSelectPineScript(pineScripts[0].id)
+  }, [pineScripts, pineScriptId, handleSelectPineScript])
+
+  /** 首次进入自动跑一次默认回测（等脚本载入后才跑，避免首屏必然报「未选择脚本」） */
+  const autoRanRef = useRef(false)
+  useEffect(() => {
+    if (autoRanRef.current || !pineSource.trim()) return
+    autoRanRef.current = true
+    void handleRun()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pineSource])
+
+  /**
    * 保存当前源码：同名即更新。
-   * 落盘到 `server/pine/<脚本名目录>/`，源码 .pine 与编译产物 .ts 同目录存放，
-   * 保存后刷新列表并选中这一份；返回值供编辑器提示具体路径。
+   * 落盘到 `server/pine/<脚本名目录>/`，保存后刷新列表并选中这一份；返回值供编辑器提示具体路径。
    */
   const handleSavePine = useCallback(async () => {
     const saved = await savePineScript(pineName.trim(), pineSource)
@@ -270,12 +295,6 @@ export default function App() {
       togglePineDrawer,
     ],
   )
-
-  // 首次进入自动跑一次默认回测
-  useEffect(() => {
-    void handleRun()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
 
   const themeMode = 'dark' as const
   const theme = useMemo(() => buildTheme(themeMode), [themeMode])
@@ -556,12 +575,24 @@ export default function App() {
                   {tab === 'equity' && <EquityPanel result={result!} />}
                   {tab === 'analysis' && <AnalysisPanel result={result!} />}
                   {tab === 'trades' && (
-                    <TradesTable result={result!} onSelectTrade={setDetailTrade} />
+                    <TradesTable
+                      result={result!}
+                      onSelectTrade={setDetailTrade}
+                      onReplayTrade={setReplayTrade}
+                    />
                   )}
                   {tab === 'report' && <ReportPanel result={result!} />}
 
                   {/* 单笔交易明细：交易明细表点行、K 线图点交易标记都会打开这里 */}
                   <TradeDetailDialog trade={detailTrade} onClose={() => setDetailTrade(null)} />
+
+                  {/* 单笔交易 K 线回溯：交易明细表每行的「回溯」按钮打开 */}
+                  <TradeReplayDialog
+                    open={replayTrade !== null}
+                    trade={replayTrade}
+                    result={result}
+                    onClose={() => setReplayTrade(null)}
+                  />
 
                   <Paper sx={{ p: 1.75 }}>
                     <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap>

@@ -1,0 +1,97 @@
+//@version=6
+// ============================================================================
+// AgtPump —— AGT（山寨币）1h 「巨量 + 破新高」暴涨捕获  · v6
+//
+// 【复盘依据】AGT/USDT:USDT · 1h · 近一年（2025-10 ~ 2026-10），共 9 段暴涨
+// （72 根内自低点涨 ≥50%）。9 段「确认 bar」（自低点起涨 15% 的第一根）特征：
+//   · 成交量 / 96 根均量：14.2× ~ 51.0×（全部 ≥14×，中位约 21×）   ← 最强
+//   · 收盘突破前 50 根最高：+9.8% ~ +47.7%（9/9 全部突破新高）
+//   · RSI14：76 ~ 91（极超买）
+//   · 近 6 根涨幅：+16.4% ~ +95.7%
+//   · 距 MA20：+15.7% ~ +83.5%
+// 与 AKE 系「下跌结构里启动、破新高无用」不同，**AGT 的暴涨是「巨量突破新高」型**，
+// 所以入场必须带 50 根新高突破条件，并用高量能阈值把信号稀有化。
+//
+// 【入场】巨量 + 破新高（可选脉冲/RSI 过滤）：
+//   成交量 ≥ volMult × 96 根均量
+//   收盘 > 前 brkLen 根最高价（突破）
+//   近 6 根涨幅 ≥ impPct%（0=关）
+//   RSI14 ≥ useRsi（0=关）
+//
+// 【离场】
+//   · 初始止损：固定百分比 slPct% —— 暴涨当下 ATR% 被撑大，不用 ATR。
+//   · 吊灯移动止损：止损 = max(止损, 持仓最高价 × (1 − trailPct%))，
+//     可设「浮盈满 trailArm% 才激活」。
+//   · 时间止损：持仓 maxBars 根仍未创新高 → 退出，等下一次放量。
+//   · 离场用「上一根收盘就已确定的止损」判定，绝不用本根 high 设止损、
+//     再用本根 low 触发（否则会造出「刚进场就被打掉」的假信号）。
+//
+// 【仓位】固定名义价值 qty = notional / 价格（TradingView 口径）。
+// ============================================================================
+strategy("AgtPump", overlay=true, max_bars_back=500, initial_capital=100000,
+  default_qty_type=strategy.fixed, default_qty_value=1,
+  commission_type=strategy.commission.percent, commission_value=0.055)
+
+// ---------------- 入场参数 ----------------
+notional = input.float(1000.0, "单笔名义价值 USDT")
+volMult  = input.float(14.0, "成交量 / 96均量 ≥")
+brkLen   = input.int(50, "突破 N 根新高")
+impPct   = input.float(16.0, "近6根涨幅 ≥ % (0=关)")
+useRsi   = input.float(0.0, "要求 RSI ≥ (0=关)")
+
+// ---------------- 离场参数 ----------------
+slPct    = input.float(12.0, "初始止损 %")
+trailArm = input.float(20.0, "移动止损激活所需浮盈 % (0=立即)")
+trailPct = input.float(15.0, "吊灯移动止损 %")
+maxBars  = input.float(120.0, "时间止损 K线数")
+
+// ---------------- 指标 ----------------
+volMa = ta.sma(volume, 96)
+volR  = volMa > 0 ? volume / volMa : 0
+imp   = close / close[6] - 1
+hiN   = ta.highest(high, brkLen)
+brk   = close > hiN[1]
+
+plot(ta.sma(close, 20), color=color.orange)
+plot(ta.sma(close, 50), color=color.green)
+
+entryCond = volR >= volMult and brk and (impPct < 0.5 or imp >= impPct / 100) and (useRsi < 0.5 or ta.rsi(close, 14) >= useRsi)
+
+// ---------------- 状态（必须用 var）----------------
+var float stopPx  = 0.0
+var float entryPx = 0.0
+var float hiSince = 0.0
+var bool  armed   = false
+var float heldN   = 0.0
+
+if (strategy.position_size <= 0)
+    stopPx := 0.0
+    entryPx := 0.0
+    hiSince := 0.0
+    armed := false
+    heldN := 0.0
+else
+    if (stopPx == 0)
+        entryPx := strategy.position_avg_price
+        stopPx := entryPx * (1 - slPct / 100)
+        hiSince := high
+        armed := false
+        heldN := 0.0
+    else
+        // 1) 先用「上一根收盘时已确定」的止损判定离场
+        if (low <= stopPx)
+            strategy.close("P", comment="STOP " + str.tostring(close))
+            stopPx := 0.0
+        if (stopPx > 0 and heldN >= maxBars and close <= entryPx)
+            strategy.close("P", comment="TIME " + str.tostring(close))
+            stopPx := 0.0
+
+    // 2) 再用本根收盘信息更新止损，供下一根使用
+    hiSince := math.max(hiSince, high)
+    if (trailArm <= 0 or hiSince >= entryPx * (1 + trailArm / 100))
+        stopPx := math.max(stopPx, hiSince * (1 - trailPct / 100))
+    heldN := heldN + 1
+
+// 开仓（引擎在下一根开盘成交）
+if (strategy.position_size <= 0 and entryCond)
+    strategy.entry("P", strategy.long, qty=notional / close, comment="PUMP " + str.tostring(close))

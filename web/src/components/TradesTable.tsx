@@ -14,8 +14,11 @@ import TablePagination from '@mui/material/TablePagination'
 import TableRow from '@mui/material/TableRow'
 import TableSortLabel from '@mui/material/TableSortLabel'
 import TextField from '@mui/material/TextField'
+import IconButton from '@mui/material/IconButton'
+import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import DownloadIcon from '@mui/icons-material/Download'
+import HistoryIcon from '@mui/icons-material/History'
 
 import type { BacktestResult, Trade } from '@shared/types'
 import { EXIT_REASON_LABEL, dateTime, money, num, pct, price } from '../utils/format'
@@ -47,10 +50,13 @@ const REASON_COLOR: Record<string, string> = {
 export default function TradesTable({
   result,
   onSelectTrade,
+  onReplayTrade,
 }: {
   result: BacktestResult
   /** 点击某一行 → 交给外层打开单笔明细弹窗（与 K 线图上的交易标记共用） */
   onSelectTrade?: (trade: Trade) => void
+  /** 点击「回溯」按钮 → 打开该笔交易的 K 线回放弹窗 */
+  onReplayTrade?: (trade: Trade) => void
 }) {
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(25)
@@ -125,6 +131,7 @@ export default function TradesTable({
     { key: 'balanceAfter', label: '余额', align: 'right' },
     { key: 'barsHeld', label: '持仓', align: 'right' },
     { key: null, label: '平仓原因', align: 'center' },
+    { key: null, label: '回溯', align: 'center' },
   ]
 
   return (
@@ -244,6 +251,20 @@ export default function TradesTable({
                         color: REASON_COLOR[t.exitReason] ?? 'text.secondary',
                       }}
                     />
+                  </TableCell>
+                  <TableCell align="center" padding="none">
+                    <Tooltip title="K 线回溯：从入场逐根回放到出场">
+                      <IconButton
+                        size="small"
+                        onClick={(e) => {
+                          // 不要触发该行的「打开单笔明细」点击
+                          e.stopPropagation()
+                          onReplayTrade?.(t)
+                        }}
+                      >
+                        <HistoryIcon sx={{ fontSize: 16 }} />
+                      </IconButton>
+                    </Tooltip>
                   </TableCell>
                 </TableRow>
               )

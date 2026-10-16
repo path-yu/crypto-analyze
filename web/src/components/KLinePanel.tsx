@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Box from '@mui/material/Box'
 import Paper from '@mui/material/Paper'
 import Stack from '../ui/Stack'
@@ -12,7 +12,7 @@ import { VelaWorkspace } from '@luxalgo/vela/workspace'
 import type { DataProvider } from '@luxalgo/vela/plugin'
 import { PineEngine } from '@luxalgo/vela-pinets'
 
-import type { BacktestResult, Timeframe, Trade } from '@shared/types'
+import type { BacktestResult, Candle, Timeframe, Trade } from '@shared/types'
 import {
   MARKER_HIT_RADIUS,
   TRADE_LAYER_ID,
@@ -23,7 +23,9 @@ import {
   tradeHitState,
 } from '../charts/tradeMarkersLayer'
 import { loadPineManifest } from '../charts/manifestLoader'
-import { klineAxisTime } from '../utils/format'
+import { installVelaLocale } from '../charts/velaLocale'
+import { dateTime, klineAxisTime, price } from '../utils/format'
+import { DOWN_COLOR, UP_COLOR } from '../theme'
 
 registerTradeVisuals()
 
@@ -94,6 +96,11 @@ export default function KLinePanel({
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const workspaceRef = useRef<VelaWorkspace | null>(null)
+  /**
+   * 十字光标所在的那根 K 线；null = 鼠标不在图上。
+   * 信息条据此显示「当前选中的 K 线」，鼠标移出时回落到最后一根。
+   */
+  const [hoverBar, setHoverBar] = useState<Candle | null>(null)
 
   const velaData = useMemo(() => {
     if (!result) return []
@@ -114,6 +121,42 @@ export default function KLinePanel({
 
   const markerCount = result?.trades.length ?? 0
 
+  /** 时间戳 → 下标，供信息条 O(1) 找「上一根收盘」 */
+  const barIndex = useMemo(() => {
+    const m = new Map<number, number>()
+    result?.candles.forEach((c, i) => m.set(c.timestamp, i))
+    return m
+  }, [result])
+
+  /** 信息条当前展示的那根 K 线：有悬停就用悬停的那根，否则默认最后一根 */
+  const shownBar = useMemo(() => {
+    if (hoverBar) return hoverBar
+    const bars = result?.candles
+    return bars && bars.length > 0 ? bars[bars.length - 1] : null
+  }, [hoverBar, result])
+
+  /**
+   * 基本信息各项：开/高/低/收 + 涨跌幅、振幅（均以「上一根收盘价」为基准，
+   * 与参考图里的信息条口径一致）。
+   */
+  const barInfo = useMemo(() => {
+    if (!shownBar) return []
+    const i = barIndex.get(shownBar.timestamp) ?? -1
+    const bars = result?.candles ?? []
+    const prevClose = i > 0 ? bars[i - 1].close : shownBar.open
+    const change = prevClose !== 0 ? ((shownBar.close - prevClose) / prevClose) * 100 : 0
+    const amplitude = prevClose !== 0 ? ((shownBar.high - shownBar.low) / prevClose) * 100 : 0
+    const tone = change >= 0 ? UP_COLOR : DOWN_COLOR
+    return [
+      { label: '开', value: price(shownBar.open) },
+      { label: '高', value: price(shownBar.high) },
+      { label: '低', value: price(shownBar.low) },
+      { label: '收', value: price(shownBar.close), tone },
+      { label: '涨跌幅', value: `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`, tone },
+      { label: '振幅', value: `${amplitude.toFixed(2)}%` },
+    ] as { label: string; value: string; tone?: string }[]
+  }, [shownBar, barIndex, result])
+
   useEffect(() => {
     const el = containerRef.current
     if (!el || !result || velaData.length === 0) return
@@ -121,6 +164,7 @@ export default function KLinePanel({
     // 图层读的是模块级的当前 payload；必须先写入再实例化工作区，
     // 否则原生指标 `start()` 时推进去的是上一份结果。
     setTradeLayerPayload(payload)
+    setHoverBar(null)
     el.innerHTML = ''
 
     let ws: VelaWorkspace | null = null
@@ -166,6 +210,10 @@ export default function KLinePanel({
       run(tries)
     }
 
+    let offCross: (() => void) | null = null
+    // Vela 内置 UI 没有 i18n：这里挂 DOM 层的汉化（图例、右键菜单、设置弹窗等）
+    const uninstallLocale = installVelaLocale()
+
     withChart((chart) => {
       // 交易标记覆盖物（图层 + 同名的 legend-less 原生指标）
       chart.addNativeIndicator(TRADE_LAYER_ID)
@@ -178,6 +226,23 @@ export default function KLinePanel({
           console.warn('[vela] Pine 脚本叠加失败（蜡烛与交易标记不受影响）：', err)
         }
       }
+      // 十字光标 → 信息条：鼠标在图上时显示光标那根，移出图（ohlc 为 null）时回落最后一根。
+      // 订阅在 renderer 上（chart.renderer.onCrosshairMove），不是 chart 本身。
+      offCross = chart.renderer.onCrosshairMove((e) => {
+        const o = e.ohlc
+        setHoverBar(
+          o
+            ? {
+                timestamp: o.time,
+                open: o.open,
+                high: o.high,
+                low: o.low,
+                close: o.close,
+                volume: o.volume ?? 0,
+              }
+            : null,
+        )
+      })
     })
 
     const ro = new ResizeObserver(() => ws?.resize())
@@ -185,9 +250,10 @@ export default function KLinePanel({
 
     return () => {
       ro.disconnect()
+      offCross?.()
+      uninstallLocale()
       workspaceRef.current = null
       tradeHitState.regions = []
-      tradeHitState.timeAt = null
       try {
         ws?.destroy()
       } catch {
@@ -196,9 +262,10 @@ export default function KLinePanel({
     }
   }, [result, velaData, payload])
 
-  // 图上点选交易：图层每帧把标记的视口坐标写进 tradeHitState，
-  // 这里按半径命中；未命中时再用 x → 时间找「覆盖该根 K 线」的交易。
+  // 图上点选交易：图层每帧把标记的视口坐标写进 tradeHitState，这里按半径命中。
   // 以「按下 → 抬起位移 < 4px」区分点击与拖动、平移，避免缩放拖图时误弹窗。
+  // 只认「点在绘图画布上」：Vela 自带的 HTML chrome（图例行、工具条、水印、
+  // 折叠箭头等）不是画布，点它们不应该弹交易明细。
   // 用 pointer 事件（Vela 内部也走 pointer，捕获阶段更稳），并保留 mouse 兜底。
   useEffect(() => {
     const el = containerRef.current
@@ -212,6 +279,7 @@ export default function KLinePanel({
     const onUp = (e: MouseEvent | PointerEvent): void => {
       if (!workspaceRef.current) return
       if (Math.abs(e.clientX - downX) > 4 || Math.abs(e.clientY - downY) > 4) return
+      if (!(e.target instanceof HTMLCanvasElement)) return
       let best = -1
       let bestDist = Number.POSITIVE_INFINITY
       for (const r of tradeHitState.regions) {
@@ -222,16 +290,9 @@ export default function KLinePanel({
           best = r.index
         }
       }
-      if (best >= 0 && bestDist <= MARKER_HIT_RADIUS) {
-        const t = pickTradeAt(result, best)
-        if (t) onSelectTrade?.(t)
-        return
-      }
-      // 没点中标记时退一步：把点击位置换算回时间，打开「覆盖该根 K 线」的那笔交易
-      const time = tradeHitState.timeAt?.(e.clientX) ?? null
-      if (time === null) return
-      const covering = result.trades.find((t) => t.entryTime <= time && time <= t.exitTime)
-      if (covering) onSelectTrade?.(covering)
+      if (best < 0 || bestDist > MARKER_HIT_RADIUS) return
+      const t = pickTradeAt(result, best)
+      if (t) onSelectTrade?.(t)
     }
     el.addEventListener('pointerdown', onDown, true)
     el.addEventListener('pointerup', onUp, true)
@@ -266,12 +327,9 @@ export default function KLinePanel({
           )}
           <Tooltip
             title={
-              (result?.meta.strategy === 'supertrend'
-                ? '主图红/绿线为 SuperTrend 上下轨（up/dn）；'
-                : '主图蓝线为斐波那契 0.5 回撤趋势线（imba_trend_line），紫线为 TSOT 趋势强度；') +
               '三角标注每笔交易的入场方向与盈亏；' +
               '蓝线为该笔入场价、红/绿线为出场价（按盈亏着色），线间淡色区域为持仓区间；' +
-              '选为 Pine 策略时，脚本自身的 plot() 由 Vela 的 Pine 引擎原生绘制'
+              'Pine 脚本自身的 plot() 由 Vela 的 Pine 引擎原生绘制'
             }
           >
             <InfoOutlinedIcon sx={{ fontSize: 15, color: 'text.secondary' }} />
@@ -302,6 +360,43 @@ export default function KLinePanel({
         </Stack>
       </Stack>
 
+      {/* K 线基本信息：跟随鼠标（十字光标）实时切换；鼠标不在图上时显示最后一根 */}
+      {shownBar && (
+        <Stack
+          direction="row"
+          alignItems="center"
+          spacing={1.5}
+          flexWrap="wrap"
+          useFlexGap
+          sx={{
+            px: 2,
+            py: 0.6,
+            borderBottom: '1px solid',
+            borderColor: 'divider',
+            bgcolor: 'action.hover',
+          }}
+        >
+          <Typography
+            variant="caption"
+            sx={{ color: 'text.secondary', fontVariantNumeric: 'tabular-nums' }}
+          >
+            {dateTime(shownBar.timestamp)}
+          </Typography>
+          {barInfo.map((it) => (
+            <Typography
+              key={it.label}
+              variant="caption"
+              sx={{ color: 'text.secondary', fontVariantNumeric: 'tabular-nums' }}
+            >
+              {it.label}{' '}
+              <Box component="span" sx={{ color: it.tone ?? 'text.primary', fontWeight: 600 }}>
+                {it.value}
+              </Box>
+            </Typography>
+          ))}
+        </Stack>
+      )}
+
       {markerCount > MAX_MARKERS && showTrades && (
         <Box sx={{ px: 2, py: 0.5, bgcolor: 'action.hover' }}>
           <Typography variant="caption" color="warning.main">
@@ -329,7 +424,7 @@ export default function KLinePanel({
   )
 }
 
-export { klineAxisTime }
+export { klineAxisTime, VELA_TIMEFRAME, VELA_THEME }
 
 /** 预留：把本项目的数据源做成 Vela Provider 时用（当前走离线 `data`，无需网络） */
 export type VelaProviderFactory = () => DataProvider
