@@ -1,67 +1,48 @@
-//@version=4
+//@version=6
 // ============================================================================
-// MainWave —— 主升浪做多（1h）
+// MainWave —— 主升浪做多（1h）  ·  v6 迁移版
 //
-// 【与「暴涨脉冲」策略的本质区别（本轮复盘的核心发现）】
-// 用 25% 回撤 zigzag + 历时 ≥240 根（10 天）切出 20 个币的 **57 波主升浪**
-// （涨幅 +31%~+320%，历时 250~1800 根），再对比它们**启动确认 bar**与全样本基线：
+// 迁移自同目录同名的 v4 版本（MainWave.pine）。仅做 v4 → v6 的语法迁移：
+//   study/indicator 命名空间、ta.* / str.* 前缀、input.* 构造器、
+//   strategy() 的 default_qty_type/value 必填项、int 型周期参数。
+// 策略逻辑、参数默认值、入场/离场条件、仓位口径（qty = notional / close）
+// 与 v4 版本逐条保持一致 —— 用于「旧编译器 × 新 PineTS 账本」的平价校验。
 //
-//   特征                  启动确认bar中位   基线中位
-//   成交量 / 96均量             3.72          0.699   ← 5.3 倍
-//   相对 24 / 50 / 100 根新高   +0.008        -0.041 / -0.061 / -0.091
-//   均线多头排列(MA20>MA50>MA200)  1.000        0.000   ← 几乎完全区分
-//   MA50 上行(10根)             1.000        0.000   ← 几乎完全区分
-//   距 MA200                   +11.6%        -1.6%
-//   近 24 / 72 根涨幅           +11.9% / +12.1%  -0.4% / -1.0%
-//   ATR% / 240均值              1.33          0.926
-//   布林带宽                    11.98%        6.10%
-//
-// 规则 lift（精度/基线，基线 0.034%）：
-//   破100根新高          lift **102**  覆盖 39/57    ← 最强
-//   破50新高+量≥2+站上MA200 lift 97    覆盖 37/57
-//   破24新高+MA50上行+量≥1.2 lift 87   覆盖 41/57
-//   破50根新高            lift 79     覆盖 44/57
-//   破24新高+量≥1.5+多头排列 lift 85  覆盖 22/57
-//   「窄幅横盘」+破24新高  lift 56     覆盖 46/57
-//
-// **关键反差**：上一轮做「2~3 天暴涨脉冲」时，「突破 N 根新高」几乎没有区分度
-// （暴涨币启动时还在下跌结构里）；而做「持续多日的主升浪」时，**突破 100 根新高
-// 是所有特征里最强的（lift 102）**，因为主升浪本身就是一个"不断创出新高"的持续趋势。
-// 这就是两类行情必须用两套特征的原因。
-//
-// 【策略】只做一件事：**在主升浪刚突破时上车，然后一路持有到趋势掉头**。
-//   入场  收盘 > 前 100 根最高价（突破）
-//         且 成交量 ≥ 2 × 96 根均量（放量）
+//   入场  收盘 > 前 brkLen 根最高价（突破）
+//         且 成交量 ≥ volMult × 96 根均量（放量）
 //         且 收盘 > MA200（方向过滤：只在长期均线上方做多）
-//   离场  初始止损 8% + 吊灯移动止损 25%（对齐 zigzag 的 25% 回撤阈值，让利润奔跑）
-//         可选保本；可选时间止损（默认关 —— 主升浪要耐心持有，不设时间上限）
-//   冷却  止损后 cooldown 根内不再入场，避免同一段假突破里反复进出
-//   其余时间：条件不满足就不交易（"能不做就不做"）
+//   离场  初始止损 slPct% + 吊灯移动止损 trailPct%（在同一根内用已确定的止损判定）
+//         可选保本；可选时间止损（默认关 —— 主升浪要耐心持有）
+//   冷却  止损后 coolBars 根内不再入场
 //
-// 【仓位】固定名义价值 qty = notional / 价格。
+// 【状态变量必须用 var】否则每根 bar 重置 → 止损永不触发、仓位被拿到回测结束。
 // ============================================================================
-strategy(title="MainWave", overlay=true, max_bars_back=500, initial_capital=1000, commission_value=0.055)
+// 注：initial_capital 只影响 PineTS 券商模拟器自己的保证金模型，不影响本仓库回测引擎
+//     的口径（引擎用 UI 的 initialCapital）。这里给足 100000，避免「1000 名义价值 == 1000 本金」
+//     触发 PineTS 的 Margin call 微型强平，从而把干净的开仓价/数量写进账本。
+strategy("MainWave", overlay=true, max_bars_back=500, initial_capital=100000,
+  default_qty_type=strategy.fixed, default_qty_value=1,
+  commission_type=strategy.commission.percent, commission_value=0.055)
 
-float notional  = input(1000.0, "单笔名义价值 USDT", type=input.float)
+notional      = input.float(1000.0, "单笔名义价值 USDT")
 // ★ 突破窗口是全篇最关键的参数：实测「越稀有越好」，且 20 天之后收敛
-//   （真·验证集 22 币中位：4天 -56% → 10天 -28% → 20天 0% → 30~60天 0%，均值 +4~9%）
-float brkLen    = input(720.0, "突破窗口（根，720=30天）", type=input.float)
-float volMult   = input(1.5,  "成交量 / 96均量 ≥", type=input.float)
-float useMA200  = input(1.0,  "要求收盘 > MA200 (1/0)", type=input.float)
-float slPct     = input(12.0, "初始止损 %", type=input.float)
-float useFailStop = input(0.0, "突破失败即离场(收盘跌回突破位) (1/0)", type=input.float)
-float bePct     = input(0.0,  "保本触发 % (0=关)", type=input.float)
-float trailPct  = input(25.0, "吊灯移动止损 %", type=input.float)
-float coolBars  = input(48.0, "离场后冷却根数", type=input.float)
-float maxBars   = input(0.0,  "时间止损根数 (0=关)", type=input.float)
+brkLen        = input.int(720, "突破窗口（根，720=30天）")
+volMult       = input.float(1.5,  "成交量 / 96均量 ≥")
+useMA200      = input.float(1.0,  "要求收盘 > MA200 (1/0)")
+slPct         = input.float(12.0, "初始止损 %")
+useFailStop   = input.float(0.0,  "突破失败即离场(收盘跌回突破位) (1/0)")
+bePct         = input.float(0.0,  "保本触发 % (0=关)")
+trailPct      = input.float(25.0, "吊灯移动止损 %")
+coolBars      = input.float(48.0, "离场后冷却根数")
+maxBars       = input.float(0.0,  "时间止损根数 (0=关)")
 
-ma200 = sma(close, 200)
-vol96 = sma(volume, 96)
+ma200 = ta.sma(close, 200)
+vol96 = ta.sma(volume, 96)
 volR  = vol96 > 0 ? volume / vol96 : 0
-brk   = close > highest(high, brkLen)[1]
+brk   = close > ta.highest(high, brkLen)[1]
 
 plot(ma200, color=color.orange)
-plot(highest(high, 100), color=color.gray)
+plot(ta.highest(high, 100), color=color.gray)
 
 // 状态必须用 var（否则每根 bar 重置 → 止损永不触发）
 var float stopPx  = 0.0
@@ -88,22 +69,22 @@ else
         // 新成交：按实际成交均价初始化（止损从下一根起生效）
         entryPx := strategy.position_avg_price
         stopPx := entryPx * (1 - slPct / 100)
-        // 突破位 = 成交那根之前的 100 根最高价；收盘跌回其下方即视为突破失败
-        failPx := useFailStop >= 0.5 ? highest(high, brkLen)[1] : 0.0
+        // 突破位 = 成交那根之前的 brkLen 根最高价；收盘跌回其下方即视为突破失败
+        failPx := useFailStop >= 0.5 ? ta.highest(high, brkLen)[1] : 0.0
         hiSince := high
         armed := false
         heldN := 0.0
     else
         // 先用「上一根收盘已确定」的止损判定离场
         if (low <= stopPx)
-            strategy.close("M", comment="STOP " + tostring(close))
+            strategy.close("M", comment="STOP " + str.tostring(close))
             stopPx := 0.0
-        // 突破失败：收盘跌回突破位下方 → 假突破，立刻离场（成本远低于固定 8% 止损）
+        // 突破失败：收盘跌回突破位下方 → 假突破，立刻离场
         if (stopPx > 0 and failPx > 0 and close < failPx)
-            strategy.close("M", comment="FAIL " + tostring(close))
+            strategy.close("M", comment="FAIL " + str.tostring(close))
             stopPx := 0.0
         if (stopPx > 0 and maxBars > 0 and heldN >= maxBars)
-            strategy.close("M", comment="TIME " + tostring(close))
+            strategy.close("M", comment="TIME " + str.tostring(close))
             stopPx := 0.0
 
     hiSince := math.max(hiSince, high)
@@ -114,6 +95,6 @@ else
     stopPx := math.max(stopPx, hiSince * (1 - trailPct / 100))
     heldN := heldN + 1
 
-// 入场（引擎在下一根开盘成交）
+// 入场（引擎/券商在下一根开盘成交）
 if (strategy.position_size <= 0 and coolN <= 0 and brk and volR >= volMult and (useMA200 < 0.5 or close > ma200))
-    strategy.entry("M", strategy.long, qty=notional / close, comment="WAVE " + tostring(close))
+    strategy.entry("M", strategy.long, qty=notional / close, comment="WAVE " + str.tostring(close))

@@ -19,7 +19,7 @@ import {
   ValidationError,
   type BacktestRequest,
 } from '../service/backtestService'
-import { compilePineCached } from '../pine/cache'
+import { analyzePine } from '../pine/pinetsAdapter'
 import {
   deletePineScript,
   listPineScripts,
@@ -177,21 +177,27 @@ apiRouter.post('/backtest', async (req: Request, res: Response) => {
 })
 
 /**
- * Pine 实时编译。
- * POST /api/pine/compile  { source, name? }
+ * Pine 实时校验。
+ * POST /api/pine/compile  { source, inputs? }
  *
- * 语法 / 语义错误仍返回 200 且 ok:true，诊断放进 diagnostics，编辑器可一边打字一边显示。
+ * 语法 / 语义 / 版本错误仍返回 200 且 ok:true，诊断放进 diagnostics，
+ * 编辑器可一边打字一边显示。改用 PineTS 后不再产出「编译出的 TypeScript」，
+ * 因此响应里没有 `ts` 字段（前端已不使用它）。
  */
 apiRouter.post('/pine/compile', (req: Request, res: Response) => {
   try {
-    const body = (req.body ?? {}) as { source?: unknown; name?: unknown }
+    const body = (req.body ?? {}) as { source?: unknown; inputs?: unknown }
     const source = typeof body.source === 'string' ? body.source : ''
     if (!source.trim()) throw new ValidationError('缺少 Pine 源码（source）')
-    const name = typeof body.name === 'string' ? body.name : undefined
-    const comp = compilePineCached(source, { sourceName: name })
+    const inputs = body.inputs as Record<string, number | boolean | string> | undefined
+    const analysis = analyzePine(source, inputs)
     res.json({
       ok: true,
-      data: { ts: comp.ts, diagnostics: comp.diagnostics, meta: comp.meta, ok: comp.ok },
+      data: {
+        diagnostics: analysis.diagnostics,
+        meta: analysis.meta,
+        ok: !analysis.diagnostics.some((d) => d.severity === 'error'),
+      },
     })
   } catch (err) {
     fail(res, err)
@@ -256,8 +262,10 @@ apiRouter.get('/pine/scripts', (_req: Request, res: Response) => {
  *
  * 同名视为更新（就地覆盖），换名即新增；落盘位置：
  *   server/pine/<脚本名目录>/<脚本名目录>.pine   原始源码
- *   server/pine/<脚本名目录>/<脚本名目录>.ts     编译产物（保存时顺带编译一次）
  * 另外在 .cache/pine-scripts.json 记一份索引，重启服务仍在。
+ *
+ * 注：改用 PineTS 后不再顺带写入编译产物（`<目录>.ts`）—— PineTS 在内存里
+ * 直接转译，产物对前端与后端都没有用途。
  */
 apiRouter.post('/pine/scripts', (req: Request, res: Response) => {
   try {
@@ -270,14 +278,7 @@ apiRouter.post('/pine/scripts', (req: Request, res: Response) => {
     } catch (e) {
       throw new ValidationError(e instanceof Error ? e.message : '脚本名不合法')
     }
-    // 编译失败也照样保存源码（源码比产物重要），此时只写 .pine
-    let ts: string | undefined
-    try {
-      ts = compilePineCached(source, { sourceName: name }).ts
-    } catch {
-      ts = undefined
-    }
-    res.json({ ok: true, data: savePineScript(name, source, ts) })
+    res.json({ ok: true, data: savePineScript(name, source) })
   } catch (err) {
     fail(res, err)
   }

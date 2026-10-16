@@ -1,4 +1,4 @@
-﻿﻿import { useEffect, useRef, useState } from 'react'
+﻿import { useEffect, useRef, useState } from 'react'
 import Accordion from '@mui/material/Accordion'
 import AccordionDetails from '@mui/material/AccordionDetails'
 import AccordionSummary from '@mui/material/AccordionSummary'
@@ -42,7 +42,7 @@ export interface PinePanelState {
   selectedId: string | null
   /** 策略下拉里选中一份已保存脚本（null = 切回内置策略或示例） */
   onSelect: (id: string | null) => void
-  /** 保存当前源码：写穿到 server/pine/<目录>/ 下的 .pine 与 .ts，返回落盘记录 */
+  /** 保存当前源码：写穿到 server/pine/<目录>/ 下的 .pine，返回落盘记录 */
   onSave: () => Promise<SavedPineScript>
   /** 删除当前载入的已保存脚本 */
   onDelete: () => Promise<void>
@@ -82,11 +82,9 @@ export default function PineEditor({
   loading,
 }: Props) {
   const [diagnostics, setDiagnostics] = useState<PineDiagnostic[]>([])
-  const [ts, setTs] = useState('')
   const [meta, setMeta] = useState<PineCompileMeta | null>(null)
   const [compiling, setCompiling] = useState(false)
   const [compileError, setCompileError] = useState<string | null>(null)
-  const [copied, setCopied] = useState(false)
 
   /** 保存 / 删除的进行中标记与结果提示 */
   const [busy, setBusy] = useState(false)
@@ -94,7 +92,6 @@ export default function PineEditor({
   const [saveError, setSaveError] = useState<string | null>(null)
 
   const [examples, setExamples] = useState<PineExample[]>([])
-  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // 挂载时拉取内置示例（失败则回退到内联示例），渲染成一行可点的 chip
   useEffect(() => {
@@ -107,11 +104,10 @@ export default function PineEditor({
     }
   }, [])
 
-  // 300ms 防抖：一边打字一边刷新诊断与 TS 产物
+  // 300ms 防抖：一边打字一边刷新诊断与脚本元信息
   useEffect(() => {
     if (!source.trim()) {
       setDiagnostics([])
-      setTs('')
       setMeta(null)
       setCompileError(null)
       return
@@ -123,7 +119,6 @@ export default function PineEditor({
         .then((res) => {
           if (cancelled) return
           setDiagnostics(res.diagnostics)
-          setTs(res.ts)
           setMeta(res.meta)
           setCompileError(null)
         })
@@ -131,7 +126,6 @@ export default function PineEditor({
           if (cancelled) return
           setCompileError(err instanceof Error ? err.message : '编译失败')
           setDiagnostics([])
-          setTs('')
           setMeta(null)
         })
         .finally(() => {
@@ -144,27 +138,10 @@ export default function PineEditor({
     }
   }, [source])
 
-  useEffect(
-    () => () => {
-      if (copyTimer.current) clearTimeout(copyTimer.current)
-    },
-    [],
-  )
-
-  const copyTs = async () => {
-    try {
-      await navigator.clipboard.writeText(ts)
-      setCopied(true)
-      if (copyTimer.current) clearTimeout(copyTimer.current)
-      copyTimer.current = setTimeout(() => setCopied(false), 1500)
-    } catch {
-      /* 剪贴板不可用时忽略 */
-    }
-  }
-
   /**
-   * 保存：写穿到服务端 `server/pine/<目录>/` 下，源码 `.pine` 与编译产物 `.ts`
-   * 放在同一个文件夹里（便于直接进 git）；同名即更新，索引记在 .cache 下。
+   * 保存：写穿到服务端 `server/pine/<目录>/` 下的 `.pine`（同名即更新，
+   * 索引记在 `.cache` 下）。改用 PineTS 后不再产出编译中间产物，
+   * 因此只落源码。
    */
   const doSave = async () => {
     setBusy(true)
@@ -173,11 +150,7 @@ export default function PineEditor({
     try {
       const saved = await onSave()
       const time = new Date().toLocaleTimeString('zh-CN', { hour12: false })
-      setSaveNote(
-        saved.tsPath
-          ? `已保存 · ${saved.pinePath} + ${saved.tsPath}（${saved.tsBytes ?? 0} 字节）· ${time}`
-          : `已保存源码 · ${saved.pinePath ?? saved.name}（未生成编译产物）· ${time}`,
-      )
+      setSaveNote(`已保存 · ${saved.pinePath ?? saved.name} · ${time}`)
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : '保存失败')
     } finally {
@@ -240,7 +213,7 @@ export default function PineEditor({
       {!drawerOpen && (
         <Alert severity="info" sx={{ mb: 1.25, py: 0 }}>
           <Typography variant="caption">
-            脚本是信号的唯一来源，引擎只负责撮合。编辑后 300ms 自动编译，诊断与 TS 产物见下方。
+            脚本是信号的唯一来源，引擎只负责撮合。编辑后 300ms 自动校验，诊断见下方。
             保存后可从上方「策略」下拉菜单直接选中，无需再次粘贴。
           </Typography>
         </Alert>
@@ -369,51 +342,6 @@ export default function PineEditor({
         </Box>
       )}
 
-      {/* 放大编辑时把 TS 产物折叠栏让掉，高度尽量留给编辑器 */}
-      {ts && !drawerOpen && (
-        <>
-          <Divider sx={{ my: 1.5 }} />
-          <Accordion disableGutters elevation={0} sx={{ bgcolor: 'transparent', '&:before': { display: 'none' } }}>
-            <AccordionSummary expandIcon={<ExpandMoreIcon />} sx={{ px: 0, minHeight: 32 }}>
-              <Typography variant="caption" color="text.secondary">
-                编译产物（TypeScript）
-              </Typography>
-            </AccordionSummary>
-            <AccordionDetails sx={{ px: 0 }}>
-              <Box sx={{ position: 'relative' }}>
-                <Tooltip title={copied ? '已复制' : '复制 TS 源码'}>
-                  <IconButton
-                    size="small"
-                    onClick={() => void copyTs()}
-                    sx={{ position: 'absolute', top: 4, right: 4 }}
-                  >
-                    {copied ? <CheckIcon fontSize="small" color="success" /> : <ContentCopyIcon fontSize="small" />}
-                  </IconButton>
-                </Tooltip>
-                <Box
-                  component="pre"
-                  sx={{
-                    m: 0,
-                    p: 1.25,
-                    maxHeight: 360,
-                    overflow: 'auto',
-                    fontFamily: MONO,
-                    fontSize: 11.5,
-                    lineHeight: 1.55,
-                    whiteSpace: 'pre',
-                    bgcolor: 'action.hover',
-                    border: '1px solid',
-                    borderColor: 'divider',
-                    borderRadius: 1,
-                  }}
-                >
-                  {ts}
-                </Box>
-              </Box>
-            </AccordionDetails>
-          </Accordion>
-        </>
-      )}
     </Box>
   )
 }

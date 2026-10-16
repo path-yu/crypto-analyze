@@ -592,16 +592,21 @@ export interface BacktestResult {
     /** 本次回测使用的策略 */
     strategy: StrategyKind
   }
-  /** Pine 脚本回测时附带的编译产物（未使用 pine 策略时为 undefined） */
+  /**
+   * Pine 脚本回测时附带的执行产物（未使用 pine 策略时为 undefined）。
+   *
+   * 注：改用 PineTS 后不再产出「编译出的 TypeScript 源码」这一中间产物
+   * （`ts` 字段已移除）；诊断来自 PineTS 的转译/运行期错误，告警来自其运行期。
+   */
   pine?: {
     /** 原始 Pine 源码 */
     source: string
-    /** 编译生成的 TypeScript 源码 */
-    ts: string
-    /** 编译诊断 */
+    /** 执行诊断（语法 / 版本 / 运行期错误） */
     diagnostics: PineDiagnostic[]
-    /** 编译元信息 */
+    /** 脚本元信息（声明、input、plot 标题） */
     meta: PineCompileMeta
+    /** PineTS 运行期告警 */
+    warnings: string[]
   }
 }
 

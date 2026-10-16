@@ -185,7 +185,7 @@ async function main() {
   if (!ready) console.log('警告：未在超时内检测到回测结果 KPI')
 
   // 等待 K 线画布出现。
-  // 开发模式下 Vite 按模块逐个加载（未打包），KLineChart 比生产构建晚不少，
+  // 开发模式下 Vite 按模块逐个加载（未打包），Vela 的渲染画布比生产构建晚不少，
   // 单次采样容易只拿到 canvas=0，因此这里轮询等待。
   let canvasCount = 0
   for (let i = 0; i < 30; i++) {

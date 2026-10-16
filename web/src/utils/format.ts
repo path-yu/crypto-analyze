@@ -76,7 +76,7 @@ export function weekdayName(w: number): string {
   return WEEKDAYS[w] ?? '—'
 }
 
-/** KLineChart 横轴标签格式 */
+/** 图表横轴标签格式 */
 export function klineAxisTime(ts: number): string {
   const d = new Date(ts)
   return `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`

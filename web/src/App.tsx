@@ -328,7 +328,7 @@ export default function App() {
                   {strategyTitle}
                 </Typography>
                 <Typography variant="caption" color="text.secondary">
-                  ccxt 公开合约行情 · TypeScript 回测引擎 · KLineChart 可视化
+                  ccxt 公开合约行情 · TypeScript 回测引擎 · Vela 可视化
                 </Typography>
               </Box>
             </Stack>

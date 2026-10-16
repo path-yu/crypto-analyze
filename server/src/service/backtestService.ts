@@ -20,8 +20,7 @@ import {
   OrderBlockTracker,
   type OrderBlockSignal,
 } from '../indicators/orderBlock'
-import { compilePineCached } from '../pine/cache'
-import { emptyPineSignal, runPineProgram, type PineSignal } from '../pine/execute'
+import { runPineTsSignals, type PineSignal } from '../pine'
 import { runBacktest, type SignalProviderCtx } from '../backtest/engine'
 import { computeReport } from '../backtest/metrics'
 import { fetchKlines, MarketError } from '../market/exchange'
@@ -250,9 +249,9 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
    * 再把结果写回 signals[index]，图表标记与统计都读同一份数组。
    */
   let signalProvider: ((index: number, ctx: SignalProviderCtx) => void) | undefined
-  /** Pine 编译产物（源码 / TS / 诊断 / 元信息），仅在 strategy = 'pine' 时返回 */
+  /** Pine 执行结果（源码 / 诊断 / 元信息 / 告警），仅在 strategy = 'pine' 时返回 */
   let pineArtifact:
-    | { source: string; ts: string; diagnostics: PineDiagnostic[]; meta: PineCompileMeta }
+    | { source: string; diagnostics: PineDiagnostic[]; meta: PineCompileMeta; warnings: string[] }
     | undefined
 
   if (params.strategy === 'supertrend') {
@@ -269,36 +268,40 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
     if (!source || typeof source !== 'string') {
       throw new ValidationError('缺少 Pine 脚本源码（req.pine.source）')
     }
-    const comp = compilePineCached(source, { sourceName: req.pine?.name })
-    if (!comp.ok) {
-      const first = comp.diagnostics.find((d) => d.severity === 'error')
+    /*
+     * PineTS 是**批量执行**（没有 `step(index, ctx)` 逐 bar 回调）：
+     * 一次性跑完全部 K 线，再把它留下的券商账本折算成逐 bar 的 PineSignal[]。
+     * 脚本读 `strategy.position_size` 时读到的是 **PineTS 自己券商的仓位**，
+     * 因此不再需要 `signalProvider` 把本引擎的活仓回传给脚本。
+     */
+    const run = await runPineTsSignals(source, allCandles, {
+      tickerId: `${usedExchange}:${symbol}`,
+      timeframe,
+      inputs: req.pine?.inputs,
+    })
+    const firstError = run.diagnostics.find((d) => d.severity === 'error')
+    if (firstError) {
       throw new ValidationError(
-        `Pine 脚本编译失败：第 ${first?.line ?? 0} 行第 ${first?.column ?? 0} 列 · ${first?.message ?? '未知错误'}`,
+        `Pine 脚本执行失败：第 ${firstError.line} 行第 ${firstError.column} 列 · ${firstError.message}`,
       )
     }
-    // 与 order-block 一致：脚本只产信号，撮合仍由引擎的 Zone OCO 通路完成。
-    const program = runPineProgram(comp.ts, allCandles, {
-      inputs: req.pine?.inputs,
-      tickSize,
-      timeframe,
-    })
-    const signals = allCandles.map(() => emptyPineSignal())
-    signalProvider = (index, ctx) => {
-      const s = program.step(index, ctx)
-      /**
-       * `useScriptPositionSize = false`：忽略脚本 `strategy.entry(qty=…)` 指定的下单量，
-       * 让引擎按 UI 的「权益 × 仓位比例 × 杠杆」定名义价值（与其余三个策略一致）。
-       * 置 na 后引擎走非 fixed 路径：margin = 权益 × 仓位比例、notional = margin × 杠杆。
-       */
-      if (!params.useScriptPositionSize) s.entryQty = Number.NaN
-      signals[index] = s
+    /**
+     * `useScriptPositionSize = false`：忽略脚本 `strategy.entry(qty=…)` 指定的下单量，
+     * 让引擎按 UI 的「权益 × 仓位比例 × 杠杆」定名义价值（与其余三个策略一致）。
+     * 置 na 后引擎走非 fixed 路径：margin = 权益 × 仓位比例、notional = margin × 杠杆。
+     *
+     * 注意：只对**显式写了 `qty=`** 的脚本有效 —— 依赖 `default_qty_type/value` 的脚本
+     * 本来就没有 `entryQty`，开关切换不会有任何差别。
+     */
+    if (!params.useScriptPositionSize) {
+      for (const s of run.signals) s.entryQty = Number.NaN
     }
-    series = { signals }
+    series = { signals: run.signals }
     pineArtifact = {
       source,
-      ts: comp.ts,
-      diagnostics: comp.diagnostics,
-      meta: program.meta,
+      diagnostics: run.diagnostics,
+      meta: run.meta,
+      warnings: run.warnings,
     }
   } else {
     series = computeFibTrendSeries(allCandles, {

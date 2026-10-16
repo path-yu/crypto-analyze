@@ -1,6 +1,11 @@
-//@version=4
+//@version=6
 // ============================================================================
-// PumpHunter —— 暴涨启动捕获（1h）
+// PumpHunter —— 暴涨启动捕获（1h）  ·  v6 迁移版
+//
+// 迁移自同目录同名的 v4 版本（PumpHunter.pine）。仅做 v4 → v6 的语法迁移：
+//   strategy() 位置参数、ta.* / str.* 前缀、input.* 构造器、
+//   default_qty_type/value 必填项。策略逻辑、参数默认值、入场/离场条件、
+//   仓位口径（qty = notional / close）与 v4 版本逐条保持一致。
 //
 // 【复盘依据】6 个暴涨币、近一年 1h，共 94 段「3 天内自低点涨 ≥50%」的行情。
 // 暴涨启动【确认 bar】相对全样本基线，区分度最高的特征：
@@ -27,41 +32,44 @@
 //
 // 【仓位】固定名义价值 qty = notional / 价格，不做复利，便于逐笔归因。
 // ============================================================================
-strategy(title="PumpHunter", overlay=true, max_bars_back=500, initial_capital=1000, commission_value=0.055)
+// 注：initial_capital 只影响 PineTS 券商模拟器自己的保证金模型，不影响本仓库回测引擎
+//     的口径（引擎用 UI 的 initialCapital）。这里给足 100000，避免「1000 名义价值 == 1000 本金」
+//     触发 PineTS 的 Margin call 微型强平。
+strategy("PumpHunter", overlay=true, max_bars_back=500, initial_capital=100000,
+  default_qty_type=strategy.fixed, default_qty_value=1,
+  commission_type=strategy.commission.percent, commission_value=0.055)
 
 // ---------------- 入场参数 ----------------
-float notional  = input(1000.0, "单笔名义价值 USDT", type=input.float)
-float volMult   = input(5.0,  "成交量 / 96均量 ≥", type=input.float)
-float bar1Pct   = input(12.0, "单根涨幅 ≥ % (0=关)", type=input.float)
-float impPct    = input(0.0,  "近6根涨幅 ≥ % (0=关)", type=input.float)
-float distMaPct = input(2.0,  "收盘距MA20 ≥ %", type=input.float)
-float useBrk    = input(0.0,  "要求破50根新高(1/0)", type=input.float)
+notional  = input.float(1000.0, "单笔名义价值 USDT")
+volMult   = input.float(5.0,  "成交量 / 96均量 ≥")
+bar1Pct   = input.float(12.0, "单根涨幅 ≥ % (0=关)")
+impPct    = input.float(0.0,  "近6根涨幅 ≥ % (0=关)")
+distMaPct = input.float(2.0,  "收盘距MA20 ≥ %")
+useBrk    = input.float(0.0,  "要求破50根新高(1/0)")
 
 // ---------------- 离场参数 ----------------
-float slPct     = input(12.0, "初始止损 %", type=input.float)
-float bePct     = input(0.0,  "保本触发 % (0=关)", type=input.float)
-float trailArm  = input(0.0,  "移动止损激活所需浮盈 % (0=立即)", type=input.float)
-float trailPct  = input(10.0, "吊灯移动止损 %", type=input.float)
-float maxBars   = input(96.0, "时间止损 K线数", type=input.float)
+slPct     = input.float(12.0, "初始止损 %")
+bePct     = input.float(0.0,  "保本触发 % (0=关)")
+trailArm  = input.float(0.0,  "移动止损激活所需浮盈 % (0=立即)")
+trailPct  = input.float(10.0, "吊灯移动止损 %")
+maxBars   = input.float(96.0, "时间止损 K线数")
 
 // ---------------- 指标 ----------------
-volMa = sma(volume, 96)
+volMa = ta.sma(volume, 96)
 volR  = volMa > 0 ? volume / volMa : 0
 imp   = close / close[6] - 1
-ma20  = sma(close, 20)
+ma20  = ta.sma(close, 20)
 dist20 = ma20 > 0 ? close / ma20 - 1 : 0
-hi50  = highest(high, 50)
+hi50  = ta.highest(high, 50)
 brk   = close > hi50[1]
 
 plot(ma20, color=color.orange)
-plot(sma(close, 200), color=color.green)
+plot(ta.sma(close, 200), color=color.green)
 
 entryCond = volR >= volMult and (bar1Pct < 0.5 or close / close[1] - 1 >= bar1Pct / 100) and (impPct < 0.5 or imp >= impPct / 100) and dist20 >= distMaPct / 100 and (useBrk < 0.5 or brk)
 
 // ---------------- 状态 ----------------
 // 必须用 `var`：Pine 里顶层 `x = 0` 是**每根 bar 重新初始化**的，只有 `var` 才会跨 bar 保留。
-// （写成不带 var 的 `float stopPx = 0.0` 时，编译器会把它当逐 bar 标量放在 step 内部，
-//  于是每根都从 0 开始 → 永远走「新成交初始化」分支、止损一次都不会触发。）
 var float stopPx  = 0.0
 var float entryPx = 0.0
 var float hiSince = 0.0
@@ -69,8 +77,6 @@ var bool  armed   = false
 var float heldN   = 0.0
 
 if (strategy.position_size <= 0)
-    // 空仓：状态复位。用 position_size 而不是自维护标志，避免预热期
-    //「脚本自认为持仓、引擎实际空仓」的错位。
     stopPx := 0.0
     armed := false
     hiSince := 0.0
@@ -87,10 +93,10 @@ else
     else
         // 1) 先用「上一根收盘时已确定」的止损判定离场
         if (low <= stopPx)
-            strategy.close("P", comment="STOP " + tostring(close))
+            strategy.close("P", comment="STOP " + str.tostring(close))
             stopPx := 0.0
         if (stopPx > 0 and heldN >= maxBars and close <= entryPx)
-            strategy.close("P", comment="TIME " + tostring(close))
+            strategy.close("P", comment="TIME " + str.tostring(close))
             stopPx := 0.0
 
     // 2) 再用本根收盘信息更新止损，供下一根使用
@@ -99,12 +105,11 @@ else
         armed := true
     if (armed)
         stopPx := math.max(stopPx, entryPx)
-    // 吊灯移动止损可设置「浮盈满 trailArm% 才激活」：假信号先用固定止损便宜地切掉，
-    // 真爆发时再让移动止损接管，避免刚进场就被 12% 的回撤噪声打掉。
+    // 吊灯移动止损可设置「浮盈满 trailArm% 才激活」
     if (trailArm <= 0 or hiSince >= entryPx * (1 + trailArm / 100))
         stopPx := math.max(stopPx, hiSince * (1 - trailPct / 100))
     heldN := heldN + 1
 
 // 开仓（引擎在下一根开盘成交）
 if (strategy.position_size <= 0 and entryCond)
-    strategy.entry("P", strategy.long, qty=notional / close, comment="PUMP " + tostring(close))
+    strategy.entry("P", strategy.long, qty=notional / close, comment="PUMP " + str.tostring(close))

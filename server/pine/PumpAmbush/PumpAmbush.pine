@@ -1,47 +1,42 @@
-//@version=4
+//@version=6
 // ============================================================================
-// PumpAmbush —— 埋伏型暴涨捕获（1h）
+// PumpAmbush —— 埋伏型暴涨捕获（1h）  ·  v6 迁移版
 //
-// 【为什么是这套规则】先做了纯统计检验（scripts/scan-ambush.ts，20 个币、165k 根 bar、
-// 178 段暴涨），看「启动前的收缩状态」是否真能提前预测，结果（K=72 根预测窗，基线 5.72%）：
+// 迁移自同目录同名的 v4 版本（PumpAmbush.pine）。仅做 v4 → v6 的语法迁移：
+//   strategy() 位置参数、ta.* / str.* 前缀、input.* 构造器、
+//   default_qty_type/value 必填项。策略逻辑、参数默认值、入场/离场条件、
+//   仓位口径（qty = notional / close）与 v4 版本逐条保持一致。
 //
-//   信号                          信号段   精度    lift   覆盖暴涨段
-//   S1 量枯竭 volR<0.5            18589   5.1%   0.90   172/178   ← 无效（比随机还差）
-//   S2 波动压缩 atrPct<0.7×240均     1855   5.4%   0.95    88/178   ← 无效
-//   S3 窄幅 48根振幅<35%             371  21.3%   3.72   157/178   ← 唯一有效
-//   S3a 窄幅<20%                    922   4.8%   0.83   110/178   ← 收紧反而变差
-//   S3b 窄幅<25%                    630   8.7%   1.53   132/178   ← 次之
-//   E  首根放量                     8008   7.0%   1.22   165/178   ← 弱
-//   S3b+低位 / +高位 / +缩量 / +站上MA200 / +均线粘合 / +首根放量  ← **全部把 lift 拉回 1 以下**
+// 【为什么是这套规则】纯统计检验结论（K=72 根预测窗，基线 5.72%）：
+//   真正有效的启动前夜特征只有一个：**48 根振幅收敛到 35% 以内**
+//   （精度是基线的 3.7 倍，且覆盖 88% 的暴涨段）。
+//   「量枯竭」「波动压缩」实测无效；且**不要给这个条件加任何附加过滤**。
 //
-// 两条关键结论：
-//   ① 真正的启动前夜特征只有一个：**48 根振幅收敛到 35% 以内**（精度是基线的 3.7 倍，
-//      且覆盖 88% 的暴涨段）。「量枯竭」「波动压缩」这些直觉上的特征实测无效 ——
-//      原因是非暴涨的垃圾币同样长期缩量横盘，它们不具备区分度。
-//   ② **不要给这个条件加任何附加过滤**：低位/高位/缩量/均线/首根放量一律把 lift 打到 1 以下。
-//      极窄（<20%）也不行 —— 那更多是"下跌途中的死水"，而不是启动前夜。
-//
-// 【策略结构】埋伏的天然优势是"风险小、赔率大"：在横盘里布仓，止损放在区间下沿附近；
-// 若 72 根内没启动就时间止损走人；若启动则用 10% 吊灯移动止损跟随主升段
-// （10% 吊灯是上一轮实测的最优离场，见 PumpHunter.pine 的复盘结论）。
+// 【策略结构】在横盘里布仓，止损放在区间下沿附近；若 72 根内没启动就时间止损走人；
+// 若启动则用 10% 吊灯移动止损跟随主升段。
 //
 // 【仓位】固定名义价值 qty = notional / 价格。
 // ============================================================================
-strategy(title="PumpAmbush", overlay=true, max_bars_back=500, initial_capital=1000, commission_value=0.055)
+// 注：initial_capital 只影响 PineTS 券商模拟器自己的保证金模型，不影响本仓库回测引擎
+//     的口径（引擎用 UI 的 initialCapital）。这里给足 100000，避免「1000 名义价值 == 1000 本金」
+//     触发 PineTS 的 Margin call 微型强平。
+strategy("PumpAmbush", overlay=true, max_bars_back=500, initial_capital=100000,
+  default_qty_type=strategy.fixed, default_qty_value=1,
+  commission_type=strategy.commission.percent, commission_value=0.055)
 
 // ---------------- 参数 ----------------
-float notional  = input(1000.0, "单笔名义价值 USDT", type=input.float)
-float rangePct  = input(35.0, "48根振幅 < %", type=input.float)
-float maxPos    = input(100.0, "只在区间下 X% 处布仓 (100=不限)", type=input.float)
-float useLowStop = input(0.0, "止损放48根低点下方 (1/0)", type=input.float)
-float slPct     = input(15.0, "初始止损 %（useLowStop=0 时生效）", type=input.float)
-float trailArm  = input(0.0,  "移动止损激活所需浮盈 % (0=立即)", type=input.float)
-float trailPct  = input(10.0, "吊灯移动止损 %", type=input.float)
-float maxBars   = input(72.0, "时间止损 K线数", type=input.float)
+notional  = input.float(1000.0, "单笔名义价值 USDT")
+rangePct  = input.float(35.0, "48根振幅 < %")
+maxPos    = input.float(100.0, "只在区间下 X% 处布仓 (100=不限)")
+useLowStop = input.float(0.0, "止损放48根低点下方 (1/0)")
+slPct     = input.float(15.0, "初始止损 %（useLowStop=0 时生效）")
+trailArm  = input.float(0.0,  "移动止损激活所需浮盈 % (0=立即)")
+trailPct  = input.float(10.0, "吊灯移动止损 %")
+maxBars   = input.float(72.0, "时间止损 K线数")
 
 // ---------------- 信号：48 根振幅收敛 ----------------
-hi48 = highest(high, 48)
-lo48 = lowest(low, 48)
+hi48 = ta.highest(high, 48)
+lo48 = ta.lowest(low, 48)
 range48 = close > 0 ? (hi48 - lo48) / close : 1
 narrow = range48 < rangePct / 100
 // 收盘价在 48 根区间里的位置：0 = 贴近区间最低，100 = 贴近区间最高
@@ -71,19 +66,18 @@ if (strategy.position_size <= 0)
 else
     if (stopPx == 0)
         entryPx := strategy.position_avg_price
-        // 两种止损口径：固定百分比，或「放在 48 根区间下沿下方 1%」——
-        // 后者让风险随横盘宽度自适应：横盘越窄、风险越小（埋伏型的赔率来自这里）
+        // 两种止损口径：固定百分比，或「放在 48 根区间下沿下方 1%」
         stopPx := useLowStop >= 0.5 ? lo48 * (1 - 0.01) : entryPx * (1 - slPct / 100)
         hiSince := high
         armed := false
         heldN := 0.0
     else
-        // 先用「上一根收盘已确定」的止损判定离场（不要用本根 high 设、本根 low 触）
+        // 先用「上一根收盘已确定」的止损判定离场
         if (low <= stopPx)
-            strategy.close("A", comment="STOP " + tostring(close))
+            strategy.close("A", comment="STOP " + str.tostring(close))
             stopPx := 0.0
         if (stopPx > 0 and heldN >= maxBars and close <= entryPx)
-            strategy.close("A", comment="TIME " + tostring(close))
+            strategy.close("A", comment="TIME " + str.tostring(close))
             stopPx := 0.0
 
     hiSince := math.max(hiSince, high)
@@ -93,5 +87,5 @@ else
 
 // 布仓（引擎在下一根开盘成交）
 if (strategy.position_size <= 0 and canEnter and narrow and posInRange <= maxPos)
-    strategy.entry("A", strategy.long, qty=notional / close, comment="AMBUSH " + tostring(close))
+    strategy.entry("A", strategy.long, qty=notional / close, comment="AMBUSH " + str.tostring(close))
     canEnter := false

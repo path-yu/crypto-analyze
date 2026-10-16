@@ -104,9 +104,7 @@ export { request }
 /* ------------------------------------------------------------------ */
 
 export interface PineCompileResult {
-  /** 编译生成的 TypeScript 源码 */
-  ts: string
-  /** 编译诊断（语法 / 语义错误也走 200 + diagnostics） */
+  /** 校验诊断（语法 / 版本 / 运行期错误也走 200 + diagnostics） */
   diagnostics: PineDiagnostic[]
   /** 脚本声明、可覆盖 input、plot 标题等元信息 */
   meta: PineCompileMeta

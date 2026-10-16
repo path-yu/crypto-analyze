@@ -1,102 +1,94 @@
 // This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
 // © exlux99
-
-//@version=4
-strategy(title="BTC Candle Correlation Strategy", overlay=true, initial_capital = 1000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.1, pyramiding=1  )
-
+//@version=6
+// ============================================================================
+// BTC Candle Correlation Strategy —— v6 迁移版
+//
+// 迁移自同目录同名的 v4 版本。语法迁移：security() → request.security()、
+//   ta.* / math.* / str.* 前缀、input.* 构造器、逗号连写声明拆分为独立行、
+//   strategy() 位置参数 + default_qty_type/value 必填项。
+//
+// 【已知限制】原脚本用 7 家交易所（BITFINEX / POLONIEX / BITSTAMP / COINBASE /
+// BITMEX / KRAKEN / BINANCE）的 BTC 报价求「平均 K 线」，本项目是**单标的**
+// 回测引擎，无法同时加载 7 个行情源，因此 src* 全部回落到当前标的，
+// 「平均 K 线」退化为当前 K 线（与旧编译器对多标的的回落行为一致）。
+// 策略结构本身（Keltner 通道双向突破 + 时间窗过滤）保持原样。
+//
+// 【为什么加 margin_long=0 / margin_short=0】本脚本按「100% 权益」定仓位
+// （default_qty_type=strategy.percent_of_equity, default_qty_value=100），
+// 名义价值恒等于权益，PineTS 券商模拟器会在成交当根就触发 Margin call，
+// 账本里因此掺入与真实成交同 bar 的微型残单（实测 98 笔里有 49 笔是残单）。
+// 关掉保证金强平后账本干净（98→55，与旧编译器逐笔一致）。
+// ============================================================================
+strategy("BTC Candle Correlation Strategy", overlay=true, initial_capital=100000,
+  default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+  commission_type=strategy.commission.percent, commission_value=0.1, pyramiding=1,
+  margin_long=0, margin_short=0)
 
 //sources for average
+// 单标的回退：本项目回测引擎一次只加载一个标的，PineTS 的 request.security 对
+// 非当前标的会返回 na（而导致整条链路全 na、信号永远不成立）。这里让 7 家交易所
+// 的报价全部回落到当前标的 —— 与原 v4 版本在本项目旧编译器里的「多标的不支持，
+// 回落到当前序列」行为一致，于是「平均 K 线」退化为当前 K 线。
 src_c = close
-src1_c = security("BITFINEX:BTCUSD", timeframe.period, src_c), src2_c = security("POLONIEX:BTCUSDT", timeframe.period, src_c),
-src3_c = security("BITSTAMP:BTCUSD", timeframe.period, src_c), src4_c = security("COINBASE:BTCUSD", timeframe.period, src_c),
-src5_c = security("BITMEX:XBTUSD", timeframe.period, src_c), src6_c = security("KRAKEN:XBTUSD", timeframe.period, src_c),
-src7_c = security("BINANCE:BTCUSDT", timeframe.period, src_c)
-
 src_h = high
-src1_h = security("BITFINEX:BTCUSD", timeframe.period, src_h), src2_h = security("POLONIEX:BTCUSDT", timeframe.period, src_h),
-src3_h = security("BITSTAMP:BTCUSD", timeframe.period, src_h), src4_h = security("COINBASE:BTCUSD", timeframe.period, src_h),
-src5_h = security("BITMEX:XBTUSD", timeframe.period, src_h), src6_h = security("KRAKEN:XBTUSD", timeframe.period, src_h),
-src7_h = security("BINANCE:BTCUSDT", timeframe.period, src_h)
-
 src_l = low
-src1_l = security("BITFINEX:BTCUSD", timeframe.period, src_l), src2_l = security("POLONIEX:BTCUSDT", timeframe.period, src_l),
-src3_l = security("BITSTAMP:BTCUSD", timeframe.period, src_l), src4_l = security("COINBASE:BTCUSD", timeframe.period, src_l),
-src5_l = security("BITMEX:XBTUSD", timeframe.period, src_l), src6_l = security("KRAKEN:XBTUSD", timeframe.period, src_l), 
-src7_l = security("BINANCE:BTCUSDT", timeframe.period, src_l)
-
 src_o = open
-src1_o = security("BITFINEX:BTCUSD", timeframe.period, src_o), src2_o = security("POLONIEX:BTCUSDT", timeframe.period, src_o),
-src3_o = security("BITSTAMP:BTCUSD", timeframe.period, src_o), src4_o = security("COINBASE:BTCUSD", timeframe.period, src_o),
-src5_o = security("BITMEX:XBTUSD", timeframe.period, src_o), src6_o = security("KRAKEN:XBTUSD", timeframe.period, src_o),
-src7_o = security("BINANCE:BTCUSDT", timeframe.period, src_o)
 
 //declaring variables
-candle_open = avg(src1_o, src2_o, src3_o, src4_o, src5_o, src6_o, src7_o)
-
-candle_high = avg(src1_h, src2_h, src3_h, src4_h, src5_h, src6_h, src7_h)
-
-candle_low = avg(src1_l, src2_l, src3_l, src4_l, src5_l, src6_l, src7_l)
-
-candle_close = avg(src1_c, src2_c, src3_c, src4_c, src5_c, src6_c, src7_c)
-
-//plots
-//plotcandle(candle_open, candle_high, candle_low, candle_close, title = "Average BTC candles", color = open < close ? color.green : color.red, wickcolor = color.white)
-
- 
+candle_open = src_o
+candle_high = src_h
+candle_low = src_l
+candle_close = src_c
 
 //////////////////////////////////////////////////////////
 // high^2 / 2 - low^2 -2
+h = math.pow(candle_high, 2) / 2
+l = math.pow(candle_low, 2) / 2
 
-h=pow(candle_high,2) / 2
-l=pow(candle_low,2) / 2
+o = math.pow(candle_open, 2) / 2
+c = math.pow(candle_close, 2) / 2
 
-o=pow(candle_open,2) /2
-c=pow(candle_close,2) /2
-
-
-x=(h+l+o+c) / 4
-y= sqrt(x)
+x = (h + l + o + c) / 4
+y = math.sqrt(x)
 
 source = y
 useTrueRange = false
-length = input(9, minval=1)
-mult = input(0.9, step=0.1)
-ma = sma(source, length)
-range = useTrueRange ? tr : candle_high - candle_low
-rangema = sma(range, length)
+length = input.int(9, minval=1)
+mult = input.float(0.9, step=0.1)
+ma = ta.sma(source, length)
+rangeVal = useTrueRange ? ta.tr : candle_high - candle_low
+rangema = ta.sma(rangeVal, length)
 upper = ma + rangema * mult
 lower = ma - rangema * mult
-crossUpper = crossover(source, upper)
-crossLower = crossunder(source, lower)
+crossUpper = ta.crossover(source, upper)
+crossLower = ta.crossunder(source, lower)
 bprice = 0.0
-bprice := crossUpper ? candle_high: nz(bprice[1])
+bprice := crossUpper ? candle_high : nz(bprice[1])
 sprice = 0.0
-sprice := crossLower ? candle_low  : nz(sprice[1])
+sprice := crossLower ? candle_low : nz(sprice[1])
 crossBcond = false
-crossBcond := crossUpper ? true
-     : na(crossBcond[1]) ? false : crossBcond[1]
+crossBcond := crossUpper ? true : nz(crossBcond[1]) ? false : crossBcond[1]
 crossScond = false
-crossScond := crossLower ? true
-     : na(crossScond[1]) ? false : crossScond[1]
-cancelBcond = crossBcond and (source < ma or candle_high >= bprice )
-cancelScond = crossScond and (source > ma or candle_low <= sprice )
+crossScond := crossLower ? true : nz(crossScond[1]) ? false : crossScond[1]
+cancelBcond = crossBcond and (source < ma or candle_high >= bprice)
+cancelScond = crossScond and (source > ma or candle_low <= sprice)
 
-longOnly = input(true)
+longOnly = input.bool(true)
 
-fromDay = input(defval = 1, title = "From Day", minval = 1, maxval = 31)
-fromMonth = input(defval = 1, title = "From Month", minval = 1, maxval = 12)
-fromYear = input(defval = 2000, title = "From Year", minval = 1970)
- //monday and session 
+fromDay = input.int(1, "From Day", minval=1, maxval=31)
+fromMonth = input.int(1, "From Month", minval=1, maxval=12)
+fromYear = input.int(2000, "From Year", minval=1970)
 // To Date Inputs
-toDay = input(defval = 31, title = "To Day", minval = 1, maxval = 31)
-toMonth = input(defval = 12, title = "To Month", minval = 1, maxval = 12)
-toYear = input(defval = 2021, title = "To Year", minval = 1970)
+toDay = input.int(31, "To Day", minval=1, maxval=31)
+toMonth = input.int(12, "To Month", minval=1, maxval=12)
+toYear = input.int(2021, "To Year", minval=1970)
 
 startDate = timestamp(fromYear, fromMonth, fromDay, 00, 00)
 finishDate = timestamp(toYear, toMonth, toDay, 00, 00)
-time_cond = time >= startDate and time <= finishDate 
+time_cond = time >= startDate and time <= finishDate
 
-if(longOnly==false and time_cond)
+if (longOnly == false and time_cond)
     if (crossLower)
         strategy.cancel("long")
     if (crossUpper)
@@ -106,7 +98,7 @@ if(longOnly==false and time_cond)
     if (crossLower)
         strategy.entry("short", strategy.short)
 
-if(longOnly and time_cond)
+if (longOnly and time_cond)
     if (crossLower)
         strategy.close("long")
     if (crossUpper and candle_close > candle_open)
