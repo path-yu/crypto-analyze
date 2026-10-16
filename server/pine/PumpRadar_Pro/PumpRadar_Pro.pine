@@ -1,0 +1,116 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// ===========================================================================
+//  PumpRadar Pro —— 暴涨前哨·保本分批版（多版本对比的胜出版本 V5）
+//  与 PumpRadar.pine 的差异：
+//    · 浮盈达到 10% 后，止损移动到入场价（保本，大幅降低回吐）
+//    · 浮盈达到 20% 时平掉一半（落袋），剩余仓位继续用吊灯追踪
+//  其余（CVD/振幅收缩/量能/买卖压力 四特征评分门、结构性止损、96 根时间止损）不变。
+//  仓位：账户层面按「单笔风险 ≤ 1% 权益」反推名义仓位。
+// ===========================================================================
+
+//@version=6
+strategy("PumpRadar Pro 保本分批版", overlay=true,
+     commission_type=strategy.commission.percent, commission_value=0.055,
+     slippage=2, initial_capital=10000, default_qty_type=strategy.percent_of_equity,
+     default_qty_value=12, pyramiding=0)
+
+// ------------------------- 参数 -------------------------
+cvdLen    = input.int(48,  "CVD：Delta EMA 平滑", group="CVD")
+cvdBack   = input.int(48,  "CVD 回看根数", group="CVD")
+rngLen    = input.int(24,  "振幅窗口", group="结构")
+rngSmaLen = input.int(240, "振幅基准均线", group="结构")
+pickLen   = input.int(96,  "量能基准均线", group="量能")
+scoreMin  = input.int(3,   "最低评分 (1~4)", minval=1, maxval=4, group="门")
+
+useSL     = input.bool(true, "结构止损", group="风控")
+slBuf     = input.float(0.5, "止损缓冲 (%)", step=0.1, group="风控")
+beArm     = input.float(10.0, "保本触发 (%)", step=1, group="风控",
+     tooltip="浮盈达到该幅度后，止损移动到入场价")
+useTP50   = input.bool(true, "分批止盈", group="风控")
+tpAt      = input.float(20.0, "分批触发 (%)", step=1, group="风控")
+useTrail  = input.bool(true, "吊灯离场", group="风控")
+trailPct  = input.float(20.0, "吊灯回撤 (%)", step=1, group="风控")
+maxBars   = input.int(96, "时间止损(根) 0=不限", group="风控")
+
+// ------------------------- 进场过滤（AKE 亏损复盘得出） -------------------------
+// AKE 一年实盘复盘中，唯一一笔 ATR 分位 > 0.7 的高波动进场亏掉全年净利的 2.3 倍（-56% 权益）；
+// 点火 K 线收在自身区间下半部的 10 笔进场平均只有 +2.6%（收在上半区的 17 笔平均 +16.7%）。
+useAtrFilter  = input.bool(true, "过滤：ATR% 高于基准时不开仓", group="进场过滤",
+     tooltip="ATR% 高于其 240 根均值 = 市场已进入恐慌/插针阶段，此时『深跌+突破』极易是接飞刀")
+useRejFilter  = input.bool(true, "过滤：点火K线须收在上半区", group="进场过滤",
+     tooltip="点火 bar 的收盘须位于自身高低区间的上半部（≥50%），否则视为承接不足")
+atrRankTh = input.float(1.0, "ATR% / 240均值 上限", step=0.1, group="进场过滤")
+
+// ------------------------- 特征 -------------------------
+rng      = high - low
+delta    = volume * (rng > 0 ? (close - open) / rng : 0.0)
+deltaEma = ta.ema(delta, cvdLen)
+cvd      = ta.cum(deltaEma)
+f1 = cvd > cvd[cvdBack]
+
+hiN      = ta.highest(high, rngLen)
+loN      = ta.lowest(low, rngLen)
+rangeComp = close > 0 ? (hiN - loN) / close : na
+rangeBase = ta.sma(rangeComp, rngSmaLen)
+f2 = rangeBase > 0 and rangeComp < rangeBase * 0.8
+
+volPickup = ta.sma(volume, 6) / ta.sma(volume, pickLen)
+f3 = volPickup > 1.2
+
+upVol = ta.sma(math.max(delta, 0.0), 48)
+dnVol = ta.sma(math.max(-delta, 0.0), 48)
+f4 = dnVol > 0 and upVol / dnVol > 1.2
+
+score = (f1 ? 1 : 0) + (f2 ? 1 : 0) + (f3 ? 1 : 0) + (f4 ? 1 : 0)
+
+// 进场过滤（AKE 复盘：剔除高波动进场与无承接的点火 K 线）
+atrPct  = close > 0 ? ta.atr(14) / close * 100 : na
+atrBase = ta.sma(atrPct, 240)
+barPos  = rng > 0 ? (close - low) / rng : na
+passAtr = not useAtrFilter or not na(atrBase) and atrPct <= atrBase * atrRankTh
+passRej = not useRejFilter or (rng > 0 and barPos >= 0.5)
+
+// ------------------------- 交易 -------------------------
+longCond = score >= scoreMin and passAtr and passRej and strategy.position_size == 0
+var float sqStop = na
+var float entryPx = na
+var float hiMark = na
+var bool  beDone = false
+var bool  tpDone = false
+var int   held = 0
+
+if longCond
+    strategy.entry("Radar", strategy.long)
+    sqStop := ta.lowest(low, 24) * (1 - slBuf / 100)
+    entryPx := close
+    hiMark := close
+    beDone := false
+    tpDone := false
+    held := 0
+
+if strategy.position_size > 0
+    hiMark := math.max(hiMark, high)
+    // 保本移动
+    if beArm > 0 and not beDone and hiMark >= entryPx * (1 + beArm / 100) and sqStop < entryPx
+        sqStop := entryPx
+        beDone := true
+    if useSL
+        strategy.exit("SL", "Radar", stop=sqStop)
+    // 分批止盈：触及 +tpAt 平一半（剩余仓位继续吊灯追踪）
+    if useTP50 and not tpDone and high >= entryPx * (1 + tpAt / 100)
+        strategy.close("Radar", comment="止盈50%", qty_percent=50)
+        tpDone := true
+    if useTrail and close < hiMark * (1 - trailPct / 100)
+        strategy.close("Radar", comment="吊灯离场")
+    held := held + 1
+    if maxBars > 0 and held >= maxBars
+        strategy.close("Radar", comment="时间止损")
+else
+    held := 0
+
+// ------------------------- 可视化 -------------------------
+plotshape(longCond, "雷达触发", shape.triangleup,
+     location=location.belowbar, color=color.new(color.orange, 0),
+     textcolor=color.white, text="RADAR", size=size.small)
+plot(score, "评分", display=display.none)
+bgcolor(score >= scoreMin ? color.new(color.orange, 92) : na, title="评分达标背景")
