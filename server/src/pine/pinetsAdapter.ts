@@ -391,6 +391,22 @@ export async function runPineTsSignals(
     mark(exitIdx, 'forceClose')
   }
 
+  /*
+   * 盘中止损通道：脚本 `plot(…, title="STOP")` 的逐 bar 止损价 → 信号 obStopLoss。
+   *
+   * PineTS 账本只记录开/平仓成交，适配器原本只能给出 forceClose（下一根开盘平仓），
+   * 于是「止损」在瀑布行情里会被跳空穿透（真实案例：Q 一笔 −36.8%，止损位只差 12%）。
+   * 引擎本身支持盘中止损（持仓期逐 bar 用 `p <= stopLevel` 判定并按止损价成交），
+   * 所以这里把脚本画出来的止损位透传给引擎，由引擎在持仓期间**只收紧**地维护。
+   */
+  const stopPlot = plots['STOP'] ?? plots['Stop'] ?? plots['__stop']
+  if (stopPlot) {
+    for (let i = 0; i < signals.length; i++) {
+      const v = stopPlot[i]
+      if (typeof v === 'number' && Number.isFinite(v) && v > 0) signals[i].obStopLoss = v
+    }
+  }
+
   return {
     signals,
     meta: {

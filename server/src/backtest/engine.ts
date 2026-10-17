@@ -902,6 +902,25 @@ class BacktestEngine {
           Number.isFinite(sig.entryQty ?? NaN) && (sig.entryQty as number) > 0
             ? (sig.entryQty as number)
             : undefined
+        /*
+         * Pine 动态止损（盘中止损）：脚本 `plot(…, title="STOP")` 的逐 bar 止损价 →
+         * 适配器的 obStopLoss → 这里在持仓期间**只收紧**地维护 sub.stopLoss。
+         *
+         * 引擎的止损判定本来就是盘中的（`p <= stopLevel` 时按止损价成交），
+         * 所以瀑布行情不会再被「信号 → 下一根开盘」跳空穿透。
+         * 只对 pine 策略生效，且脚本没有 STOP 通道时（NaN）完全不改变原有行为。
+         */
+        if (params.strategy === 'pine' && inPos && Number.isFinite(sig.obStopLoss ?? NaN)) {
+          const next = sig.obStopLoss as number
+          for (const sub of this.position!.subs) {
+            if (!this.isAlive(sub)) continue
+            const isLong = sub.side === 'long'
+            const tighter = isLong ? next > sub.stopLoss : next < sub.stopLoss
+            // 不允许把止损放到当前价的另一侧（那等于立刻成交）
+            const okSide = isLong ? next < bar.close : next > bar.close
+            if (okSide && (!Number.isFinite(sub.stopLoss) || tighter)) sub.stopLoss = next
+          }
+        }
         if (wantLong && !inPos && this.canAddSameDirection('long', true)) {
           const stopLoss = Number.isFinite(sig.obStopLoss ?? NaN) ? (sig.obStopLoss as number) : NaN
           const takeProfit = Number.isFinite(sig.obTakeProfit ?? NaN)
