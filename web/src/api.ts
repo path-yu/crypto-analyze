@@ -106,29 +106,67 @@ export async function runBacktest(body: BacktestRequest): Promise<BacktestResult
 export { request }
 
 /* ------------------------------------------------------------------ */
-/* 交易回放用 K 线                                                      */
+/* 交易回放 / 图表用 K 线                                               */
 /* ------------------------------------------------------------------ */
 
+/** 返回的一次取数结果：K 线 + 服务端实际使用的窗口与命中缓存标记 */
+export interface KlineDataset {
+  candles: Candle[]
+  cached: boolean
+  /** 用户可见区间起点（服务端回显） */
+  since: number
+  /** 用户可见区间终点，已冻结到 bar 边界（服务端回显） */
+  until: number
+}
+
 /**
- * 拉取一段 K 线：以 `until`（毫秒）为锚点向前取 `bars` 根，用于「交易回溯」弹窗。
- * 服务端 `/api/klines` 只支持「锚点 + 根数」这一种取法（没有 from 参数），
- * 因此调用方要自己把「起点 → 根数」换算好。
+ * 拉取一段 K 线。
+ *
+ * 与回测接口**共用同一套窗口换算**（服务端 `resolveWindow`，含固定预热根数），
+ * 因此同一 `since/until` 组合会命中同一份缓存 —— 先取 K 线再点回测不会重复打交易所。
+ * 传 `since` 时以它为准（`bars` 仅作兜底），否则按 `until - bars * 周期` 反推。
  */
 export async function fetchKlines(opts: {
   exchange: ExchangeId
   symbol: string
   timeframe: Timeframe
-  bars: number
-  until: number
-}): Promise<Candle[]> {
+  until?: number
+  since?: number
+  bars?: number
+}): Promise<KlineDataset> {
   const params = new URLSearchParams({
     exchange: opts.exchange,
     symbol: opts.symbol,
     timeframe: opts.timeframe,
-    bars: String(Math.max(100, Math.min(20000, Math.round(opts.bars)))),
-    until: String(Math.round(opts.until)),
   })
-  return request<Candle[]>(`/api/klines?${params.toString()}`)
+  if (opts.until !== undefined) params.set('until', String(Math.round(opts.until)))
+  if (opts.since !== undefined) params.set('since', String(Math.round(opts.since)))
+  if (opts.bars !== undefined) params.set('bars', String(Math.round(opts.bars)))
+
+  const res = await fetch(`/api/klines?${params.toString()}`)
+  const text = await res.text()
+  let json: {
+    ok?: boolean
+    error?: string
+    cached?: boolean
+    since?: number
+    until?: number
+    data?: Candle[]
+  }
+  try {
+    json = JSON.parse(text)
+  } catch {
+    throw new Error(`服务返回了非 JSON 响应（HTTP ${res.status}）`)
+  }
+  if (!res.ok || json.ok === false || !Array.isArray(json.data)) {
+    throw new Error(json.error ?? `获取 K 线失败（HTTP ${res.status}）`)
+  }
+  return {
+    candles: json.data,
+    cached: Boolean(json.cached),
+    since: json.since ?? opts.since ?? 0,
+    until: json.until ?? opts.until ?? 0,
+  }
 }
 
 /* ------------------------------------------------------------------ */

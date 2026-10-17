@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import Box from '@mui/material/Box'
+import IconButton from '@mui/material/IconButton'
 import Paper from '@mui/material/Paper'
 import Stack from '../ui/Stack'
 import Typography from '@mui/material/Typography'
@@ -7,6 +8,7 @@ import FormControlLabel from '@mui/material/FormControlLabel'
 import Switch from '@mui/material/Switch'
 import Tooltip from '@mui/material/Tooltip'
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined'
+import RefreshIcon from '@mui/icons-material/Refresh'
 
 import { VelaWorkspace } from '@luxalgo/vela/workspace'
 import type { DataProvider } from '@luxalgo/vela/plugin'
@@ -59,8 +61,61 @@ const VELA_THEME = {
 
 const MAX_MARKERS = 1200
 
+/** 渲染器上的入口：写 K 线 + 设置价格精度 */
+interface KlineSink {
+  updateBar?: (bar: unknown) => void
+  setBars?: (bars: unknown, opts?: { preserveView?: boolean }) => void
+  /**
+   * 用交易所的 tick（mintick）设定价格轴的显示位数。
+   * Vela 默认按当前缩放推导小数位（见其文档：「undefined ⇒ fall back to the zoom-derived
+   * decimals」），于是同一张图缩放一变位数就变、且常常多于交易所的真实精度。
+   */
+  setPricePrecision?: (mintick: number | undefined) => void
+}
+
+/**
+ * 取到真正能写 K 线的渲染器实例。
+ *
+ * `chart.renderer` 是 `RendererControl` 这个 façade：它转发了 `onCrosshairMove` 等方法，
+ * 却**没有** `setBars` / `updateBar`（实测运行时都是 undefined，直接调用会静默空转、
+ * 图表停在旧数据）。真实实例挂在 façade 内部的 `renderer` 字段上（TS 标为 private，
+ * 运行时存在），另可用 `orchestrator.renderer` 兜底。依次探测，取第一个可用的。
+ */
+function barsSinkOf(chart: unknown): KlineSink | null {
+  const c = chart as {
+    renderer?: { renderer?: unknown } & Record<string, unknown>
+    orchestrator?: { renderer?: unknown }
+  }
+  const usable = (x: unknown): boolean => {
+    const s = x as KlineSink | undefined
+    // 必须按 `setBars` 判定：若只在 façade 上认到 `setPricePrecision`，
+    // 返回 façade 会让下面的就地更新（setBars/updateBar）静默失效、图表冻结。
+    return Boolean(s && typeof s.setBars === 'function')
+  }
+  const facade = c.renderer
+  if (usable(facade)) return facade as KlineSink
+  const inner = facade?.renderer
+  if (usable(inner)) return inner as KlineSink
+  const orch = c.orchestrator?.renderer
+  if (usable(orch)) return orch as KlineSink
+  return null
+}
+
 interface Props {
-  result: BacktestResult | null
+  /** 图表主数据源：历史 K 线（与回测解耦，未回测也能画图） */
+  candles: Candle[]
+  /** 当前标的（用于工作区标题 / 表头） */
+  symbol: string
+  /** 当前周期（用于 Vela 的周期换算） */
+  timeframe: Timeframe
+  /** 回测结果；未回测时为 null —— 只影响交易标注与 Pine 叠加，不影响蜡烛 */
+  result?: BacktestResult | null
+  /**
+   * 交易所的最小变动价位（syminfo.mintick）。
+   * 传进来后会用它设定价格轴的显示位数，使图表的价格精度与交易所一致；
+   * 不传（或 ≤0）则沿用 Vela 按缩放推导的默认精度。
+   */
+  priceTick?: number
   loading: boolean
   showTrades: boolean
   onToggleTrades: (v: boolean) => void
@@ -75,6 +130,8 @@ interface Props {
    * 参数 = 回测用的参数 = 文件里的默认值"）。
    */
   onIndicatorInputsChange?: (values: Record<string, number | boolean | string>) => void
+  /** 重新拉取当前窗口的 K 线（「刷新」按钮，把结束时间前移一根 bar） */
+  onRefresh?: () => void
   height?: number
 }
 
@@ -92,7 +149,11 @@ interface Props {
  * Vela™ 的署名水印由工作区自身挂载，保持可见（Apache-2.0 §4(d) 的署名要求）。
  */
 export default function KLinePanel({
+  candles,
+  symbol,
+  timeframe,
   result,
+  priceTick,
   loading,
   showTrades,
   onToggleTrades,
@@ -100,6 +161,7 @@ export default function KLinePanel({
   onToggleLevels,
   onSelectTrade,
   onIndicatorInputsChange,
+  onRefresh,
   height = 620,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -113,20 +175,21 @@ export default function KLinePanel({
    */
   const [hoverBar, setHoverBar] = useState<Candle | null>(null)
 
-  const velaData = useMemo(() => {
-    if (!result) return []
-    return result.candles.map((c) => ({
-      time: c.timestamp,
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-      volume: c.volume,
-    }))
-  }, [result])
+  const velaData = useMemo(
+    () =>
+      candles.map((c) => ({
+        time: c.timestamp,
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume,
+      })),
+    [candles],
+  )
 
   const payload = useMemo(
-    () => buildTradeLayerPayload(result, showTrades && result !== null, showLevels),
+    () => buildTradeLayerPayload(result ?? null, showTrades && !!result, showLevels),
     [result, showTrades, showLevels],
   )
 
@@ -135,16 +198,15 @@ export default function KLinePanel({
   /** 时间戳 → 下标，供信息条 O(1) 找「上一根收盘」 */
   const barIndex = useMemo(() => {
     const m = new Map<number, number>()
-    result?.candles.forEach((c, i) => m.set(c.timestamp, i))
+    candles.forEach((c, i) => m.set(c.timestamp, i))
     return m
-  }, [result])
+  }, [candles])
 
   /** 信息条当前展示的那根 K 线：有悬停就用悬停的那根，否则默认最后一根 */
   const shownBar = useMemo(() => {
     if (hoverBar) return hoverBar
-    const bars = result?.candles
-    return bars && bars.length > 0 ? bars[bars.length - 1] : null
-  }, [hoverBar, result])
+    return candles.length > 0 ? candles[candles.length - 1] : null
+  }, [hoverBar, candles])
 
   /**
    * 基本信息各项：开/高/低/收 + 涨跌幅、振幅（均以「上一根收盘价」为基准，
@@ -153,8 +215,7 @@ export default function KLinePanel({
   const barInfo = useMemo(() => {
     if (!shownBar) return []
     const i = barIndex.get(shownBar.timestamp) ?? -1
-    const bars = result?.candles ?? []
-    const prevClose = i > 0 ? bars[i - 1].close : shownBar.open
+    const prevClose = i > 0 ? candles[i - 1].close : shownBar.open
     const change = prevClose !== 0 ? ((shownBar.close - prevClose) / prevClose) * 100 : 0
     const amplitude = prevClose !== 0 ? ((shownBar.high - shownBar.low) / prevClose) * 100 : 0
     const tone = change >= 0 ? UP_COLOR : DOWN_COLOR
@@ -166,15 +227,46 @@ export default function KLinePanel({
       { label: '涨跌幅', value: `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`, tone },
       { label: '振幅', value: `${amplitude.toFixed(2)}%` },
     ] as { label: string; value: string; tone?: string }[]
-  }, [shownBar, barIndex, result])
+  }, [shownBar, barIndex, candles])
+
+  /**
+   * 结构键：只要「品种 / 周期 / Pine 源码」不变，就**不重建** Vela 工作区。
+   *
+   * 以前的初始化 effect 把 `result` / `velaData` 也放进依赖里，于是
+   * ①每次回测结果变化、②每根 WS 推来的新 bar，都会销毁并重建整个工作区；
+   * 而每次重建都会重新执行 `loadPineManifest()`（拉一次 `/api/pine/scripts`）——
+   * 实测该接口被调用过 4319 次。这是「频繁请求 + 图表重复加载」的主因。
+   * 现在：结构变化才重建，纯数据变化走 `renderer.setBars/updateBar` 就地更新。
+   */
+  const pineSource = result?.pine?.source
+  /**
+   * 注意末尾的「有无数据」：首帧 `candles` 往往还是空的（K 线在异步拉取），
+   * 此时 effect 会 early-return；若键不含这一位，等数据到位后键不变、**图就永远建不出来**。
+   * 加上它以后：空 → 有数据 会触发一次建图，而后续每根 bar 的跳动不再改键。
+   */
+  const hasCandles = candles.length > 0
+  const structureKey = `${symbol}|${timeframe}|${pineSource ?? ''}|${hasCandles ? 'bars' : 'empty'}`
+
+  /** 建图时用的那份数据（用于判断后续变化是「只有最后一根在跳」还是「换了/多了 bar」） */
+  const seededRef = useRef<Candle[] | null>(null)
+  const candlesRef = useRef<Candle[]>(candles)
+  candlesRef.current = candles
+  const payloadRef = useRef(payload)
+  payloadRef.current = payload
+  /** 当前工作区是用哪个结构键建的（数据更新时据此判断能不能就地更新） */
+  const builtKeyRef = useRef<string | null>(null)
+  /** 建图时用的「延迟取用 chart」工具，供数据更新复用（cell 未就绪时会重试） */
+  const withChartRef = useRef<
+    ((fn: (chart: ReturnType<VelaWorkspace['cells']>[number]['chart']) => void) => void) | null
+  >(null)
 
   useEffect(() => {
     const el = containerRef.current
-    if (!el || !result || velaData.length === 0) return
+    if (!el || !symbol || velaData.length === 0) return
 
     // 图层读的是模块级的当前 payload；必须先写入再实例化工作区，
     // 否则原生指标 `start()` 时推进去的是上一份结果。
-    setTradeLayerPayload(payload)
+    setTradeLayerPayload(payloadRef.current)
     setHoverBar(null)
     el.innerHTML = ''
 
@@ -183,8 +275,8 @@ export default function KLinePanel({
       ws = new VelaWorkspace(el, {
         layout: false,
         data: velaData,
-        symbol: result.report.symbol,
-        timeframe: VELA_TIMEFRAME[result.report.timeframe] ?? '60',
+        symbol,
+        timeframe: VELA_TIMEFRAME[timeframe] ?? '60',
         theme: VELA_THEME,
         upColor: VELA_THEME.upColor,
         downColor: VELA_THEME.downColor,
@@ -203,6 +295,7 @@ export default function KLinePanel({
         indicators: loadPineManifest,
       })
       workspaceRef.current = ws
+      seededRef.current = candlesRef.current
     } catch (err) {
       console.error('[vela] 初始化图表失败：', err)
       return
@@ -220,6 +313,8 @@ export default function KLinePanel({
       }
       run(tries)
     }
+    withChartRef.current = withChart
+    builtKeyRef.current = structureKey
 
     let offCross: (() => void) | null = null
     let offInputs: (() => void) | null = null
@@ -232,7 +327,7 @@ export default function KLinePanel({
       // 交易标记覆盖物（图层 + 同名的 legend-less 原生指标）
       chart.addNativeIndicator(TRADE_LAYER_ID)
       // Pine 脚本自身的绘制交给 Pine 引擎；脚本报错时 Vela 会自行提示，不阻断蜡烛
-      const source = result.pine?.source
+      const source = result?.pine?.source
       if (source) {
         try {
           const handle = chart.addIndicator(source)
@@ -284,6 +379,9 @@ export default function KLinePanel({
       offInputs?.()
       uninstallLocale()
       workspaceRef.current = null
+      builtKeyRef.current = null
+      seededRef.current = null
+      withChartRef.current = null
       tradeHitState.regions = []
       try {
         ws?.destroy()
@@ -291,7 +389,68 @@ export default function KLinePanel({
         /* 卸载期的异常不必上抛 */
       }
     }
-  }, [result, velaData, payload])
+    // 只按结构键重建：`velaData` / `payload` / `result` 的变化改由下面的
+    // 「就地更新」effect 处理，绝不再销毁重建整个 Vela 工作区。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [structureKey])
+
+  /** 交易标注（payload）变化：只更新图层读取的模块级 payload，不重建工作区 */
+  useEffect(() => {
+    setTradeLayerPayload(payload)
+  }, [payload])
+
+  /**
+   * 价格精度：把交易所的最小变动价位（mintick）交给渲染器，
+   * 让价格轴刻度与十字光标标签显示**与交易所一致**的小数位。
+   *
+   * 不这么做时 Vela 会按当前缩放自己推导位数 —— 同一张图放大/缩小一次，位数就变一次，
+   * 而且常常比交易所的真实精度多几位（例如交易所 tick 0.00001，轴上一度显示 0.07689400）。
+   */
+  useEffect(() => {
+    const chart = withChartRef.current
+    if (!chart) return
+    const mintick = Number.isFinite(priceTick) && (priceTick as number) > 0 ? priceTick : undefined
+    chart((c) => {
+      try {
+        barsSinkOf(c)?.setPricePrecision?.(mintick)
+      } catch (err) {
+        console.warn('[vela] 设置价格精度失败（不影响其它功能）：', err)
+      }
+    })
+    // structureKey：换品种/周期会重建工作区，重建后必须重新应用一次
+  }, [priceTick, structureKey])
+
+  /**
+   * K 线数据变化：往**已有**的工作区里就地换数据。
+   *
+   * · 只有最后一根在跳动（长度不变）→ `renderer.updateBar`，最省；
+   * · 新增 / 换了一批 bar → `renderer.setBars(…, { preserveView: true })`，保留缩放与位置。
+   * 这样 WS 每秒推一根也不会让图表「重新加载」，更不会顺带再拉一次脚本清单。
+   */
+  useEffect(() => {
+    const seeded = seededRef.current
+    if (!seeded || !builtKeyRef.current || candles === seeded) return
+    const chart = withChartRef.current
+    if (!chart) return
+    const isTickOnly = candles.length === seeded.length
+    seededRef.current = candles
+    chart((c) => {
+      try {
+        const sink = barsSinkOf(c)
+        if (!sink) {
+          console.warn('[vela] 找不到可写 K 线的渲染器，图表将保留上一份快照（等下一次结构重建）')
+          return
+        }
+        if (isTickOnly && typeof sink.updateBar === 'function') {
+          sink.updateBar(velaData[velaData.length - 1])
+        } else {
+          sink.setBars?.(velaData, { preserveView: true })
+        }
+      } catch (err) {
+        console.warn('[vela] 就地更新 K 线数据失败（将等待下一次结构重建）：', err)
+      }
+    })
+  }, [candles, velaData])
 
   // 图上点选交易：图层每帧把标记的视口坐标写进 tradeHitState，这里按半径命中。
   // 以「按下 → 抬起位移 < 4px」区分点击与拖动、平移，避免缩放拖图时误弹窗。
@@ -348,12 +507,14 @@ export default function KLinePanel({
         sx={{ px: 2, py: 1.25, borderBottom: '1px solid', borderColor: 'divider', flexWrap: 'wrap', gap: 1 }}
       >
         <Stack direction="row" alignItems="center" spacing={1.25}>
-          <Typography variant="subtitle2">
-            {result ? `${result.report.symbol} · ${result.report.timeframe}` : 'K 线图'}
-          </Typography>
-          {result && (
+          <Typography variant="subtitle2">{`${symbol || '—'} · ${timeframe}`}</Typography>
+          {result ? (
             <Typography variant="caption" color="text.secondary">
-              共 {result.candles.length.toLocaleString()} 根 · 交易 {markerCount} 笔
+              共 {candles.length.toLocaleString()} 根 · 交易 {markerCount} 笔
+            </Typography>
+          ) : (
+            <Typography variant="caption" color="text.secondary">
+              共 {candles.length.toLocaleString()} 根 · 未回测
             </Typography>
           )}
           <Tooltip
@@ -367,18 +528,36 @@ export default function KLinePanel({
           </Tooltip>
         </Stack>
         <Stack direction="row" alignItems="center" spacing={1}>
+          {onRefresh && (
+            <Tooltip title="重新拉取当前窗口的 K 线（结束时间前移一根）。勾选「同步进行回测」时会一并重跑回测">
+              <span>
+                <IconButton size="small" disabled={loading} onClick={onRefresh}>
+                  <RefreshIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+          )}
           <FormControlLabel
             control={
-              <Switch size="small" checked={showTrades} onChange={(e) => onToggleTrades(e.target.checked)} />
+              <Switch
+                size="small"
+                checked={showTrades}
+                disabled={!result}
+                onChange={(e) => onToggleTrades(e.target.checked)}
+              />
             }
-            label={<Typography variant="caption">交易标注</Typography>}
+            label={
+              <Tooltip title={result ? '' : '先运行一次回测才能显示交易标注'}>
+                <Typography variant="caption">交易标注</Typography>
+              </Tooltip>
+            }
           />
           <FormControlLabel
             control={
               <Switch
                 size="small"
                 checked={showLevels}
-                disabled={!showTrades}
+                disabled={!showTrades || !result}
                 onChange={(e) => onToggleLevels(e.target.checked)}
               />
             }
@@ -446,7 +625,7 @@ export default function KLinePanel({
             sx={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}
           >
             <Typography color="text.secondary" variant="body2">
-              {loading ? '正在拉取行情并回测…' : '设置参数后点击「开始回测」加载 K 线'}
+              {loading ? '正在拉取行情…' : '暂无 K 线数据'}
             </Typography>
           </Stack>
         )}

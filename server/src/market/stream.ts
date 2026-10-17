@@ -157,8 +157,20 @@ export function onStreamUpdate(cb: UpdateListener): () => void {
   return () => listeners.delete(cb)
 }
 
-/** 把一批 K 线按时间戳并入滚动窗口（ccxt 的 watchOHLCV 可能重复推送整段缓存） */
-function mergeOhlcv(key: string, raw: readonly number[][]): void {
+/**
+ * 把一批 K 线按时间戳并入滚动窗口（ccxt 的 watchOHLCV 可能重复推送整段缓存）。
+ *
+ * 键必须与 `streamCandles` 的读取键一致（`ohlcvKey`）—— 原先写入用的是订阅键
+ * （`subKey`，多一段 kind），读的时候却按 `ohlcvKey` 查，导致 `streamCandles`
+ * 永远查不到数据、WS 优先的路径静默退回 REST 轮询。
+ */
+function mergeOhlcv(
+  exchange: ExchangeId,
+  symbol: string,
+  timeframe: Timeframe,
+  raw: readonly number[][],
+): void {
+  const key = ohlcvKey(exchange, symbol, timeframe)
   const merged = new Map<number, Candle>()
   for (const c of ohlcvCache.get(key)?.candles ?? []) merged.set(c.timestamp, c)
   for (const bar of raw) {
@@ -178,7 +190,7 @@ function mergeOhlcv(key: string, raw: readonly number[][]): void {
 }
 
 /** 订阅后用 REST 播种一次历史 K 线，让指标 / Pine 立刻有足够暖机数据 */
-async function seedCandles(key: string, spec: StreamSubscription, tf: Timeframe): Promise<void> {
+async function seedCandles(spec: StreamSubscription, tf: Timeframe): Promise<void> {
   try {
     const res = await fetchKlines({
       exchange: spec.exchange,
@@ -187,7 +199,12 @@ async function seedCandles(key: string, spec: StreamSubscription, tf: Timeframe)
       targetBars: SEED_BARS,
       useCache: true,
     })
-    mergeOhlcv(key, res.candles.map((c) => [c.timestamp, c.open, c.high, c.low, c.close, c.volume]))
+    mergeOhlcv(
+      spec.exchange,
+      spec.symbol,
+      tf,
+      res.candles.map((c) => [c.timestamp, c.open, c.high, c.low, c.close, c.volume]),
+    )
   } catch (err) {
     // 播种失败不致命：WS 自己会推增量，REST 兜底也照常可用
     lastError = `K 线播种失败 ${spec.exchange} ${spec.symbol} ${tf}：${
@@ -219,11 +236,11 @@ async function runLoop(entry: ActiveSub, key: string): Promise<void> {
         const tf = spec.timeframe ?? '1h'
         if (!seeded) {
           seeded = true
-          await seedCandles(key, spec, tf)
+          await seedCandles(spec, tf)
         }
         const raw = await ex.watchOHLCV(spec.symbol, tf)
         if (Array.isArray(raw) && raw.length > 0) {
-          mergeOhlcv(key, raw)
+          mergeOhlcv(spec.exchange, spec.symbol, tf, raw)
           markAlive(spec.exchange)
           emit({ exchange: spec.exchange, symbol: spec.symbol, kind: 'ohlcv', timeframe: tf })
         }
@@ -255,12 +272,36 @@ async function runLoop(entry: ActiveSub, key: string): Promise<void> {
 /* ------------------------------------------------------------------ */
 
 /**
+ * 多来源订阅注册表：`来源名 → 该来源当前需要的订阅`。
+ *
+ * 原实现是「声明式全量覆盖」（谁调用 `syncSubscriptions` 谁就把别人的订阅全顶掉），
+ * 而 `alerts/monitor.ts` 每一轮轮询都会用它自己那份覆盖一次 —— 图表侧若直接调用，
+ * 下一个 monitor tick 就会把图表的订阅取消掉。改为各来源各占一路，由这里取并集
+ * 后再走下面的增量 diff。
+ */
+const subscriptionSources = new Map<string, readonly StreamSubscription[]>()
+
+/** 注册/更新某个来源的订阅集合（空数组 = 该来源退订全部） */
+export function setSubscriptionSource(name: string, subs: readonly StreamSubscription[]): void {
+  if (subs.length === 0) subscriptionSources.delete(name)
+  else subscriptionSources.set(name, subs)
+  applySubscriptions()
+}
+
+/**
  * 把订阅集合同步到 `desired`（增量 diff：新增的开启、不再需要的取消）。
- * 由 monitor 在每次轮询与警报增删改后调用。
+ * 等价于把「警报」这一路来源设为 `desired`，保留给原调用者使用。
  */
 export function syncSubscriptions(desired: readonly StreamSubscription[]): void {
+  setSubscriptionSource('alerts', desired)
+}
+
+/** 按注册表里的并集做增量 diff */
+function applySubscriptions(): void {
   const want = new Map<string, StreamSubscription>()
-  for (const s of desired) want.set(subKey(s), s)
+  for (const list of subscriptionSources.values()) {
+    for (const s of list) want.set(subKey(s), s)
+  }
 
   for (const [key, entry] of subs) {
     if (!want.has(key)) entry.cancelled = true

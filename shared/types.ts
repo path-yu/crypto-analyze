@@ -53,6 +53,33 @@ export const TIMEFRAME_MS: Record<Timeframe, number> = {
   '1w': 604_800_000,
 }
 
+/**
+ * 指标预热的 K 线根数常量。
+ *
+ * 「取 K 线」接口与「回测」接口必须用**完全相同的抓取窗口**，否则两级缓存的键
+ * （`数据源_品种_周期_起_止`）对不上，点回测时会再向交易所拉一遍数据。
+ * 原实现按策略参数（sensitivity / orderBlock.maxAge 等）动态计算预热根数，
+ * 取 K 线接口无从得知，因此改为固定常量 —— 取该上限，多出来的 bar 全部落在
+ * 回测区间起点之前，只用于指标暖机，不参与撮合。
+ */
+export const KLINES_WARMUP_BARS = 1000
+
+/** 图表数据集：一次拉取的「用户区间」历史 K 线 + 窗口元信息（不含预热部分） */
+export interface ChartDataset {
+  exchange: ExchangeId
+  symbol: string
+  timeframe: Timeframe
+  /** 用户可见区间的起点（毫秒） */
+  since: number
+  /** 用户可见区间的终点（毫秒），已冻结到 bar 边界 */
+  until: number
+  candles: Candle[]
+  /** 本次是否命中缓存 */
+  cached: boolean
+  /** 服务端取数时刻 */
+  fetchedAt: number
+}
+
 /* ------------------------------------------------------------------ */
 /* 策略参数                                                             */
 /* ------------------------------------------------------------------ */
@@ -626,6 +653,11 @@ export interface Instrument {
   /** 合约面值（OKX/Bybit 等有） */
   contractSize?: number
   linear?: boolean
+  /**
+   * 最近 24 小时涨跌幅（百分比，交易所 ticker 口径：`5.2` = +5.2%）。
+   * 属于「行情」而非「合约元数据」，单独取且单独缓存；取不到时缺省。
+   */
+  change24h?: number
 }
 
 /* ------------------------------------------------------------------ */

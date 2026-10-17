@@ -4,7 +4,6 @@
 
 import type {
   BacktestResult,
-  Candle,
   ExchangeId,
   PineCompileMeta,
   PineDiagnostic,
@@ -12,7 +11,12 @@ import type {
   Timeframe,
   Trade,
 } from '../../../shared/types'
-import { DEFAULT_STRATEGY_PARAMS, TIMEFRAME_MS, TIMEFRAMES } from '../../../shared/types'
+import {
+  DEFAULT_STRATEGY_PARAMS,
+  KLINES_WARMUP_BARS,
+  TIMEFRAME_MS,
+  TIMEFRAMES,
+} from '../../../shared/types'
 import { computeFibTrendSeries, type FibTrendSeries } from '../indicators/fibTrendReversal'
 import { computeSupertrendSeries, type SupertrendSeries } from '../indicators/supertrend'
 import {
@@ -165,6 +169,45 @@ export function normalizeParams(input?: Partial<StrategyParams>): StrategyParams
   return p
 }
 
+export interface ResolvedWindow {
+  /** 用户可见区间起点 */
+  since: number
+  /** 用户可见区间终点 */
+  until: number
+  /** 用户区间内的目标根数 */
+  requestedBars: number
+  /** 含预热后的抓取起点（交给 fetchKlines 的 since） */
+  fetchSince: number
+  /** 含预热后的抓取根数（交给 fetchKlines 的 targetBars） */
+  targetBars: number
+}
+
+/**
+ * 窗口唯一真源：`/api/klines` 与回测**共用**同一份换算。
+ *
+ * 两者的 `fetchSince / targetBars` 必须逐位一致，两级缓存的键（已按周期向下取整到
+ * bar 边界）才会命中同一份数据 —— 这是「点回测不再拉 K 线」成立的前提。
+ */
+export function resolveWindow(input: {
+  timeframe: Timeframe
+  since?: number
+  until?: number
+  bars?: number
+}): ResolvedWindow {
+  const until = input.until && input.until > 0 ? input.until : Date.now()
+  const tfMs = TIMEFRAME_MS[input.timeframe]
+  const targetBars = Math.round(clamp(input.bars ?? DEFAULT_BARS, 300, MAX_BARS, DEFAULT_BARS))
+  const since = input.since && input.since > 0 ? input.since : until - targetBars * tfMs
+  const requestedBars = Math.floor((until - since) / tfMs)
+  return {
+    since,
+    until,
+    requestedBars,
+    fetchSince: since - KLINES_WARMUP_BARS * tfMs,
+    targetBars: requestedBars + KLINES_WARMUP_BARS,
+  }
+}
+
 export async function runBacktestService(req: BacktestRequest): Promise<BacktestResult> {
   const exchange: ExchangeId = req.exchange ?? 'binanceusdm'
   const symbol = (req.symbol ?? 'BTC/USDT:USDT').trim()
@@ -191,33 +234,22 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
         }
       : rawParams
 
-  const until = req.until && req.until > 0 ? req.until : Date.now()
-  const targetBars = Math.round(clamp(req.bars ?? DEFAULT_BARS, 300, MAX_BARS, DEFAULT_BARS))
+  // 窗口换算唯一真源（常量预热），与 /api/klines 完全一致 —— 缓存键才会命中同一份数据
   const tfMs = TIMEFRAME_MS[timeframe]
-  const since = req.since && req.since > 0 ? req.since : until - targetBars * tfMs
+  const { since, until, requestedBars, fetchSince, targetBars } = resolveWindow({
+    timeframe,
+    since: req.since,
+    until: req.until,
+    bars: req.bars,
+  })
 
   if (since >= until) throw new ValidationError('起始时间必须早于结束时间')
 
-  const requestedBars = Math.floor((until - since) / tfMs)
   if (requestedBars > MAX_BARS) {
     throw new ValidationError(
       `请求的 K 线数量约 ${requestedBars} 根，超过上限 ${MAX_BARS} 根，请缩短时间范围或使用更大周期`,
     )
   }
-
-  // 指标预热：TSOT 需要 144 根，Fibonacci 通道需要 sensitivity*10 根；SuperTrend 只需 atrPeriod；
-  // 订单块需要覆盖「区域最长存活 maxAge」，否则进入回测区间时存活区域会与 TradingView 不一致
-  const fibWarmup = Math.max(200, Math.trunc(params.sensitivity * 10) + 20, 144 + 20)
-  const stWarmup = Math.max(200, params.supertrend.atrPeriod + 20)
-  const obWarmup = Math.max(
-    200,
-    params.orderBlock.maxAge + 50,
-    params.orderBlock.atrLen + 20,
-    params.orderBlock.volLen + 20,
-    params.orderBlock.emaLen + 20,
-  )
-  const warmupBars = Math.min(1000, Math.max(fibWarmup, stWarmup, obWarmup))
-  const fetchSince = since - warmupBars * tfMs
 
   const { candles: allCandles, cached, exchange: usedExchange, fallbackFrom, clampNote } = await fetchKlines({
     exchange,
@@ -225,7 +257,7 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
     timeframe,
     since: fetchSince,
     until,
-    targetBars: requestedBars + warmupBars,
+    targetBars,
     useCache: req.useCache,
   })
 
@@ -413,35 +445,6 @@ export async function runBacktestService(req: BacktestRequest): Promise<Backtest
     },
     pine: pineArtifact,
   }
-}
-
-/** 仅取指标序列，用于「只看图不看回测」的轻量场景 */
-export async function previewSeries(
-  exchange: ExchangeId,
-  symbol: string,
-  timeframe: Timeframe,
-  bars: number,
-  params: Partial<StrategyParams>,
-): Promise<{ candles: Candle[]; series: FibTrendSeries; exchange: ExchangeId }> {
-  const p = normalizeParams(params)
-  const until = Date.now()
-  const tfMs = TIMEFRAME_MS[timeframe]
-  const since = until - bars * tfMs
-  const { candles, exchange: used } = await fetchKlines({
-    exchange,
-    symbol,
-    timeframe,
-    since,
-    until,
-    targetBars: bars,
-  })
-  const series = computeFibTrendSeries(candles, {
-    sensitivity: p.sensitivity,
-    atrLength: p.atrLength,
-    atrSmoothing: p.atrSmoothing,
-    atrMultiplier: p.atrMultiplier,
-  })
-  return { candles, series, exchange: used }
 }
 
 export { MarketError }

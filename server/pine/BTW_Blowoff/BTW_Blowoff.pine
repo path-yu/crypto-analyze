@@ -1,0 +1,145 @@
+//@version=6
+// ============================================================================
+// BTW_Blowoff —— 「极端超买后反转」做空 · v6
+//
+// 【标的】BTW/USDT:USDT（Binance USDT 本位永续）· 1h
+//   合约仅 2026-06-04 上市 → 可用样本 3241 根（≈135 天），**不足一年**。
+//
+// 【多维度复盘结论（原始数据见配套 markdown）】
+//   · 135 天 +13,814%（0.01717 → 2.3885），最低→最高 166 倍；逐月 +207% / +93% / +300% / +227% / +80%
+//     —— 这是一条**抛物线型新上市小币**，做空的本质是逆着强力趋势。
+//   · ATR24/收盘 中位 4.80%、90 分位 9.10%；单根收益 1% 分位 -12.4%、99% 分位 +12.6%；
+//     最极端单根 **+54.4%** / **-31.9%**；收盘高于 EMA20 的 95 分位 = **+13.6%**（常态远离均线）。
+//   · 1h 动量持续性：同向率 47.7%~50.2%，但 24 根尺度 E[sign·r] = **+0.837%**（正动量）
+//     → 与 Q 的强均值回归不同，**BTW 是趋势延续型**，追空被反复打脸。
+//   · 做空信号实测（下一根开盘入、持仓 k 根收盘平、扣 0.11%）：
+//       追空类（全部负期望）：
+//         24h 跌 ≤ -15%          269 笔  k=12 均 -5.62% / k=24 -8.15%
+//         单根阴线 ≤ -10%         52 笔  k=12 均 -4.19%
+//         跌破 EMA20（首破）     246 笔  k=12 均 -1.82% / k=24 -3.91%
+//         EMA 空头排列 + 阴线     19 笔  k=12 均 -3.36%
+//       追高反转类（正期望，且越极端越强）：
+//         RSI14 ≥ 85              25 笔  k=12 均 **+21.02%**（胜 88%）/ k=24 +19.80%（胜 100%），平均最大浮亏 16.9%
+//         RSI14 ≥ 90               6 笔  k=12 均 **+31.89%**（胜 100%）
+//         24h 涨 ≥ 100%           12 笔  k=24 均 +34.38%（胜 92%）
+//         24h 涨 ≥ 50% & RSI ≥ 80 26 笔  k=12 均 +21.26%（胜 85%）
+//         24h 涨 ≥ 50%            69 笔  k=12 均 +3.14%（胜 65%）
+//       明确无效甚至反向（已排除）：创 24h 新高但收阴（80 笔 k=12 均 -5.92%）、
+//         收盘 > EMA20×1.3（30 笔 −1.51%）、单根阳线 ≥ +15%（27 笔 −2.34%）。
+//     → **BTW 的有效过滤器是「RSI 极端」，不是「涨幅」或「偏离均线」**（后者在它涨得最猛阶段是亏的）。
+//   · 出场（障碍分析）：固定止损/固定止盈组合普遍疲弱（SL15% 的止损率高达 76%）；
+//     只有**吊灯式移动止损**给出正期望，且要用「较晚激活 + 较宽跟随」（因为它跌得又急又深）。
+//   · 引擎实测（名义 100 / 本金 1000、杠杆 1x、2026-06-04 ~ 2026-10-17 全区间）：
+//       默认参数（RSI≥85 / 吊灯激活15%跟随12% / 上限20% / 时间168根）
+//         → **9 笔 · 净利 +8.30% · 最大回撤 -4.39% · 胜 78% · 盈利因子 3.06 · 期望 +9.23 USDT/笔**
+//       更宽的吊灯 20%/15% → +9.48%（回撤 -6.80%、胜率 67%）
+//       门槛敏感性：RSI ≥ 83 → +8.02%(17笔) · 84 → +6.30% · **85 → +8.30%** · 86 → +5.33% · 88 → +2.62%
+//         （8 档全为正，是平台不是孤峰）；但**放宽到 82 → -9.19%（19 笔）**，即门槛不能再降
+//       上限 15/20/25% → +7.39 / +8.30 / +6.62%；吊灯 10/10、15/12、20/12、20/15 → +6.22 ~ +9.48%（全为正）
+//       分段：06-04~08-10 两笔 +5.81%；08-10~10-17 七笔 +2.49% —— 两段都为正
+//       杠杆 1x/2x/3x 结果完全相同（脚本 qty 口径下杠杆只影响保证金；本样本未触发强平）
+//       名义缩放近似线性：50/100/200/300 → +4.15% / +8.30% / +16.61% / +24.91%
+//
+// 【盲区（务必读）】
+//   · 合约 2026-06-04 才上市，样本只有 **135 天 / 9 笔**，统计置信度很低。
+//   · 9 笔里 2 笔亏损各 -20.12%，**都发生在 2026-08-19 的垂直拉升中**（连续两次逆势进空被打止损）
+//     —— 逆势做空的代价集中在"加速段"，这正是必须用小名义 + 低杠杆的原因。
+//   · 该币单根最大 +54.4%；3x 杠杆下约 33% 的逆行即可强平，**建议杠杆 ≤1x、名义 ≤10% 权益**。
+//   · 收益依赖少数大赢单（盈亏比 0.88 但盈利因子 3.06：赢的次数多且有两笔 +25%/+33% 的大赢）。
+//
+// 【入场（做空，引擎在下一根开盘成交）】
+//   ① RSI(rsiLen) ≥ rsiMin（默认 14 / 85）
+//   ② 可选：窗口涨幅 ≥ pumpMin%（默认 0=关）
+//   ③ 可选确认：要求「滞涨」（收盘 < 前收，默认关）或「已破位」（收盘 < EMA20，默认关）
+//      —— 垂直拉升时 RSI 会连续多根极高，等确认能显著降低"接飞刀"的概率
+//
+// 【离场】
+//   · 吊灯移动止损：止损 = min(入场价 ×(1+slPct%), 入场后最低价 ×(1+trailPct%))，只下移；
+//     浮盈达 trailArm% 后才激活（默认 15%，可设 0=立即）
+//   · 通过 plot(title="STOP") 透传给引擎做**盘中止损**，插针/瀑布按止损价成交
+//   · 时间止损：持仓 maxBars 根（默认 168）后**仍浮亏** → 平仓（浮盈时不打断）
+//   · 可选分批止盈（默认关）
+//
+// 【仓位与杠杆（重要）】
+//   qty = notional / 收盘价。默认名义 100（本金 1000 的 10%）。
+//   **建议杠杆 ≤1x**：该币单根最大 +54%，3x 杠杆下约 33% 的逆行就可能触发强平。
+// ============================================================================
+strategy("BTW_Blowoff", overlay=true, max_bars_back=500, initial_capital=1000,
+  default_qty_type=strategy.fixed, default_qty_value=1,
+  commission_type=strategy.commission.percent, commission_value=0.055)
+
+// ---------------- 入场参数 ----------------
+notional   = input.float(100.0, "单笔名义价值 USDT")
+rsiLen     = input.int(14,      "RSI 长度")
+rsiMin     = input.float(85.0,  "RSI ≥")
+pumpWin    = input.int(24,      "涨幅观察窗口（根）")
+pumpMin    = input.float(0.0,   "窗口涨幅 ≥ %（0=关）")
+needStall  = input.bool(false,  "要求滞涨确认（收盘 < 前收）")
+needBreak  = input.bool(false,  "要求破位确认（收盘 < EMA20）")
+emaLen     = input.int(20,      "确认用均线长度")
+
+// ---------------- 离场参数 ----------------
+slPct      = input.float(20.0,  "吊灯止损上限 %（入场价）")
+tp1Pct     = input.float(0.0,   "分批止盈 %（0=关）")
+trailArm   = input.float(15.0,  "吊灯激活所需浮盈 %（0=立即）")
+trailPct   = input.float(12.0,  "吊灯移动止损 %")
+maxBars    = input.int(168,     "时间止损 K线数")
+
+// ---------------- 指标 / 信号 ----------------
+rsi    = ta.rsi(close, rsiLen)
+emaRef = ta.ema(close, emaLen)
+pump   = close / close[pumpWin] - 1
+
+cond1 = rsi >= rsiMin
+cond2 = pumpMin < 0.5 or pump >= pumpMin / 100
+cond3 = (needStall == false or close < close[1]) and (needBreak == false or close < emaRef)
+
+plot(emaRef, color=color.orange)
+
+entryCond = cond1 and cond2 and cond3
+
+// ---------------- 持仓状态（必须用 var）----------------
+var float stopPx  = 0.0
+var float entryPx = 0.0
+var float loSince = 0.0
+var bool  tp1Done = false
+var float heldN   = 0.0
+
+if (strategy.position_size == 0)
+    stopPx := 0.0
+    entryPx := 0.0
+    loSince := 0.0
+    tp1Done := false
+    heldN := 0.0
+else if (strategy.position_size < 0)
+    if (stopPx == 0)
+        // 新成交那一根：按成交均价初始化「止损上限」，之后由吊灯只下移地收紧
+        entryPx := strategy.position_avg_price
+        stopPx := entryPx * (1 + slPct / 100)
+        loSince := low
+        tp1Done := false
+        heldN := 0.0
+    else
+        // 1) 先用「上一根收盘时已确定」的止损 / 止盈判定离场
+        if (high >= stopPx)
+            strategy.close("S", comment="STOP " + str.tostring(close))
+            stopPx := 0.0
+        if (stopPx > 0 and tp1Pct > 0 and tp1Done == false and low <= entryPx * (1 - tp1Pct / 100))
+            strategy.close("S", qty_percent=50, comment="TP1 " + str.tostring(close))
+            tp1Done := true
+        if (stopPx > 0 and heldN >= maxBars and close >= entryPx)
+            strategy.close("S", comment="TIME " + str.tostring(close))
+            stopPx := 0.0
+
+    // 2) 再用本根收盘信息更新止损，供下一根使用
+    loSince := math.min(loSince, low)
+    if (trailArm <= 0 or loSince <= entryPx * (1 - trailArm / 100))
+        stopPx := math.min(stopPx, loSince * (1 + trailPct / 100))
+    heldN := heldN + 1
+
+// 开仓（引擎在下一根开盘成交）
+if (strategy.position_size == 0 and entryCond)
+    strategy.entry("S", strategy.short, qty=notional / close, comment="BLOWOFF " + str.tostring(close))
+
+// 止损位输出：title 必须叫 STOP —— 适配器按这个名字把它接成引擎的盘中止损。
+plot(stopPx > 0 ? stopPx : na, title="STOP", color=color.red)

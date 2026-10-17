@@ -30,6 +30,13 @@ export default defineConfig({
         timeout: 300_000,
         proxyTimeout: 300_000,
       },
+      // 实时 K 线推送（浏览器 ↔ 服务端 WebSocket）。dev 下页面在 5273、服务端在 8787，
+      // 不加这条代理浏览器会连到 5273 自己身上（接口订阅形同虚设）。
+      '/ws': {
+        target: API_TARGET,
+        ws: true,
+        changeOrigin: true,
+      },
     },
   },
   build: {

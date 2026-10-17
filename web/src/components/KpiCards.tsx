@@ -48,7 +48,48 @@ function Kpi({ label, value, sub, tooltip, tone = 'neutral' }: KpiProps) {
   )
 }
 
-export default function KpiCards({ report }: { report: PerformanceReport }) {
+/**
+ * 空态下展示的卡片标题（顺序与下面的实值卡片一致）。
+ * 没有回测结果时统计区照常占位显示 `—`，避免切品种/周期时整块统计区消失、布局跳动。
+ */
+const KPI_LABELS = [
+  '总收益率',
+  '净利润',
+  '年化收益率',
+  '最大回撤',
+  '夏普比率',
+  '卡玛比率 / SQN',
+  '胜率',
+  '盈亏比 / 盈利因子',
+  '期望值 / 笔',
+  '最长连亏',
+  '多 / 空 胜率',
+  '平均持仓',
+]
+
+const GRID_SX = {
+  display: 'grid',
+  gap: 1.25,
+  gridTemplateColumns: {
+    xs: 'repeat(2, minmax(0,1fr))',
+    sm: 'repeat(3, minmax(0,1fr))',
+    md: 'repeat(4, minmax(0,1fr))',
+    lg: 'repeat(6, minmax(0,1fr))',
+  },
+} as const
+
+export default function KpiCards({ report }: { report: PerformanceReport | null }) {
+  // 未回测：只渲染占位（各卡显示 —），保持布局稳定
+  if (!report) {
+    return (
+      <Box sx={GRID_SX}>
+        {KPI_LABELS.map((label) => (
+          <Kpi key={label} label={label} value="—" />
+        ))}
+      </Box>
+    )
+  }
+
   const s = report.stats
   const tone = (v: number): 'up' | 'down' | 'neutral' => (v > 0 ? 'up' : v < 0 ? 'down' : 'neutral')
 
@@ -132,18 +173,7 @@ export default function KpiCards({ report }: { report: PerformanceReport }) {
   ]
 
   return (
-    <Box
-      sx={{
-        display: 'grid',
-        gap: 1.25,
-        gridTemplateColumns: {
-          xs: 'repeat(2, minmax(0,1fr))',
-          sm: 'repeat(3, minmax(0,1fr))',
-          md: 'repeat(4, minmax(0,1fr))',
-          lg: 'repeat(6, minmax(0,1fr))',
-        },
-      }}
-    >
+    <Box sx={GRID_SX}>
       {cards.map((c) => (
         <Kpi key={c.label} {...c} />
       ))}

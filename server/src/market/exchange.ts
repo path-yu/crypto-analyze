@@ -45,6 +45,13 @@ const DEFAULT_TIMEOUT = 10_000
 const MAX_PAGES = 400
 
 /**
+ * 分页并发度：页起点可由「首页实际根数」推出，因此除首页外可以并发拉取。
+ * 取 5 是为了在「冷启动延迟」与「交易所限频」之间折中（binance 期货单页 1500 根，
+ * 1 年 1h 约 7 页 → 并发后 2 轮即可拉完，而不是 7 轮串行 RTT）。
+ */
+const PARALLEL_PAGES = 5
+
+/**
  * 各交易所允许回溯的最大 K 线根数。
  *
  * 交易所普遍限制「只能取最近 N 根」：
@@ -404,6 +411,51 @@ function filterInstruments(list: Instrument[], query?: string): Instrument[] {
 }
 
 /* ------------------------------------------------------------------ */
+/* 24h 涨跌幅                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 24h 涨跌幅缓存周期。
+ *
+ * `fetchTickers()` 一次就能拿到全市场（币安永续约 700 个合约）的 24h 涨跌幅，
+ * 但它是**行情**、秒级就变；而合约列表本身几乎不变。两者的缓存周期必须分开：
+ * 这里给 60s —— 下拉列表每次打开都能拿到较新的数，又不会每次请求都去交易所
+ * 打一发全量 ticker。
+ */
+const TICKER_TTL_MS = 60 * 1000
+const changes24hCache = new Map<ExchangeId, { expires: number; data: Map<string, number> }>()
+
+/**
+ * 全市场 24 小时涨跌幅：symbol → 百分比（`5.2` 表示 +5.2%）。
+ *
+ * 交易所不支持 / 网络失败时返回**空表且不抛错** —— 调用方拿不到就保持原样，
+ * 不能让「涨跌幅取不到」把整个合约列表接口带崩。
+ */
+export async function fetch24hChanges(exchange: ExchangeId): Promise<Map<string, number>> {
+  const cached = changes24hCache.get(exchange)
+  if (cached && cached.expires > Date.now()) return cached.data
+
+  const out = new Map<string, number>()
+  try {
+    const ex = await getInstance(exchange)
+    if (ex.has?.fetchTickers !== false) {
+      const tickers = await ex.fetchTickers()
+      for (const symbol of Object.keys(tickers ?? {})) {
+        const pct = tickers[symbol]?.percentage
+        if (typeof pct === 'number' && Number.isFinite(pct)) out.set(symbol, pct)
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `[tickers] ${exchange} 24h 涨跌幅获取失败：`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+  changes24hCache.set(exchange, { expires: Date.now() + TICKER_TTL_MS, data: out })
+  return out
+}
+
+/* ------------------------------------------------------------------ */
 /* K 线拉取                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -611,7 +663,47 @@ function isTooOldError(message: string): boolean {
   return TOO_OLD_PATTERNS.some((re) => re.test(message))
 }
 
+/**
+ * 同窗口并发拉取的单飞表：键 = `数据源|品种|周期|起|止`。
+ *
+ * 「取 K 线」与「回测」是两个独立接口，浏览器在勾选「同步进行回测」时会同时发出，
+ * 或者在多个客户端里同时打开同一品种 —— 没有这层去重就会向上游重复分页，
+ * 把冷启动耗时成倍放大。命中时直接复用进行中的那次拉取。
+ */
+const pageInflight = new Map<string, Promise<Candle[]>>()
+
+/**
+ * 从交易所分页拉取一段 K 线（含单飞去重 + 有界并发）。
+ *
+ * 原实现是「逐页串行」：每页都要等上一页 RTT 回来才发下一页。1 年 1h ≈ 9760 根
+ * ÷ 1500 ≈ 7 页，冷启动因此要 4s 上下。页起点其实是可计算的
+ * （`since + k * 每页根数 * 周期`），所以先探测首页确定「交易所实际的单页根数」，
+ * 再对剩余页有界并发、按页序拼接。
+ *
+ * 首页探测还承担另一职责：品种不存在 / 区间回溯过久这类错误在这里**先**暴露，
+ * 交给上层收缩区间后重试，而不是撒进并发里混成一堆失败。
+ */
 async function fetchFromExchange(
+  exId: ExchangeId,
+  symbol: string,
+  timeframe: Timeframe,
+  since: number,
+  until: number,
+): Promise<Candle[]> {
+  const inflightKey = `${exId}|${symbol}|${timeframe}|${since}|${until}`
+  const running = pageInflight.get(inflightKey)
+  if (running) return running
+  const task = loadExchangePages(exId, symbol, timeframe, since, until)
+  pageInflight.set(inflightKey, task)
+  try {
+    return await task
+  } finally {
+    pageInflight.delete(inflightKey)
+  }
+}
+
+/** `fetchFromExchange` 的实际分页逻辑（不要在此处再加单飞） */
+async function loadExchangePages(
   exId: ExchangeId,
   symbol: string,
   timeframe: Timeframe,
@@ -631,16 +723,17 @@ async function fetchFromExchange(
 
   const limit = MAX_LIMIT[exId]
   const tfMs = TIMEFRAME_MS[timeframe]
-  const all: Candle[] = []
-  let cursor = since
-  let pages = 0
 
-  while (cursor <= until && pages < MAX_PAGES) {
-    pages++
+  /** 原始单页请求（保留交易所的条数，供「游标推进」判断用） */
+  const rawPage = async (cursor: number): Promise<number[][]> => {
     const batch = (await ex.fetchOHLCV(symbol, timeframe, cursor, limit)) as number[][]
-    if (!batch || batch.length === 0) break
+    return Array.isArray(batch) ? batch : []
+  }
 
-    for (const row of batch) {
+  /** 规整为 Candle[]：丢掉区间外的行与非法值 */
+  const normalize = (rows: number[][]): Candle[] => {
+    const out: Candle[] = []
+    for (const row of rows) {
       const ts = row[0]
       if (ts == null || ts > until) continue
       const c: Candle = {
@@ -660,30 +753,101 @@ async function fetchFromExchange(
       ) {
         continue
       }
-      all.push(c)
+      out.push(c)
     }
-
-    // 注意：不能用「返回条数 < limit」来判断结束。
-    // 多数交易所会自行收敛单次条数（例如 Gate 期货实际上限为 999，而声明值更大），
-    // 用条数判断会导致分页在第一页就提前终止、只取到很短的区间。
-    // 正确的终止条件：已覆盖到 until，或时间游标不再前进。
-    const lastTs = batch[batch.length - 1][0]
-    if (lastTs >= until) break
-    const next = lastTs + tfMs
-    if (next <= cursor) break
-    cursor = next
+    return out
   }
 
-  // 去重 + 升序
-  const seen = new Set<number>()
-  const dedup: Candle[] = []
-  for (const c of all) {
-    if (seen.has(c.timestamp)) continue
-    seen.add(c.timestamp)
-    dedup.push(c)
+  const dedupSorted = (list: Candle[]): Candle[] => {
+    const seen = new Set<number>()
+    const dedup: Candle[] = []
+    for (const c of list) {
+      if (seen.has(c.timestamp)) continue
+      seen.add(c.timestamp)
+      dedup.push(c)
+    }
+    dedup.sort((a, b) => a.timestamp - b.timestamp)
+    return dedup
   }
-  dedup.sort((a, b) => a.timestamp - b.timestamp)
-  return dedup
+
+  /**
+   * 串行逐页（原实现，作为并发分页出现空洞时的兜底）。
+   *
+   * 注意：不能用「返回条数 < limit」判断结束 —— 多数交易所会自行收敛单次条数
+   * （例如 Gate 期货实际上限 999，而声明值更大），用条数判断会让分页在第一页就
+   * 提前终止。终止条件只能是「已覆盖到 until」或「游标不再前进」。
+   */
+  const sequential = async (): Promise<Candle[]> => {
+    const all: Candle[] = []
+    let cursor = since
+    let pages = 0
+    while (cursor <= until && pages < MAX_PAGES) {
+      pages++
+      const rows = await rawPage(cursor)
+      if (rows.length === 0) break
+      all.push(...normalize(rows))
+      const lastTs = rows[rows.length - 1][0]
+      if (lastTs >= until) break
+      const next = lastTs + tfMs
+      if (next <= cursor) break
+      cursor = next
+    }
+    return dedupSorted(all)
+  }
+
+  // 首页探测：品种不存在 / 回溯过久等错误在这一步暴露
+  const firstRows = await rawPage(since)
+  if (firstRows.length === 0) return []
+
+  /**
+   * 单页实际根数：用**首页实际条数**做步长，而不是声明的 limit。
+   * 交易所收敛单页条数时（Gate 1000→999），按声明值跳页会在页间留下空洞。
+   */
+  const step = Math.min(limit, firstRows.length)
+  const pageStarts: number[] = []
+  for (let k = 1; k < MAX_PAGES; k++) {
+    const cursor = since + k * step * tfMs
+    if (cursor > until) break
+    pageStarts.push(cursor)
+  }
+
+  const all: Candle[] = [...normalize(firstRows)]
+  if (pageStarts.length > 0) {
+    const results: (Candle[] | null)[] = new Array(pageStarts.length).fill(null)
+    let next = 0
+    await Promise.all(
+      Array.from({ length: Math.min(PARALLEL_PAGES, pageStarts.length) }, async () => {
+        for (;;) {
+          const i = next++
+          if (i >= pageStarts.length) return
+          try {
+            results[i] = normalize(await rawPage(pageStarts[i]))
+          } catch {
+            // 先标记失败，交给下面串行重试（多为限频，不该直接当「空洞」处理）
+            results[i] = null
+          }
+        }
+      }),
+    )
+    for (let i = 0; i < results.length; i++) {
+      if (results[i] !== null) continue
+      await new Promise((r) => setTimeout(r, 300))
+      try {
+        results[i] = normalize(await rawPage(pageStarts[i]))
+      } catch {
+        results[i] = []
+      }
+    }
+    for (const rows of results) all.push(...(rows ?? []))
+  }
+
+  const merged = dedupSorted(all)
+  // 并行分页若出现空洞（某页空/被限频），相邻时间戳不再等距 → 回落串行补齐。
+  // 代价是慢一点，但结果与原来的串行实现一致。
+  for (let i = 1; i < merged.length; i++) {
+    if (merged[i].timestamp - merged[i - 1].timestamp !== tfMs) return sequential()
+  }
+  return merged
 }
 
 export interface LastPriceResult {

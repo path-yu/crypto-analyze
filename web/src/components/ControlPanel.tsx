@@ -26,14 +26,33 @@ import ClearIcon from '@mui/icons-material/Clear'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import PlayArrowIcon from '@mui/icons-material/PlayArrow'
 import RestartAltIcon from '@mui/icons-material/RestartAlt'
+import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward'
+import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward'
+import SwapVertIcon from '@mui/icons-material/SwapVert'
 import CircularProgress from '@mui/material/CircularProgress'
 
 import type { ExchangeId, Instrument, StrategyParams, Timeframe } from '@shared/types'
 import { DEFAULT_STRATEGY_PARAMS, EXCHANGES, TIMEFRAMES } from '@shared/types'
 import { fetchInstruments } from '../api'
+import { DOWN_COLOR, UP_COLOR } from '../theme'
 import PineEditor, { type PinePanelState } from './PineEditor'
 
 export type RangeKey = '1m' | '3m' | '6m' | '1y' | '2y' | '3y' | 'custom'
+
+/**
+ * 合约下拉的 24h 涨跌幅排序档位。
+ *
+ * 用「点一下循环一档」的单按钮表达三态，而不是一个开关 + 一个方向按钮：
+ * `off` 保留交易所默认顺序（主流币优先 + 字母序），`desc` / `asc` 才按
+ * 24h 涨跌幅排序 —— 这样既能切到升序，也不会把原本的默认顺序弄丢。
+ */
+type ChangeSort = 'off' | 'desc' | 'asc'
+
+const CHANGE_SORT_STEPS: Record<ChangeSort, { hint: string; Icon: typeof SwapVertIcon }> = {
+  off: { hint: '按 24 小时涨跌幅排序：未排序（点击切降序）', Icon: SwapVertIcon },
+  desc: { hint: '按 24 小时涨跌幅排序：降序（点击切升序）', Icon: ArrowDownwardIcon },
+  asc: { hint: '按 24 小时涨跌幅排序：升序（点击恢复默认顺序）', Icon: ArrowUpwardIcon },
+}
 
 const RANGE_OPTIONS: { key: RangeKey; label: string; ms?: number }[] = [
   { key: '1m', label: '最近 1 个月', ms: 30 * 86400_000 },
@@ -110,6 +129,12 @@ interface Props {
   onRun: () => void
   loading: boolean
   estimatedBars: number
+  /**
+   * 「同步进行回测」：勾选后，切交易所 / 品种 / 周期 / 区间时会在拉完 K 线后
+   * 立即重跑一次回测；关闭（默认）则只更新图表、统计区留空态。
+   */
+  syncBacktest: boolean
+  onSyncBacktestChange: (v: boolean) => void
   /** Pine 面板状态（仅在 strategy === 'pine' 时使用） */
   pine: PinePanelState
   /** 收起面板（宽度收敛为一条窄轨），由外层布局控制实际宽度 */
@@ -185,6 +210,8 @@ export default function ControlPanel({
   onRun,
   loading,
   estimatedBars,
+  syncBacktest,
+  onSyncBacktestChange,
   pine,
   onCollapse,
   onTickSizeChange,
@@ -226,6 +253,26 @@ export default function ControlPanel({
     () => instruments.find((i) => i.symbol === symbol) ?? null,
     [instruments, symbol],
   )
+
+  /** 合约下拉的排序档位（默认保留交易所顺序；另两档按 24h 涨跌幅排） */
+  const [changeSort, setChangeSort] = useState<ChangeSort>('off')
+
+  /** 排序后的下拉选项：涨跌幅取不到的排在最后，避免它们混在中间 */
+  const sortedInstruments = useMemo(() => {
+    if (changeSort === 'off') return instruments
+    const dir = changeSort === 'asc' ? 1 : -1
+    return [...instruments].sort((a, b) => {
+      if (a.change24h === undefined && b.change24h === undefined) return 0
+      if (a.change24h === undefined) return 1
+      if (b.change24h === undefined) return -1
+      return (a.change24h - b.change24h) * dir
+    })
+  }, [instruments, changeSort])
+
+  const changeSortStep = CHANGE_SORT_STEPS[changeSort]
+  const SortIcon = changeSortStep.Icon
+  const cycleChangeSort = (): void =>
+    setChangeSort((s) => (s === 'off' ? 'desc' : s === 'desc' ? 'asc' : 'off'))
 
   // 把所选合约的最小变动价位上抛给 App，回测时用于把滑点 tick 换算成价格
   useEffect(() => {
@@ -308,7 +355,7 @@ export default function ControlPanel({
             <Autocomplete
               size="small"
               fullWidth
-              options={instruments}
+              options={sortedInstruments}
               loading={loadingInstruments}
               value={selected}
               getOptionLabel={(o) => (typeof o === 'string' ? o : `${o.label} · ${o.symbol}`)}
@@ -317,6 +364,42 @@ export default function ControlPanel({
                 if (!v) return
                 onSymbolChange(typeof v === 'string' ? v : v.symbol)
               }}
+              /** 每行右侧显示该合约的 24h 涨跌幅（涨红跌绿，取不到时显示 —） */
+              renderOption={({ key, ...liProps }, o) => (
+                <Box
+                  component="li"
+                  key={key}
+                  {...liProps}
+                  sx={{ display: 'flex', alignItems: 'center', gap: 1, minWidth: 0 }}
+                >
+                  <Box sx={{ minWidth: 0, flex: 1 }}>
+                    <Typography variant="body2" noWrap>
+                      {o.label}
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary" noWrap sx={{ display: 'block' }}>
+                      {o.symbol}
+                    </Typography>
+                  </Box>
+                  <Typography
+                    variant="body2"
+                    sx={{
+                      flexShrink: 0,
+                      fontWeight: 600,
+                      fontVariantNumeric: 'tabular-nums',
+                      color:
+                        o.change24h === undefined
+                          ? 'text.disabled'
+                          : o.change24h >= 0
+                            ? UP_COLOR
+                            : DOWN_COLOR,
+                    }}
+                  >
+                    {o.change24h === undefined
+                      ? '—'
+                      : `${o.change24h >= 0 ? '+' : ''}${o.change24h.toFixed(2)}%`}
+                  </Typography>
+                </Box>
+              )}
               renderInput={(p) => (
                 <TextField
                   {...p}
@@ -326,6 +409,36 @@ export default function ControlPanel({
                   error={Boolean(instrumentError)}
                   color={instrumentNote ? 'info' : undefined}
                   focused={instrumentNote ? true : undefined}
+                  slotProps={{
+                    ...p.slotProps,
+                    input: {
+                      ...p.slotProps.input,
+                      endAdornment: (
+                        <>
+                          <InputAdornment position="end">
+                            <Tooltip title={changeSortStep.hint}>
+                              <IconButton
+                                size="small"
+                                edge="end"
+                                aria-label="按 24 小时涨跌幅排序"
+                                // 点排序按钮时不要让事件透回输入框（弹层的开合挂在输入框的
+                                // mousedown 上），否则会顺带把下拉展开/收起
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={(e) => {
+                                  e.preventDefault()
+                                  e.stopPropagation()
+                                  cycleChangeSort()
+                                }}
+                              >
+                                <SortIcon fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          </InputAdornment>
+                          {p.slotProps.input.endAdornment}
+                        </>
+                      ),
+                    },
+                  }}
                 />
               )}
             />
@@ -420,6 +533,29 @@ export default function ControlPanel({
               <Chip size="small" variant="outlined" label={`该合约最大杠杆 ${selected.maxLeverage}x`} />
             )}
           </Stack>
+
+          <FormControlLabel
+            sx={{ mt: 1, display: 'flex', alignItems: 'flex-start' }}
+            control={
+              <Switch
+                size="small"
+                sx={{ mt: -0.25 }}
+                checked={syncBacktest}
+                onChange={(e) => onSyncBacktestChange(e.target.checked)}
+              />
+            }
+            label={
+              <Tooltip
+                title={
+                  '勾选后：切换交易所 / 合约 / 周期 / 区间时，拉完 K 线会立即重跑一次回测（统计区同步更新）。\n' +
+                  '关闭时（默认）：只刷新图表，统计区留空态，需要时再点「开始回测」。\n' +
+                  '注意实时行情下每根新 K 线收盘也会自动重跑一次，短周期 + 长区间会明显变慢。'
+                }
+              >
+                <Typography variant="caption">同步进行回测（切换行情设置时自动回测）</Typography>
+              </Tooltip>
+            }
+          />
         </Box>
 
         <Divider />

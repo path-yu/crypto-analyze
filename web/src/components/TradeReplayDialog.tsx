@@ -180,14 +180,14 @@ export default function TradeReplayDialog({ open, trade, result, onClose }: Prop
         let data =
           timeframe === result.report.timeframe ? result.candles.filter(inWindow) : []
         if (data.length === 0) {
-          data = await fetchKlines({
+          const res = await fetchKlines({
             exchange: result.report.exchange,
             symbol: result.report.symbol,
             timeframe,
             bars: replayWindow.bars,
             until: replayWindow.to,
           })
-          data = data.filter(inWindow)
+          data = res.candles.filter(inWindow)
         }
         if (!cancelled) setCandles(data)
       } catch (err) {

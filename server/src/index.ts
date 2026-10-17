@@ -11,6 +11,7 @@ import express from 'express'
 import cors from 'cors'
 import { apiRouter } from './routes/api'
 import { resolveProxyUrl } from './market/exchange'
+import { attachKlineSocket } from './market/klineSocket'
 import { startAlertMonitor } from './alerts/monitor'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -54,10 +55,11 @@ if (fs.existsSync(webDist)) {
   })
 }
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   const proxy = resolveProxyUrl()
   console.log(`\n  ● 回测服务已启动: http://127.0.0.1:${PORT}`)
   console.log(`  ● 健康检查:      http://127.0.0.1:${PORT}/api/health`)
+  console.log(`  ● K 线实时推送:   ws://127.0.0.1:${PORT}/ws/klines`)
   console.log(
     proxy
       ? `  ● 行情代理:      ${proxy}（ccxt 走代理；Binance 归档直连）`
@@ -67,3 +69,6 @@ app.listen(PORT, () => {
   startAlertMonitor()
   console.log('')
 })
+
+// 浏览器侧实时 K 线尾巴（复用 ccxt.pro 行情流，见 market/klineSocket.ts）
+attachKlineSocket(server)

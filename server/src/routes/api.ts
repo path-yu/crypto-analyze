@@ -7,12 +7,14 @@ import type { ExchangeId, Timeframe } from '../../../shared/types'
 import { EXCHANGES, TIMEFRAMES } from '../../../shared/types'
 import {
   fetchKlines,
+  fetch24hChanges,
   listInstrumentsWithFallback,
   fetchLastPrice,
   MarketError,
 } from '../market/exchange'
 import {
   runBacktestService,
+  resolveWindow,
   ValidationError,
   type BacktestRequest,
 } from '../service/backtestService'
@@ -72,13 +74,22 @@ apiRouter.get('/instruments', async (req: Request, res: Response) => {
       exchange,
       q,
     )
+    /**
+     * 24h 涨跌幅属于「行情」，与合约元数据分开取：一次全市场 ticker（约 700 个合约）
+     * + 60s 缓存。取不到时返回空表，这里就**不带这个字段**，列表照常可用。
+     */
+    const changes = await fetch24hChanges(used)
+    const data = instruments.slice(0, limit).map((i) => {
+      const change24h = changes.get(i.symbol)
+      return change24h === undefined ? i : { ...i, change24h }
+    })
     res.json({
       ok: true,
       exchange: used,
       requested: exchange,
       fallbackFrom,
       total: instruments.length,
-      data: instruments.slice(0, limit),
+      data,
     })
   } catch (err) {
     fail(res, err)
@@ -106,31 +117,48 @@ apiRouter.get('/price', async (req: Request, res: Response) => {
 
 /**
  * 纯 K 线接口（不带回测），用于快速预览图表。
- * GET /api/klines?exchange=binanceusdm&symbol=BTC/USDT:USDT&timeframe=1h&bars=1000
+ *
+ * GET /api/klines?exchange=binanceusdm&symbol=BTC/USDT:USDT&timeframe=1h&since=<ms|可选>&until=<ms|可选>&bars=<可选>
+ *
+ * 与回测共用 `resolveWindow` 换算窗口（含固定预热根数），因此**同一个 since/until
+ * 组合会命中与回测完全相同的那份缓存** —— 先取 K 线再点回测不会再向交易所拉数据。
+ * 响应只返回用户区间（不含预热），并回显窗口元信息。
  */
 apiRouter.get('/klines', async (req: Request, res: Response) => {
   try {
     const exchange = asExchange(req.query.exchange)
     const symbol = String(req.query.symbol ?? 'BTC/USDT:USDT')
     const timeframe = asTimeframe(req.query.timeframe)
-    const bars = Math.max(100, Math.min(20000, toNumber(req.query.bars) ?? 1000))
-    const until = toNumber(req.query.until) ?? Date.now()
+    const window = resolveWindow({
+      timeframe,
+      since: toNumber(req.query.since),
+      until: toNumber(req.query.until),
+      bars: toNumber(req.query.bars),
+    })
 
     const result = await fetchKlines({
       exchange,
       symbol,
       timeframe,
-      until,
-      targetBars: bars,
+      since: window.fetchSince,
+      until: window.until,
+      targetBars: window.targetBars,
       useCache: req.query.cache !== 'false',
     })
+    // 去掉预热部分：图表只需要用户区间
+    const candles = result.candles.filter(
+      (c) => c.timestamp >= window.since && c.timestamp <= window.until,
+    )
     res.json({
       ok: true,
       exchange: result.exchange,
       symbol,
       timeframe,
       cached: result.cached,
-      data: result.candles,
+      since: window.since,
+      until: window.until,
+      bars: candles.length,
+      data: candles,
     })
   } catch (err) {
     fail(res, err)
