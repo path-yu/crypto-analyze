@@ -419,12 +419,28 @@ function translateTree(root: Node): void {
   }
 }
 
+/**
+ * 节点是否位于「可编辑区」内（CodeMirror / 输入框 / contenteditable）。
+ *
+ * 这些地方的文本绝不能翻译：词典里有 `volume` / `price` / `left` 这类 Pine
+ * 标识符（用于脚本属性下拉），而 CodeMirror 会把编辑区的 DOM 变更当成用户
+ * 输入同步回文档（readDOMChange）—— 一翻译就把源码里的 `volume` 写成了
+ * 「成交量」，编译随即报 `Unexpected character '成'`。刷新/重新载入都救不了，
+ * 因为每次重新渲染都会再被改脏。
+ */
+function insideEditable(node: Node): boolean {
+  const el = node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement
+  if (!el) return false
+  return !!el.closest('.cm-editor, input, textarea, select, [contenteditable="true"]')
+}
+
 /** 只改「整串等于词典键（或 Vela 日期格式）」的文本节点；保留首尾空白 */
 function translateTextNode(node: Text): void {
   const raw = node.data
   if (!raw) return
   const trimmed = raw.trim()
   if (!trimmed) return
+  if (insideEditable(node)) return
   const t = zhDate(trimmed) ?? zh(trimmed)
   if (t === null) return
   const lead = raw.slice(0, raw.indexOf(trimmed))

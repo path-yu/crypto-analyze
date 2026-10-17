@@ -215,6 +215,7 @@ export function analyzePine(
   source: string,
   inputs?: Record<string, number | boolean | string>,
 ): PineAnalysis {
+  
   const indicator = new Indicator(source, inputs as Record<string, unknown> | undefined)
   try {
     indicator.prepare()
