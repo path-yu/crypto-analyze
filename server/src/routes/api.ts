@@ -23,8 +23,12 @@ import {
   normalizeScriptName,
   savePineScript,
 } from '../pine/store'
+import { alertsRouter } from './alerts'
 
 export const apiRouter: Router = Router()
+
+/** 价格警报（列表 / 增删改 / 推送设置 / 触发记录），见 routes/alerts.ts */
+apiRouter.use('/alerts', alertsRouter)
 
 function asExchange(v: unknown, fallback: ExchangeId = 'binanceusdm'): ExchangeId {
   const s = String(v ?? '') as ExchangeId

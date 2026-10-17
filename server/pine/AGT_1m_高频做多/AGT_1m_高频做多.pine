@@ -1,0 +1,48 @@
+//@version=6
+// AGT/USDT:USDT · 1m · 「高频做多」版（AGT_1m_高频做多）
+//
+// 【用途】这套不是为了赚钱，是为了**压测价格警报链路**：1 分钟周期 + 刻意放宽的入场条件，
+// 让脚本在 1m 上大量 K 线都留下开仓信号，从而频繁触发警报（用来验证电报机器人 / 网页通知）。
+//
+// 【入场】三条超短周期条件任一成立即开多（都刻意放宽，1m 上很容易满足）：
+//   · 收盘价上穿 EMA(3)
+//   · RSI(2) 从 30 下方回升
+//   · 收阳推进且成交量不低于 5 均量
+// 【离场】跌破 EMA(3) 或持仓满 2 根即平 —— 快速腾出仓位，好让下一个信号继续触发。
+//
+// 【为什么关掉保证金】margin_long/short = 0 可以避免 PineTS 券商模拟器因保证金不足
+// 在成交当根强平、产出 entry_bar_index == exit_bar_index 的微型残单（会把信号算歪）。
+strategy("AGT_1m_高频做多", overlay=true, max_bars_back=500,
+  initial_capital=1000, default_qty_type=strategy.fixed, default_qty_value=1,
+  commission_type=strategy.commission.percent, commission_value=0.05,
+  margin_long=0, margin_short=0, pyramiding=0)
+
+// ---------------- 入场参数 ----------------
+emaLen  = input.int(3,     "EMA 快线周期", minval=1)
+rsiLen  = input.int(2,     "RSI 周期", minval=1)
+rsiBuy  = input.float(30,  "RSI 回升阈值", minval=1, maxval=99)
+volLen  = input.int(5,     "量能均线周期", minval=1)
+volMult = input.float(1.0, "量能 ≥ 均量 ×", minval=0)
+
+// ---------------- 离场参数 ----------------
+maxBars = input.int(2, "最长持仓 K 线数", minval=1)
+
+fast  = ta.ema(close, emaLen)
+r     = ta.rsi(close, rsiLen)
+volMa = ta.sma(volume, volLen)
+
+crossUp    = ta.crossover(close, fast)
+rsiTurn    = ta.crossover(r, rsiBuy)
+pushCandle = close > close[1] and volume >= volMa * volMult
+
+longSignal = crossUp or rsiTurn or pushCandle
+held       = ta.barssince(strategy.position_size == 0)
+
+// 图上标出所有会触发警报的 K 线，便于肉眼核对
+plotshape(longSignal, title="LONG", style=shape.triangleup,
+  location=location.belowbar, color=color.new(color.lime, 0), size=size.tiny)
+
+if longSignal and strategy.position_size == 0
+    strategy.entry("L", strategy.long)
+if strategy.position_size > 0 and (close < fast or held >= maxBars)
+    strategy.close("L", comment="exit")

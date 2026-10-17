@@ -11,6 +11,7 @@ import express from 'express'
 import cors from 'cors'
 import { apiRouter } from './routes/api'
 import { resolveProxyUrl } from './market/exchange'
+import { startAlertMonitor } from './alerts/monitor'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PORT = Number(process.env.PORT ?? 8787)
@@ -62,5 +63,7 @@ app.listen(PORT, () => {
       ? `  ● 行情代理:      ${proxy}（ccxt 走代理；Binance 归档直连）`
       : '  ● 行情代理:      未检测到（直连，可用 HTTPS_PROXY 指定）',
   )
+  // 价格警报轮询：页面关掉也照常监控并发电报
+  startAlertMonitor()
   console.log('')
 })

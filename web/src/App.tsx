@@ -3,6 +3,7 @@ import type { PointerEvent as ReactPointerEvent } from 'react'
 import Alert from '@mui/material/Alert'
 import AppBar from '@mui/material/AppBar'
 import Box from '@mui/material/Box'
+import Button from '@mui/material/Button'
 import Chip from '@mui/material/Chip'
 import CssBaseline from '@mui/material/CssBaseline'
 import Drawer from '@mui/material/Drawer'
@@ -17,6 +18,7 @@ import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
 import ChevronRightIcon from '@mui/icons-material/ChevronRight'
 import InsightsIcon from '@mui/icons-material/Insights'
+import NotificationsActiveIcon from '@mui/icons-material/NotificationsActive'
 import { ThemeProvider } from '@mui/material/styles'
 
 import type {
@@ -38,6 +40,8 @@ import {
 } from './api'
 import ControlPanel, { rangeToSince, rangeToUntil, type RangeKey } from './components/ControlPanel'
 import PineEditor, { type PinePanelState } from './components/PineEditor'
+import AlertPanel from './components/AlertPanel'
+import AlertNotifications from './components/AlertNotifications'
 import KLinePanel from './components/KLinePanel'
 import KpiCards from './components/KpiCards'
 import EquityPanel from './components/EquityPanel'
@@ -112,6 +116,8 @@ export default function App() {
   const [pineScriptId, setPineScriptId] = useState<string | null>(null)
   /** Pine 编辑器是否在右侧 Drawer 弹窗中放大编辑 */
   const [pineDrawerOpen, setPineDrawerOpen] = useState(false)
+  /** 价格警报面板（右侧 Drawer） */
+  const [alertPanelOpen, setAlertPanelOpen] = useState(false)
   /** 所选合约的最小变动价位（下单精度），用于滑点换算 */
   const [tickSize, setTickSize] = useState(0)
 
@@ -442,6 +448,16 @@ export default function App() {
             </Stack>
             <Box sx={{ flex: 1 }} />
             <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+              <Tooltip title="为合约添加实时价格警报，支持电报机器人与网页通知推送">
+                <Button
+                  size="small"
+                  variant="outlined"
+                  startIcon={<NotificationsActiveIcon />}
+                  onClick={() => setAlertPanelOpen(true)}
+                >
+                  价格警报
+                </Button>
+              </Tooltip>
               <Chip size="small" label={headline} variant="outlined" />
               {report && (
                 <>
@@ -721,6 +737,18 @@ export default function App() {
             </Stack>
           </Box>
         </Box>
+
+        {/* ---------- 价格警报：管理面板（右侧 Drawer） ---------- */}
+        <AlertPanel
+          open={alertPanelOpen}
+          onClose={() => setAlertPanelOpen(false)}
+          defaultExchange={exchange}
+          defaultSymbol={symbol}
+          defaultTimeframe={timeframe}
+        />
+
+        {/* ---------- 页内通知：轮询触发记录并弹 Notification（与面板开关无关） ---------- */}
+        <AlertNotifications />
       </Box>
     </ThemeProvider>
   )

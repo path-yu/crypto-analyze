@@ -28,6 +28,7 @@
   ```
 
   另有 `.cache/pine-scripts.json` 作为索引（记录 id / 名称 / 时间 / 目录名）；索引丢失时会扫描 `server/pine/` 下已有的脚本目录重建列表。已保存脚本直接出现在「策略」下拉菜单里，选中即载入并实时编译
+- **价格警报**：给任意合约添加实时监控条件 —— 价格上穿 / 下穿、涨跌幅达标、RSI / 均线等指标穿越、Pine 脚本开平仓信号；命中后推送至**电报机器人**或**页内浏览器 Notification**。判定在服务端定时轮询（页面关掉也照常监控与发电报），提示信息可自定义并支持占位符
 - **CLI 回测** 与一批诊断脚本（`pnpm diag:*`、`pnpm pine`、`pnpm compare:pinets`）
 
 ## 技术栈
@@ -82,6 +83,12 @@ pnpm backtest --symbol ETH/USDT:USDT --timeframe 15m --since 2025-01-01 --exit "
 server/src/                  后端
   index.ts                   HTTP 入口（API + 生产模式静态托管）
   routes/api.ts              路由层
+  routes/alerts.ts           价格警报路由
+  alerts/
+    store.ts                 警报 / 设置 / 触发记录的 JSON 落盘（.cache/alerts/）
+    evaluator.ts             条件判定（价格 / 指标 / Pine 信号）与提示信息渲染
+    notify.ts                电报推送 + 触发记录入库
+    monitor.ts               服务端定时轮询调度器
   service/backtestService.ts 业务编排：参数校验 → 拉行情 → 算指标 → 跑回测 → 出报告
   indicators/
     ta.ts                    Pine 对齐的指标原语（sma/ema/rma/wma/highest/lowest/percentile/atr）
@@ -115,6 +122,14 @@ scripts/                     开发启动与诊断脚本
 | POST | `/api/pine/backtest` | Pine 脚本回测（额外携带 `source` / `inputs`） |
 | GET | `/api/pine/examples` | 内置示例脚本（`server/pine/*.pine`） |
 | GET / POST / DELETE | `/api/pine/scripts` | 已保存脚本的列表 / 保存（同名即更新，写 `server/pine/<目录>/` 下的 `.pine` + `.ts`）/ 删除 |
+| GET / POST | `/api/alerts` | 价格警报列表（含全局设置与轮询状态）/ 新建警报 |
+| PUT / PATCH / DELETE | `/api/alerts/:id` | 更新 / 启停（`/:id/enabled`）/ 删除警报 |
+| POST | `/api/alerts/:id/test` | 用当前行情判定一次（不推送、不改状态），验证条件是否命中 |
+| POST | `/api/alerts/:id/send` | 立即推送一条，验证电报 / 浏览器通知链路 |
+| GET / DELETE | `/api/alerts/events` | 触发记录（`?since=<seq>` 取增量）/ 清空 |
+| PUT | `/api/alerts/settings` | 更新 Telegram Bot Token / Chat ID、轮询间隔、浏览器通知开关 |
+| POST | `/api/alerts/settings/test-telegram` | 发送一条测试电报消息（可临时覆盖 Token / Chat ID） |
+| POST | `/api/alerts/tick` | 立即执行一次服务端轮询 |
 
 ## 策略参数
 
@@ -197,6 +212,25 @@ DISABLE_PROXY=1 pnpm dev                     # 强制直连（本地代理未启
 行情按「ccxt 实时接口 → Binance Vision 归档 → 本地缓存」的顺序获取，缓存位于 `.cache/klines/`（已在 .gitignore 中忽略，属运行时数据、**故意不进版本库**）。全程只使用公开行情接口，无需 API Key。
 
 缓存策略：文件名形如 `<数据源>_<品种>_<周期>_<起始>_<结束>.json`，时间按周期取整；读取时只要已有文件**覆盖**请求区间且尾部足够新（同一根 K 线内）就直接复用，不会因为 `until = 当前时间` 的毫秒漂移而反复新建文件。同一「数据源 + 品种 + 周期」最多保留 3 个文件（写入时自动淘汰旧的），也可随时执行 `pnpm clean:cache` 手动清理。若需要绝对最新的数据（例如刚收盘的那根 K 线），清理缓存或在请求里传 `useCache: false` 跳过缓存即可。
+
+## 价格警报
+
+点顶栏的「价格警报」打开面板。判定与推送都在 **Node 服务端**按 `pollIntervalMs`（默认 15 秒，面板可改）轮询执行 —— 因此浏览器页面关掉后依然在监控，电报推送不受影响；页内通知由前端轮询 `/api/alerts/events` 增量后调用浏览器的 `Notification` API 弹出（需先授权）。
+
+支持的条件（均为**边沿触发**：只在「未满足 → 满足」的那一刻触发一次，避免行情贴着阈值抖动时刷屏）：
+
+| 分组 | 条件 | 说明 |
+| --- | --- | --- |
+| 价格 | 价格上穿 / 下穿 | 与阈值比较，穿越那一刻触发 |
+| 价格 | 涨幅 / 跌幅达到 N% | 基准价 = 首次观测价，触发后重置为触发时价格 |
+| 指标 | 指标上穿 / 下穿 | 可选收盘价 / SMA / EMA / RSI / ATR，按 `timeframe` 在**最近一根已收盘 K 线**上判定 |
+| Pine 信号 | 做多开仓 / 做空开仓 / 平仓 / 任意信号 | 服务端用 PineTS 跑所选脚本（缺省取第一份已保存脚本），读取最近一根已收盘 K 线的信号 |
+
+每条警报可单独设置：提示信息、推送渠道（电报 / 网页通知，可多选）、冷却秒数、触发一次后自动停用。提示信息支持占位符 `{symbol}` `{name}` `{price}` `{value}` `{condition}` `{time}`，多行时首行为标题、其余为正文；留空则用自动文案。
+
+配置与记录落在 `.cache/alerts/`（`alerts.json` / `settings.json` / `events.json`，已被 .gitignore 忽略，Telegram Token 不会进版本库）；测试可用环境变量 `ALERT_DATA_DIR` 改目录。
+
+电报机器人准备：找 @BotFather 建机器人拿到 **Bot Token**，把机器人拉进目标会话，再用 @userinfobot 查 **Chat ID**，填进面板的「推送设置」并点「发送测试消息」确认连通。Telegram 接口复用行情层同一套代理（`HTTPS_PROXY` / Windows 系统代理），未配代理时直连 —— 受限网络下直连 `api.telegram.org` 通常会超时，失败原因会显示在面板与触发记录里。
 
 ## 免责声明
 

@@ -1,10 +1,15 @@
 import type {
+  AlertEvent,
+  AlertMonitorStatus,
+  AlertOverview,
+  AlertSettings,
   BacktestResult,
   Candle,
   ExchangeId,
   Instrument,
   PineCompileMeta,
   PineDiagnostic,
+  PriceAlert,
   SavedPineScript,
   StrategyParams,
   Timeframe,
@@ -212,4 +217,110 @@ export async function deletePineScript(id: string): Promise<void> {
   const res = await fetch(`/api/pine/scripts/${encodeURIComponent(id)}`, { method: 'DELETE' })
   const json = (await res.json()) as { ok: boolean; error?: string }
   if (!res.ok || !json.ok) throw new Error(json.error ?? `删除失败（HTTP ${res.status}）`)
+}
+
+/* ------------------------------------------------------------------ */
+/* 价格警报                                                            */
+/* ------------------------------------------------------------------ */
+
+/** 新建 / 更新警报的入参（服务端会做校验与规范化） */
+export type AlertInput = Omit<
+  PriceAlert,
+  'id' | 'createdAt' | 'updatedAt' | 'lastTriggeredAt' | 'triggerCount' | 'state'
+>
+
+async function jsonRequest<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init)
+  const text = await res.text()
+  let json: { ok?: boolean; error?: string; data?: T }
+  try {
+    json = JSON.parse(text)
+  } catch {
+    throw new Error(`服务返回了非 JSON 响应（HTTP ${res.status}）`)
+  }
+  if (!res.ok || json.ok === false) throw new Error(json.error ?? `请求失败（HTTP ${res.status}）`)
+  return json.data as T
+}
+
+/** 警报列表 + 全局设置 + 轮询状态 */
+export async function fetchAlerts(): Promise<AlertOverview> {
+  return jsonRequest<AlertOverview>('/api/alerts')
+}
+
+export async function createAlert(input: AlertInput): Promise<PriceAlert> {
+  return jsonRequest<PriceAlert>('/api/alerts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+}
+
+export async function updateAlert(id: string, input: AlertInput): Promise<PriceAlert> {
+  return jsonRequest<PriceAlert>(`/api/alerts/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  })
+}
+
+export async function setAlertEnabled(id: string, enabled: boolean): Promise<PriceAlert> {
+  return jsonRequest<PriceAlert>(`/api/alerts/${encodeURIComponent(id)}/enabled`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+}
+
+export async function deleteAlert(id: string): Promise<void> {
+  await jsonRequest<{ id: string }>(`/api/alerts/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+/** 条件自测：用当前行情判定一次（不推送、不改状态） */
+export async function testAlert(id: string): Promise<{
+  matched: boolean
+  value: number
+  error?: string
+  summary: { title: string; body: string }
+}> {
+  return jsonRequest(`/api/alerts/${encodeURIComponent(id)}/test`, { method: 'POST' })
+}
+
+/** 立即推送一条（验证 Telegram / 浏览器通知链路） */
+export async function sendAlertNow(id: string): Promise<AlertEvent> {
+  return jsonRequest<AlertEvent>(`/api/alerts/${encodeURIComponent(id)}/send`, { method: 'POST' })
+}
+
+/** 触发记录增量：`since` = 前端已消费的最大 seq */
+export async function fetchAlertEvents(since?: number): Promise<AlertEvent[]> {
+  const qs = since === undefined ? '' : `?since=${since}`
+  return jsonRequest<AlertEvent[]>(`/api/alerts/events${qs}`)
+}
+
+export async function clearAlertEvents(): Promise<void> {
+  await jsonRequest('/api/alerts/events', { method: 'DELETE' })
+}
+
+export async function updateAlertSettings(patch: Partial<AlertSettings>): Promise<AlertSettings> {
+  return jsonRequest<AlertSettings>('/api/alerts/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })
+}
+
+/** 发送测试电报消息（可临时传 Token / ChatID 覆盖已保存值） */
+export async function testTelegram(payload: {
+  botToken?: string
+  chatId?: string
+}): Promise<{ ok: boolean; error?: string }> {
+  return jsonRequest('/api/alerts/settings/test-telegram', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+/** 立即执行一次服务端轮询 */
+export async function runAlertTick(): Promise<AlertMonitorStatus> {
+  return jsonRequest<AlertMonitorStatus>('/api/alerts/tick', { method: 'POST' })
 }

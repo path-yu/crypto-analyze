@@ -627,3 +627,253 @@ export interface Instrument {
   contractSize?: number
   linear?: boolean
 }
+
+/* ------------------------------------------------------------------ */
+/* 价格警报                                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 警报条件类型（扁平联合）。前端按 kind 决定要填哪些字段，
+ * 服务端 `alerts/evaluator.ts` 按 kind 分支判定。
+ *
+ * - `priceCrossUp` / `priceCrossDown`：最新价上穿 / 下穿阈值 `value`
+ * - `priceRise` / `priceFall`：相对「基准价」涨 / 跌达到 `value`%（基准价 = 首次观测价，
+ *   触发后重置为触发时价格）
+ * - `indicatorCrossUp` / `indicatorCrossDown`：指标上穿 / 下穿阈值 `value`
+ * - `pineEntryLong` / `pineEntryShort` / `pineExit` / `pineSignal`：
+ *   所选 Pine 脚本在最近一根**已收盘** K 线上出现对应信号
+ */
+export type AlertKind =
+  | 'priceCrossUp'
+  | 'priceCrossDown'
+  | 'priceRise'
+  | 'priceFall'
+  | 'indicatorCrossUp'
+  | 'indicatorCrossDown'
+  | 'pineEntryLong'
+  | 'pineEntryShort'
+  | 'pineExit'
+  | 'pineSignal'
+
+/** 指标类条件可用的指标 */
+export type AlertIndicator = 'close' | 'sma' | 'ema' | 'rsi' | 'atr'
+
+export const ALERT_INDICATORS: { id: AlertIndicator; label: string; needsPeriod: boolean }[] = [
+  { id: 'close', label: '收盘价', needsPeriod: false },
+  { id: 'sma', label: 'SMA 简单均线', needsPeriod: true },
+  { id: 'ema', label: 'EMA 指数均线', needsPeriod: true },
+  { id: 'rsi', label: 'RSI 相对强弱', needsPeriod: true },
+  { id: 'atr', label: 'ATR 真实波幅', needsPeriod: true },
+]
+
+/** 条件类型的展示信息（前端下拉菜单与摘要文案共用） */
+export interface AlertKindMeta {
+  kind: AlertKind
+  label: string
+  group: '价格' | '指标' | 'Pine 信号'
+  /** 是否需要填阈值 `value` */
+  needsValue: boolean
+  /** 阈值输入框的标签 */
+  valueLabel: string
+  /** 阈值单位（百分比时为 '%'） */
+  valueSuffix?: string
+  /** 阈值默认值 */
+  valueDefault?: number
+  /** 是否附带指标选择（indicator / period） */
+  needsIndicator?: boolean
+}
+
+export const ALERT_KIND_META: AlertKindMeta[] = [
+  { kind: 'priceCrossUp', label: '价格上穿（突破）', group: '价格', needsValue: true, valueLabel: '价格', valueDefault: 0 },
+  { kind: 'priceCrossDown', label: '价格下穿（跌破）', group: '价格', needsValue: true, valueLabel: '价格', valueDefault: 0 },
+  { kind: 'priceRise', label: '涨幅达到', group: '价格', needsValue: true, valueLabel: '涨幅', valueSuffix: '%', valueDefault: 5 },
+  { kind: 'priceFall', label: '跌幅达到', group: '价格', needsValue: true, valueLabel: '跌幅', valueSuffix: '%', valueDefault: 5 },
+  { kind: 'indicatorCrossUp', label: '指标上穿', group: '指标', needsValue: true, valueLabel: '阈值', valueDefault: 70, needsIndicator: true },
+  { kind: 'indicatorCrossDown', label: '指标下穿', group: '指标', needsValue: true, valueLabel: '阈值', valueDefault: 30, needsIndicator: true },
+  { kind: 'pineEntryLong', label: 'Pine 做多开仓', group: 'Pine 信号', needsValue: false, valueLabel: '', needsIndicator: false },
+  { kind: 'pineEntryShort', label: 'Pine 做空开仓', group: 'Pine 信号', needsValue: false, valueLabel: '' },
+  { kind: 'pineExit', label: 'Pine 平仓', group: 'Pine 信号', needsValue: false, valueLabel: '' },
+  { kind: 'pineSignal', label: 'Pine 任意信号', group: 'Pine 信号', needsValue: false, valueLabel: '' },
+]
+
+/** 条件类型的展示名（摘要文案用） */
+export const ALERT_KIND_LABEL: Record<AlertKind, string> = Object.fromEntries(
+  ALERT_KIND_META.map((m) => [m.kind, m.label]),
+) as Record<AlertKind, string>
+
+/** 推送渠道：电报机器人 / 页内浏览器 Notification */
+export type AlertChannel = 'telegram' | 'browser'
+
+/** 一条警报的触发条件 */
+export interface AlertCondition {
+  kind: AlertKind
+  /** 阈值：价格类 = 价格；涨跌幅类 = 百分比（正数）；指标类 = 指标阈值 */
+  value?: number
+  /** 指标类：指标名 */
+  indicator?: AlertIndicator
+  /** 指标类：指标周期 */
+  period?: number
+  /** Pine 类：脚本 id（`dir:<目录名>`）；缺省时取服务端第一份已保存脚本 */
+  pineScriptId?: string
+}
+
+/** 警报的运行期状态（持久化，用于边沿触发与涨跌幅基准） */
+export interface AlertRuntimeState {
+  /** 上一次观测到的价格（价格类交叉判定用，同时是涨跌幅基准的兜底） */
+  lastPrice?: number
+  /** 涨跌幅类条件的基准价 */
+  basePrice?: number
+  /** 最近一次判定时间 */
+  checkedAt?: number
+  /** 最近一次判定失败的原因（行情拉取失败 / 脚本报错等） */
+  lastError?: string
+  /** 最近一次判定得到的当前值（价格或指标值），供界面展示 */
+  lastValue?: number
+  /** 指标 / Pine 类：最近一次判定所用的「已收盘 K 线」开盘时间，用于同一根 K 线内去重 */
+  lastBarTime?: number
+  /** 指标 / Pine 类：该根 K 线是否命中条件 */
+  lastMatched?: boolean
+  /** 最近一次发送电报失败的原因 */
+  lastPushError?: string
+}
+
+/** 一条价格警报 */
+export interface PriceAlert {
+  id: string
+  /** 展示名（可选，留空时用 symbol） */
+  name?: string
+  exchange: ExchangeId
+  symbol: string
+  /** 指标类 / Pine 类条件使用的 K 线周期 */
+  timeframe: Timeframe
+  condition: AlertCondition
+  /**
+   * 自定义提示信息（可编辑）。支持占位符：
+   * `{symbol}` `{price}` `{value}` `{time}` —— 服务端渲染后作为标题/正文。
+   * 留空时用自动生成的摘要文案。
+   */
+  message: string
+  /** 推送渠道（可多选） */
+  channels: AlertChannel[]
+  enabled: boolean
+  /** 触发一次后自动停用（单次警报） */
+  once: boolean
+  /** 冷却秒数：距上次触发不足该时长则跳过，避免行情在阈值附近反复触发。0 = 不冷却 */
+  cooldownSec: number
+  createdAt: number
+  updatedAt: number
+  /** 最近一次触发时间 */
+  lastTriggeredAt?: number
+  /** 累计触发次数 */
+  triggerCount: number
+  state: AlertRuntimeState
+}
+
+/** 一条触发记录（页内 Notification 轮询消费 / 面板展示） */
+export interface AlertEvent {
+  /** 自增序号，前端以 `since` 拉增量 */
+  seq: number
+  alertId: string
+  /** 触发时警报的展示名 */
+  name: string
+  symbol: string
+  exchange: ExchangeId
+  /** 渲染后的标题 */
+  title: string
+  /** 渲染后的正文 */
+  body: string
+  /** 触发时的价格 / 指标值 */
+  value: number
+  at: number
+  /** 是否需要弹浏览器通知（channels 含 browser） */
+  browser: boolean
+  /** Telegram 发送结果（未启用该渠道时缺省） */
+  telegram?: { ok: boolean; error?: string }
+}
+
+/** Telegram 推送配置 */
+export interface TelegramConfig {
+  enabled: boolean
+  botToken: string
+  chatId: string
+}
+
+/** 警报全局设置 */
+export interface AlertSettings {
+  telegram: TelegramConfig
+  /** 服务端轮询间隔（毫秒） */
+  pollIntervalMs: number
+  /** 浏览器通知总开关（前端据此决定是否弹 Notification） */
+  browserEnabled: boolean
+}
+
+export const DEFAULT_ALERT_SETTINGS: AlertSettings = {
+  telegram: { enabled: false, botToken: '', chatId: '' },
+  pollIntervalMs: 15_000,
+  browserEnabled: true,
+}
+
+/** 轮询间隔允许范围（毫秒） */
+export const ALERT_POLL_MIN_MS = 5_000
+export const ALERT_POLL_MAX_MS = 300_000
+
+/** WebSocket 行情流的运行状态（服务端 ccxt.pro 订阅） */
+export interface AlertStreamStatus {
+  /** 活跃的 ticker 订阅数（价格类条件） */
+  tickerSubscriptions: number
+  /** 活跃的 K 线订阅数（指标 / Pine 信号类条件） */
+  ohlcvSubscriptions: number
+  /** 最近一小时内收到过行情的交易所 */
+  activeExchanges: ExchangeId[]
+  /** 最近一次收到 WS 行情的时间 */
+  lastMessageAt?: number
+  /** 最近一次 WS 报错（断线重连中也会记录） */
+  lastError?: string
+}
+
+/** 警报轮询调度器的运行状态（GET /api/alerts 的 status 字段） */
+export interface AlertMonitorStatus {
+  /** 是否正在定时轮询（REST 兼底） */
+  running: boolean
+  /**
+   * 是否处于待机：监控权被**另一个后端实例**持有。
+   *
+   * 多个实例同时监控同一批警报会导致同一根 K 线被推两遍（电报收到重复消息），
+   * 因此监控权由 `monitor.lock` 排他持有；待机实例照常提供接口，但不订阅行情、不推送。
+   */
+  standby: boolean
+  /** 最近一次轮询开始时间 */
+  lastTickAt?: number
+  /** 最近一次轮询耗时（毫秒） */
+  lastTickMs?: number
+  /** 最近一次轮询内触发的条数 */
+  lastFiredCount?: number
+  /** 轮询自身抛错的原因（单条警报的错误记在各自的 state.lastError 上） */
+  lastTickError?: string
+  /** WebSocket 行情流状态；无订阅时各计数为 0 */
+  stream: AlertStreamStatus
+}
+
+/** GET /api/alerts 的响应体 */
+export interface AlertOverview {
+  alerts: PriceAlert[]
+  settings: AlertSettings
+  status: AlertMonitorStatus
+}
+
+/**
+ * 条件 → 一行摘要文案（前后端共用：面板列表展示 + 服务端自动生成的提示信息）。
+ * 例：`价格上穿 69000`、`RSI(14) 下穿 30`、`Pine 做多开仓`。
+ */
+export function describeAlertCondition(c: AlertCondition): string {
+  const label = ALERT_KIND_LABEL[c.kind]
+  if (c.kind === 'indicatorCrossUp' || c.kind === 'indicatorCrossDown') {
+    const meta = ALERT_INDICATORS.find((i) => i.id === c.indicator)
+    const name = meta ? meta.label : String(c.indicator ?? '指标')
+    const period = meta?.needsPeriod ? `(${c.period ?? 14})` : ''
+    return `${name}${period} ${c.kind === 'indicatorCrossUp' ? '上穿' : '下穿'} ${c.value}`
+  }
+  if (c.kind === 'priceRise' || c.kind === 'priceFall') return `${label} ${c.value}%`
+  if (label) return c.value !== undefined ? `${label} ${c.value}` : label
+  return String(c.kind)
+}
