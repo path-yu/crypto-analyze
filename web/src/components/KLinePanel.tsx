@@ -68,6 +68,13 @@ interface Props {
   onToggleLevels: (v: boolean) => void
   /** 点击图上的交易标记 → 打开该笔交易明细（与「交易明细」表共用弹窗） */
   onSelectTrade?: (trade: Trade) => void
+  /**
+   * 图表「指标设置」里改了策略输入并点「确定」→ 回传当前输入值。
+   *
+   * 上层据此重跑回测，并把新值写回 `.pine` 的 input 默认值（保持"图上看到的
+   * 参数 = 回测用的参数 = 文件里的默认值"）。
+   */
+  onIndicatorInputsChange?: (values: Record<string, number | boolean | string>) => void
   height?: number
 }
 
@@ -92,10 +99,14 @@ export default function KLinePanel({
   showLevels,
   onToggleLevels,
   onSelectTrade,
+  onIndicatorInputsChange,
   height = 620,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const workspaceRef = useRef<VelaWorkspace | null>(null)
+  /** 图表只在重建时订阅一次指标事件，因此回调走 ref，避免进 effect 依赖 */
+  const onIndicatorInputsRef = useRef(onIndicatorInputsChange)
+  onIndicatorInputsRef.current = onIndicatorInputsChange
   /**
    * 十字光标所在的那根 K 线；null = 鼠标不在图上。
    * 信息条据此显示「当前选中的 K 线」，鼠标移出时回落到最后一根。
@@ -211,17 +222,36 @@ export default function KLinePanel({
     }
 
     let offCross: (() => void) | null = null
+    let offInputs: (() => void) | null = null
     // Vela 内置 UI 没有 i18n：这里挂 DOM 层的汉化（图例、右键菜单、设置弹窗等）
     const uninstallLocale = installVelaLocale()
 
     withChart((chart) => {
+      // 调试钩子：便于在控制台/自动化里检查指标输入（不影响渲染）
+      ;(window as unknown as { __velaChart?: unknown }).__velaChart = chart
       // 交易标记覆盖物（图层 + 同名的 legend-less 原生指标）
       chart.addNativeIndicator(TRADE_LAYER_ID)
       // Pine 脚本自身的绘制交给 Pine 引擎；脚本报错时 Vela 会自行提示，不阻断蜡烛
       const source = result.pine?.source
       if (source) {
         try {
-          chart.addIndicator(source)
+          const handle = chart.addIndicator(source)
+          // 指标设置弹窗点「确定」后，Vela 派发 indicator:inputs：
+          // 读出当前输入值回传上层（重跑回测 + 写回 .pine 默认值）
+          if (handle && typeof chart.on === 'function') {
+            offInputs = chart.on('indicator:inputs', () => {
+              try {
+                const raw = handle.inputValues?.() ?? {}
+                const next: Record<string, number | boolean | string> = {}
+                for (const [k, v] of Object.entries(raw)) {
+                  if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') next[k] = v
+                }
+                if (Object.keys(next).length > 0) onIndicatorInputsRef.current?.(next)
+              } catch (err) {
+                console.warn('[vela] 读取指标输入失败：', err)
+              }
+            })
+          }
         } catch (err) {
           console.warn('[vela] Pine 脚本叠加失败（蜡烛与交易标记不受影响）：', err)
         }
@@ -251,6 +281,7 @@ export default function KLinePanel({
     return () => {
       ro.disconnect()
       offCross?.()
+      offInputs?.()
       uninstallLocale()
       workspaceRef.current = null
       tradeHitState.regions = []

@@ -97,6 +97,13 @@ export default function App() {
   }))
   /** Pine 策略源码（strategy === 'pine' 时随回测请求一起提交） */
   const [pineSource, setPineSource] = useState('')
+  /**
+   * 回测参数覆盖（键 = input 的 title）。
+   *
+   * 只影响「运行回测」提交的 `inputs` —— 图表上那条指标的参数属于 Vela 自己的
+   * 设置弹窗（改它不会重跑回测，也不会写回 .pine 源文件）。
+   */
+  const [pineInputs, setPineInputs] = useState<Record<string, number | boolean | string>>({})
   /** 保存用的脚本名（同名保存即更新同一份） */
   const [pineName, setPineName] = useState('')
   /** 已保存到本地缓存的脚本（策略下拉菜单直接可选） */
@@ -164,35 +171,52 @@ export default function App() {
     return Math.floor(span / TIMEFRAME_MS[timeframe])
   }, [range, customSince, customUntil, timeframe])
 
-  const handleRun = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const since = rangeToSince(range, customSince)
-      const until = rangeToUntil(customUntil)
-      if (until !== undefined && until <= since) {
-        throw new Error('结束日期必须晚于起始日期')
+  /**
+   * 发起回测。`opts` 可覆盖源码 / 参数 —— 图表「指标设置」改完参数时用新值直接重跑，
+   * 避免 setState 之后闭包还读到旧值。
+   */
+  const runBacktest = useCallback(
+    async (opts: { source?: string; inputs?: Record<string, number | boolean | string> } = {}) => {
+      const src = opts.source ?? pineSource
+      const ins = opts.inputs ?? pineInputs
+      setLoading(true)
+      setError(null)
+      try {
+        const since = rangeToSince(range, customSince)
+        const until = rangeToUntil(customUntil)
+        if (until !== undefined && until <= since) {
+          throw new Error('结束日期必须晚于起始日期')
+        }
+        const base = {
+          exchange,
+          symbol,
+          timeframe,
+          since,
+          // 未设置结束日期时回测到当前时刻
+          until: until ?? Date.now(),
+          params,
+          tickSize,
+        }
+        if (!src.trim()) throw new Error('请先选择一份已保存脚本，或粘贴 / 载入 Pine 源码')
+        setResult(await runPineBacktest({ ...base, source: src, inputs: ins }))
+        setTab('chart')
+        setDetailTrade(null)
+      } catch (err) {
+        setError(humanizeError(err instanceof Error ? err.message : String(err)))
+      } finally {
+        setLoading(false)
       }
-      const base = {
-        exchange,
-        symbol,
-        timeframe,
-        since,
-        // 未设置结束日期时回测到当前时刻
-        until: until ?? Date.now(),
-        params,
-        tickSize,
-      }
-      if (!pineSource.trim()) throw new Error('请先选择一份已保存脚本，或粘贴 / 载入 Pine 源码')
-      setResult(await runPineBacktest({ ...base, source: pineSource }))
-      setTab('chart')
-      setDetailTrade(null)
-    } catch (err) {
-      setError(humanizeError(err instanceof Error ? err.message : String(err)))
-    } finally {
-      setLoading(false)
-    }
-  }, [exchange, symbol, timeframe, range, customSince, customUntil, params, pineSource, tickSize])
+    },
+    [exchange, symbol, timeframe, range, customSince, customUntil, params, pineSource, pineInputs, tickSize],
+  )
+
+  const handleRun = useCallback(() => {
+    void runBacktest()
+  }, [runBacktest])
+
+  /** 图表的事件只在建图时订阅一次，这里用 ref 指向最新的回测函数 */
+  const runBacktestRef = useRef(runBacktest)
+  runBacktestRef.current = runBacktest
 
   /* ---------------- Pine 脚本：保存 / 载入 ---------------- */
 
@@ -222,6 +246,8 @@ export default function App() {
       if (!script) return
       setPineSource(script.source)
       setPineName(script.name)
+      // 换脚本时清空参数覆盖，避免把上一个脚本的名义价值等参数带到新脚本上
+      setPineInputs({})
     },
     [pineScripts],
   )
@@ -271,6 +297,48 @@ export default function App() {
     setPineName(script.name)
   }, [pineScriptId])
 
+  /**
+   * 图表「指标设置」点「确定」→ 一次同步三处：
+   *   1. 用图表里的新参数**重跑回测**
+   *   2. 把新值写回 `.pine` 里对应 `input` 的默认值（只有匹配到声明才改）
+   *   3. 落盘保存并刷新脚本列表
+   */
+  const applyIndicatorInputs = useCallback(
+    (values: Record<string, number | boolean | string>) => {
+      if (JSON.stringify(values) === JSON.stringify(pineInputs)) return
+      // 图表（Vela）回传的键是脚本里的**变量名**（notional / volMult …），
+      // 这里把变量名映射成 input 声明的标题，后面覆盖面板与服务端都按标题走。
+      const titleOf = new Map<string, string>()
+      for (const m of pineSource.matchAll(/(\w+)\s*=\s*input\.\w+\(\s*[^,]+,\s*"([^"]+)"/g)) {
+        titleOf.set(m[1], m[2])
+      }
+      const titled: Record<string, number | boolean | string> = {}
+      let nextSource = pineSource
+      for (const [key, v] of Object.entries(values)) {
+        titled[titleOf.get(key) ?? key] = v
+        if (typeof v !== 'number' || !Number.isFinite(v)) continue
+        // 按变量名定位声明行：`notional = input.float(200.0, "…")`；
+        // 值没变就不动，避免 14 → 14.0 这种无意义的格式漂移。
+        const esc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        const re = new RegExp(`(^|\\n)(\\s*${esc}\\s*=\\s*input\\.(?:float|int)\\(\\s*)(-?\\d+(?:\\.\\d+)?)`)
+        nextSource = nextSource.replace(re, (whole, p1: string, p2: string, p3: string) =>
+          Number(p3) === v ? whole : `${p1}${p2}${v}`,
+        )
+      }
+      const changed = nextSource !== pineSource
+      if (changed) setPineSource(nextSource)
+      setPineInputs(titled)
+      const nm = pineName.trim()
+      if (changed && nm && pineScriptId) {
+        void savePineScript(nm, nextSource)
+          .then(() => refreshPineScripts())
+          .catch((err) => console.warn('[pine] 指标参数回写源文件失败：', err))
+      }
+      void runBacktestRef.current({ source: nextSource, inputs: titled })
+    },
+    [pineInputs, pineSource, pineName, pineScriptId, refreshPineScripts],
+  )
+
   /** 删除当前载入的脚本（编辑器里的源码保留） */
   const handleDeletePine = useCallback(async () => {
     if (!pineScriptId) return
@@ -289,6 +357,8 @@ export default function App() {
       onSourceChange: setPineSource,
       name: pineName,
       onNameChange: setPineName,
+      inputs: pineInputs,
+      onInputsChange: setPineInputs,
       scripts: pineScripts,
       selectedId: pineScriptId,
       onSelect: handleSelectPineScript,
@@ -302,6 +372,7 @@ export default function App() {
     [
       pineSource,
       pineName,
+      pineInputs,
       pineScripts,
       pineScriptId,
       handleSelectPineScript,
@@ -588,6 +659,7 @@ export default function App() {
                       showLevels={showLevels}
                       onToggleLevels={setShowLevels}
                       onSelectTrade={setDetailTrade}
+                      onIndicatorInputsChange={applyIndicatorInputs}
                     />
                   )}
                   {tab === 'equity' && <EquityPanel result={result!} />}

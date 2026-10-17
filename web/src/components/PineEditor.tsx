@@ -5,8 +5,10 @@ import AccordionSummary from '@mui/material/AccordionSummary'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
+import Checkbox from '@mui/material/Checkbox'
 import CircularProgress from '@mui/material/CircularProgress'
 import Divider from '@mui/material/Divider'
+import FormControlLabel from '@mui/material/FormControlLabel'
 import IconButton from '@mui/material/IconButton'
 import Stack from '../ui/Stack'
 import TextField from '@mui/material/TextField'
@@ -46,6 +48,14 @@ export interface PinePanelState {
   /** 删除当前载入的已保存脚本 */
   onDelete: () => Promise<void>
   /**
+   * 回测参数覆盖：键 = input 的 title（未列出的项用脚本默认值）。
+   *
+   * 注意：只影响「运行回测」提交给服务端的 `inputs`；
+   * 图表上那条指标的参数是 Vela 自己的设置弹窗，两者互不相通。
+   */
+  inputs: Record<string, number | boolean | string>
+  onInputsChange: (next: Record<string, number | boolean | string>) => void
+  /**
    * 丢弃编辑器里的文本、从磁盘重新载入当前脚本。
    *
    * 编译与回测用的都是**编辑器里的文本**：在应用之外修改（或修复）了 .pine 后，
@@ -77,6 +87,8 @@ export default function PineEditor({
   onSourceChange,
   name,
   onNameChange,
+  inputs,
+  onInputsChange,
   scripts,
   selectedId,
   onSave,
@@ -197,6 +209,8 @@ export default function PineEditor({
   }
 
   const errorCount = diagnostics.filter((d) => d.severity === 'error').length
+  /** 已覆盖的回测参数个数（键 = input title） */
+  const overrideCount = Object.keys(inputs).length
 
   return (
     <Box
@@ -351,6 +365,83 @@ export default function PineEditor({
             </Box>
           ))}
         </Box>
+      )}
+
+      {meta && meta.inputs.length > 0 && (
+        <Accordion
+          disableGutters
+          sx={{
+            mt: 1.25,
+            border: '1px solid',
+            borderColor: 'divider',
+            borderRadius: 1,
+            '&:before': { display: 'none' },
+          }}
+        >
+          <AccordionSummary
+            expandIcon={<ExpandMoreIcon fontSize="small" />}
+            sx={{ minHeight: 34, '& .MuiAccordionSummary-content': { my: 0.5 } }}
+          >
+            <Typography variant="caption" sx={{ fontWeight: 600 }}>
+              回测参数覆盖
+              {overrideCount > 0 ? `（已覆盖 ${overrideCount} 项）` : '（未覆盖，全部用脚本默认值）'}
+            </Typography>
+          </AccordionSummary>
+          <AccordionDetails sx={{ pt: 0 }}>
+            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+              {meta.inputs.map((it) => {
+                const key = it.title || it.name
+                const cur = inputs[key]
+                if (it.type === 'bool') {
+                  return (
+                    <FormControlLabel
+                      key={key}
+                      control={
+                        <Checkbox
+                          size="small"
+                          checked={cur === undefined ? Boolean(it.default) : Boolean(cur)}
+                          onChange={(e) => onInputsChange({ ...inputs, [key]: e.target.checked })}
+                        />
+                      }
+                      label={<Typography variant="caption">{key}</Typography>}
+                    />
+                  )
+                }
+                if (it.type === 'color' || it.type === 'string') return null
+                const val = cur ?? (typeof it.default === 'number' ? it.default : '')
+                return (
+                  <TextField
+                    key={key}
+                    size="small"
+                    type="number"
+                    label={key}
+                    value={val === '' ? '' : String(val)}
+                    onChange={(e) => {
+                      const v = e.target.value.trim()
+                      const next = { ...inputs }
+                      if (v === '') delete next[key]
+                      else next[key] = Number(v)
+                      onInputsChange(next)
+                    }}
+                    sx={{ width: 172 }}
+                    slotProps={{
+                      inputLabel: { shrink: true },
+                      htmlInput: { style: { fontSize: 12 } },
+                    }}
+                  />
+                )
+              })}
+            </Stack>
+            <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 1 }}>
+              <Button size="small" onClick={() => onInputsChange({})} disabled={overrideCount === 0}>
+                全部恢复默认
+              </Button>
+              <Typography variant="caption" color="text.secondary">
+                只影响「运行回测」；图表上那条指标的参数在图表自己的设置里改（不会重跑回测）。
+              </Typography>
+            </Stack>
+          </AccordionDetails>
+        </Accordion>
       )}
 
     </Box>
