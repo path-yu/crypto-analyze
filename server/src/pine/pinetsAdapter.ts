@@ -162,6 +162,20 @@ function toDiagnostic(err: unknown): PineDiagnostic {
   const line = m ? Number(m[1]) : 1
   const column = m ? Number(m[2]) : 1
   const clean = m ? message.slice(0, message.length - m[0].length).trim().replace(/:\s*$/, '') : message
+  // PineTS 对「中文出现在代码区」只报 Unexpected character 'X'，看不出原因。
+  // Pine 标识符必须是 ASCII（TradingView 同样如此），中文几乎都来自把内置变量
+  // 写成了中文（如 成交量→volume）。这里补一句可操作的提示。
+  const unexpected = /Unexpected character '(.+?)'/.exec(clean)
+  if (unexpected && /[\u4e00-\u9fff]/.test(unexpected[1])) {
+    return {
+      line,
+      column,
+      severity: 'error',
+      message:
+        `${clean} —— Pine 的变量名只能用英文字母、数字和下划线（TradingView 同样不允许中文标识符）。` +
+        `「${unexpected[1]}」是中文标识符：请改回对应的英文内置变量（如 成交量→volume、收盘价→close）或自定义英文名`,
+    }
+  }
   return { line, column, severity: 'error', message: clean }
 }
 

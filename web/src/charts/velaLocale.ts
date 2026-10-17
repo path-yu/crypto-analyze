@@ -29,7 +29,6 @@
 /** 英文原文 → 简体中文（键必须与运行时 DOM 里的整串文本完全一致） */
 const DICT: Record<string, string> = {
   /* ---- 指标图例 / 指标标题缺省值 ---- */
-  Volume: '成交量',
   Indicator: '指标',
   Hide: '隐藏',
   Show: '显示',

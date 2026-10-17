@@ -255,6 +255,22 @@ export default function App() {
     return saved
   }, [pineName, pineSource, refreshPineScripts])
 
+  /**
+   * 从磁盘重新载入当前脚本：丢弃编辑器里的文本，用服务端最新源码覆盖。
+   *
+   * 编译/回测用的都是**编辑器里的文本**，因此在本应用之外修改（或修复）了
+   * `.pine` 之后，编辑器不会自动感知，会一直拿旧文本报旧错 —— 用这一步同步。
+   */
+  const handleReloadPine = useCallback(async () => {
+    if (!pineScriptId) throw new Error('当前未载入已保存脚本')
+    const list = await fetchPineScripts()
+    setPineScripts(list)
+    const script = list.find((s) => s.id === pineScriptId)
+    if (!script) throw new Error('该脚本在服务端已不存在（可能已被删除或改名）')
+    setPineSource(script.source)
+    setPineName(script.name)
+  }, [pineScriptId])
+
   /** 删除当前载入的脚本（编辑器里的源码保留） */
   const handleDeletePine = useCallback(async () => {
     if (!pineScriptId) return
@@ -278,6 +294,7 @@ export default function App() {
       onSelect: handleSelectPineScript,
       onSave: handleSavePine,
       onDelete: handleDeletePine,
+      onReload: handleReloadPine,
       onRefresh: refreshPineScripts,
       drawerOpen: pineDrawerOpen,
       onToggleDrawer: togglePineDrawer,
@@ -290,6 +307,7 @@ export default function App() {
       handleSelectPineScript,
       handleSavePine,
       handleDeletePine,
+      handleReloadPine,
       refreshPineScripts,
       pineDrawerOpen,
       togglePineDrawer,

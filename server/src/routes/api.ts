@@ -3,9 +3,6 @@
  */
 
 import { Router, type Request, type Response } from 'express'
-import fs from 'node:fs'
-import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import type { ExchangeId, Timeframe } from '../../../shared/types'
 import { EXCHANGES, TIMEFRAMES } from '../../../shared/types'
 import {
@@ -28,9 +25,6 @@ import {
 } from '../pine/store'
 
 export const apiRouter: Router = Router()
-
-/** server/pine 目录（存放示例脚本） */
-const PINE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../pine')
 
 function asExchange(v: unknown, fallback: ExchangeId = 'binanceusdm'): ExchangeId {
   const s = String(v ?? '') as ExchangeId
@@ -228,27 +222,17 @@ apiRouter.post('/pine/backtest', async (req: Request, res: Response) => {
   }
 })
 
-/** 内置示例脚本：GET /api/pine/examples */
-apiRouter.get('/pine/examples', (_req: Request, res: Response) => {
-  try {
-    const read = (file: string): string => fs.readFileSync(path.join(PINE_DIR, file), 'utf8')
-    res.json({
-      ok: true,
-      data: [
-        { name: '策略脚本 · Volume Order Block', file: 'test.pine', source: read('test.pine') },
-        { name: '指标脚本 · Signal Suite', file: 'test1.pine', source: read('test1.pine') },
-      ],
-    })
-  } catch (err) {
-    fail(res, err)
-  }
-})
-
 /* ------------------------------------------------------------------ */
 /* Pine 脚本本地保存                                                    */
 /* ------------------------------------------------------------------ */
 
-/** 已保存脚本列表（最近保存的在前）：GET /api/pine/scripts */
+/**
+ * 已保存脚本列表（最近保存的在前）：GET /api/pine/scripts
+ *
+ * **实时读盘**：每次请求都重新扫描 `server/pine/` 下的脚本目录并读源码，
+ * 不读也不写任何索引/缓存文件 —— 因此在 IDE 或 git 里改了 `.pine` 后，
+ * 前端刷新列表就能看到最新内容。
+ */
 apiRouter.get('/pine/scripts', (_req: Request, res: Response) => {
   try {
     res.json({ ok: true, data: listPineScripts() })
@@ -260,9 +244,8 @@ apiRouter.get('/pine/scripts', (_req: Request, res: Response) => {
 /**
  * 保存脚本：POST /api/pine/scripts  { name, source }
  *
- * 同名视为更新（就地覆盖），换名即新增；落盘位置：
+ * 同名视为更新（就地覆盖同一目录），换名即新增；落盘位置：
  *   server/pine/<脚本名目录>/<脚本名目录>.pine   原始源码
- * 另外在 .cache/pine-scripts.json 记一份索引，重启服务仍在。
  *
  * 注：改用 PineTS 后不再顺带写入编译产物（`<目录>.ts`）—— PineTS 在内存里
  * 直接转译，产物对前端与后端都没有用途。

@@ -50,7 +50,7 @@ export interface InstrumentResponse {
 }
 
 export async function fetchInstruments(exchange: ExchangeId, q?: string): Promise<InstrumentResponse> {
-  const params = new URLSearchParams({ exchange, limit: '500' })
+  const params = new URLSearchParams({ exchange, limit: '1000' })
   if (q) params.set('q', q)
   const res = await fetch(`/api/instruments?${params.toString()}`)
   const json = (await res.json()) as {
@@ -139,12 +139,6 @@ export interface PineCompileResult {
   ok: boolean
 }
 
-export interface PineExample {
-  name: string
-  file: string
-  source: string
-}
-
 /** 实时编译 Pine 源码，返回 TS 产物、诊断与元信息 */
 export async function compilePine(source: string, name?: string): Promise<PineCompileResult> {
   const res = await fetch('/api/pine/compile', {
@@ -185,14 +179,6 @@ export async function runPineBacktest(
     throw new Error(json.error ?? `回测失败（HTTP ${res.status}）`)
   }
   return json.data
-}
-
-/** 内置示例脚本（server/pine/*.pine） */
-export async function fetchPineExamples(): Promise<PineExample[]> {
-  const res = await fetch('/api/pine/examples')
-  const json = (await res.json()) as { ok: boolean; error?: string; data?: PineExample[] }
-  if (!json.ok) throw new Error(json.error ?? '获取示例脚本失败')
-  return json.data ?? []
 }
 
 /* ------------------------------------------------------------------ */

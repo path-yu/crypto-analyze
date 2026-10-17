@@ -114,8 +114,8 @@ export interface PineCompileMeta {
  *   Signal Suite.ts     编译器生成的 TypeScript
  * ```
  *
- * 索引另存于 `.cache/pine-scripts.json`（记录 id / 名称 / 时间 / 目录名）；
- * 索引丢失时会扫描 `server/pine/` 下的各脚本目录自动重建列表。
+ * 列表不依赖任何索引文件：服务端每次请求都实时扫描 `server/pine/` 下的脚本目录并读盘，
+ * 因此外部修改 `.pine` 后刷新列表即可看到最新内容（`id` 为 `dir:<目录名>`）。
  */
 export interface SavedPineScript {
   id: string

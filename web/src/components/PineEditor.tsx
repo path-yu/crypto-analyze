@@ -5,7 +5,6 @@ import AccordionSummary from '@mui/material/AccordionSummary'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
-import Chip from '@mui/material/Chip'
 import CircularProgress from '@mui/material/CircularProgress'
 import Divider from '@mui/material/Divider'
 import IconButton from '@mui/material/IconButton'
@@ -20,12 +19,12 @@ import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import FullscreenIcon from '@mui/icons-material/Fullscreen'
 import FullscreenExitIcon from '@mui/icons-material/FullscreenExit'
 import PlayArrowIcon from '@mui/icons-material/PlayArrow'
+import RefreshIcon from '@mui/icons-material/Refresh'
 import SaveIcon from '@mui/icons-material/Save'
 
 import type { PineCompileMeta, PineDiagnostic, SavedPineScript } from '@shared/types'
 import { compilePine } from '../api'
 import { pineSetup } from '../pineEditor'
-import { loadPineExamples, type PineExample } from '../pineExamples'
 import CodeMirrorEditor from './CodeMirrorEditor'
 
 /** Pine 面板状态与回调：由 App 持有，经 ControlPanel 透传到这里 */
@@ -46,6 +45,13 @@ export interface PinePanelState {
   onSave: () => Promise<SavedPineScript>
   /** 删除当前载入的已保存脚本 */
   onDelete: () => Promise<void>
+  /**
+   * 丢弃编辑器里的文本、从磁盘重新载入当前脚本。
+   *
+   * 编译与回测用的都是**编辑器里的文本**：在应用之外修改（或修复）了 .pine 后，
+   * 不重新载入编辑器就会一直用旧文本报旧错 —— 点这个按钮同步一次即可。
+   */
+  onReload: () => Promise<void>
   /**
    * 重新拉取已保存脚本列表。
    *
@@ -73,9 +79,9 @@ export default function PineEditor({
   onNameChange,
   scripts,
   selectedId,
-  onSelect,
   onSave,
   onDelete,
+  onReload,
   drawerOpen,
   onToggleDrawer,
   onRun,
@@ -90,19 +96,11 @@ export default function PineEditor({
   const [busy, setBusy] = useState(false)
   const [saveNote, setSaveNote] = useState<string | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
-
-  const [examples, setExamples] = useState<PineExample[]>([])
-
-  // 挂载时拉取内置示例（失败则回退到内联示例），渲染成一行可点的 chip
-  useEffect(() => {
-    let cancelled = false
-    void loadPineExamples().then((list) => {
-      if (!cancelled) setExamples(list)
-    })
-    return () => {
-      cancelled = true
-    }
-  }, [])
+  /**
+   * 「重新载入」的计数器：从磁盘取回的内容可能和当前源码完全相同，
+   * 光 setSource 不会触发重编译、旧报错也会一直挂着 —— 自增一次强制重跑校验。
+   */
+  const [reloadTick, setReloadTick] = useState(0)
 
   // 300ms 防抖：一边打字一边刷新诊断与脚本元信息
   useEffect(() => {
@@ -136,12 +134,11 @@ export default function PineEditor({
       cancelled = true
       clearTimeout(timer)
     }
-  }, [source])
+  }, [source, reloadTick])
 
   /**
-   * 保存：写穿到服务端 `server/pine/<目录>/` 下的 `.pine`（同名即更新，
-   * 索引记在 `.cache` 下）。改用 PineTS 后不再产出编译中间产物，
-   * 因此只落源码。
+   * 保存：写穿到服务端 `server/pine/<目录>/` 下的 `.pine`（同名即更新）。
+   * 改用 PineTS 后不再产出编译中间产物，因此只落源码。
    */
   const doSave = async () => {
     setBusy(true)
@@ -153,6 +150,29 @@ export default function PineEditor({
       setSaveNote(`已保存 · ${saved.pinePath ?? saved.name} · ${time}`)
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : '保存失败')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * 从磁盘重新载入：覆盖编辑器里的文本。
+   *
+   * 编译用的是编辑器里的文本，因此在应用之外修改（或修复）了 .pine 之后，
+   * 编辑器不会自动感知 —— 用它把服务端最新源码取回来。
+   */
+  const doReload = async () => {
+    setBusy(true)
+    setSaveNote(null)
+    setSaveError(null)
+    try {
+      await onReload()
+      // 内容可能与当前源码完全相同：自增一次强制重编译，顺带清掉残留的旧报错
+      setReloadTick((n) => n + 1)
+      const time = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+      setSaveNote(`已从磁盘重新载入 · ${time}`)
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : '重新载入失败')
     } finally {
       setBusy(false)
     }
@@ -209,7 +229,7 @@ export default function PineEditor({
         </Stack>
       </Stack>
 
-      {/* 全屏是为写长脚本服务的，提示条与示例 chip 会挤占高度，故仅非全屏时显示 */}
+      {/* 全屏是为写长脚本服务的，提示条会挤占高度，故仅非全屏时显示 */}
       {!drawerOpen && (
         <Alert severity="info" sx={{ mb: 1.25, py: 0 }}>
           <Typography variant="caption">
@@ -241,6 +261,19 @@ export default function PineEditor({
         >
           保存
         </Button>
+        <Tooltip
+          title={
+            selectedId
+              ? '丢弃编辑器里的文本，从磁盘重新载入这份脚本（应用外部修改过 .pine 时用）'
+              : '当前未载入已保存脚本'
+          }
+        >
+          <span>
+            <IconButton size="small" disabled={busy || !selectedId} onClick={() => void doReload()}>
+              <RefreshIcon fontSize="small" />
+            </IconButton>
+          </span>
+        </Tooltip>
         <Tooltip title={selectedId ? '删除这份已保存脚本' : '当前未载入已保存脚本'}>
           <span>
             <Button
@@ -263,28 +296,6 @@ export default function PineEditor({
         >
           {saveError ?? saveNote}
         </Typography>
-      )}
-
-      {!drawerOpen && examples.length > 0 && (
-        <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mb: 1.25 }}>
-          <Typography variant="caption" color="text.secondary">
-            载入示例
-          </Typography>
-          {examples.map((ex) => (
-            <Chip
-              key={ex.file}
-              size="small"
-              variant="outlined"
-              label={ex.name}
-              onClick={() => {
-                // 载入示例即与已保存脚本解绑，并以示例名作为新的脚本名，避免误覆盖
-                onSelect(null)
-                onNameChange(ex.name)
-                onSourceChange(ex.source)
-              }}
-            />
-          ))}
-        </Stack>
       )}
 
       <Box
