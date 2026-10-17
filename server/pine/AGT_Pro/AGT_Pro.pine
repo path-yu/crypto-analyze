@@ -12,7 +12,7 @@ strategy("AGTPro", overlay=true, max_bars_back=500, initial_capital=100000,
   commission_type=strategy.commission.percent, commission_value=0.055)
 
 // ---------------- 入场参数 ----------------
-notional = input.float(200.0, "单笔名义价值 USDT")
+notional = input.float(2000, "单笔名义价值 USDT")
 volMult  = input.float(14.0,  "成交量 / 96均量 ≥")
 brkLen   = input.int(50,      "突破 N 根新高")
 brkMin   = input.float(7.0,   "突破幅度 ≥ % (0=关)")

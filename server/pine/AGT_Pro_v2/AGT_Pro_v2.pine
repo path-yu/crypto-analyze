@@ -1,0 +1,129 @@
+//@version=6
+// AGT/USDT:USDT · 1h · 「趋势骑乘 v2：分档吊灯」版（AGT_Pro_v2）
+//
+// 【v1 的问题（实测复盘）】AGT 10-15 23:00 起爆（单根 +44%），10-16 00:00 开后冲到峰值
+// 0.0425，随后深回踩到 0.029282（自峰值 −31%），横盘后 10-17 又拉到 0.10479（自起爆 +376%）。
+// v1 的固定吊灯只吃到第一腿：10-16 00:00 入 0.022054 → 10-16 04:00 出 0.032269（+46.2%），
+// 之后错过 0.032 → 0.1048 的 +224%。把吊灯放宽到 25%/30% 同样活不过那根深回踩
+// （25% 出 0.031875、30% 出 0.029750，反而更差）—— 固定百分比对「一天涨几倍」的币天生太紧。
+//
+// 【v2 改动】**只动出场，入场逻辑一行不改**：浮盈峰值一旦 ≥ wideAfter（默认 40%），
+// 离场就从「固定回撤吊灯」切换成「收盘价跌破 ema20」—— 垂直拉升时 ema20 抬得很快，
+// 能扛住深回踩，趋势真转弱时才退出。切换后止损完全交由 ema20 接管（会随后续回落而放松），
+// 这是实测口径，未再叠加 max(stopPx, …)。
+//
+// 【实测（AGT 6 个月，其余参数不变）】交易 7 笔 → 7 笔（入场与整体交易序列完全一致）；
+// 收益 +376.9% → +646.6%；回撤 −17.8% → −24.7%；10-16 那笔 +46.2%（持 4 根）→ +173.0%（持 39 根，出 0.060243）。
+// 跨品种：AKE +325.2% → +447.5%（回撤 −9.0% → −27.2%）；BANK / Q 各仅 1 笔、未触发切换，结果不变。
+//
+// ⚠ wideAfter（40%）与 fastLen（20）是按这波行情标定的启发式阈值，换品种需重新验证；
+//   别把 +646% 当预期收益 —— BANK / Q 那种单笔 −24% 也是这套「除初始止损外无额外保护」的真实一面。
+//
+// 【入场侧：勿再改】三极端门槛（量 ≥96均量×14、收盘比前 50 根最高价高 7%、6 根涨幅 ≥16%）
+// 是「起爆瞬间」过滤器，天生一炮只响一次：起爆那根会自己顶高「前 50 根最高价」、摊高「96 均量」，
+// 于是延续段永远凑不齐三者（实测 10-17 07:00 / 08:00 突破达标但量能仅 5.3× / 7.8×；
+// 10-16 01:00 / 02:00 量能达标但突破为负）。往入场条件里加 or 分支会静默破坏原有信号
+// （实测退到 −36% 且 7 笔里丢 5 笔），不要再动。
+strategy("AGTProV2", overlay=true, max_bars_back=500, initial_capital=100000,
+  default_qty_type=strategy.fixed, default_qty_value=1,
+  commission_type=strategy.commission.percent, commission_value=0.055)
+
+// ---------------- 入场参数（与 v1 完全一致） ----------------
+notional = input.float(2000, "单笔名义价值 USDT")
+volMult  = input.float(14.0,  "成交量 / 96均量 ≥")
+brkLen   = input.int(50,      "突破 N 根新高")
+brkMin   = input.float(7.0,   "突破幅度 ≥ % (0=关)")
+impPct   = input.float(16.0,  "近6根涨幅 ≥ % (0=关)")
+
+// ---------------- 离场参数 ----------------
+// 组合依据（同尺寸 1000 名义、4 个品种实测）：
+//   · 保本 6%：浮盈摸到 +6% 就把止损抬到成本 —— 瀑布最多回到 0，不会倒亏；
+//     它只「保护」不「截断」，AGG 的大波段仍由吊灯吃完
+//   · 吊灯保持松：+20% 才激活、回撤 15% —— 收紧到 8%/6% 会把 AGT 的波段砍掉
+//     （同一批信号 +101.9% → +115.0% 但 AKE +174.6% → +85.8%，整体反而更差）
+//   · 止损位通过 plot("STOP") 透传给引擎做**盘中止损**，瀑布按止损价成交
+slPct    = input.float(12.0,  "初始止损 %")
+bePct    = input.float(0.0,   "保本触发 % (0=关)")
+tp1Pct   = input.float(0.0,   "分批止盈 % (0=关)")
+trailArm = input.float(20.0,  "吊灯激活所需浮盈 % (0=关)")
+trailPct = input.float(15.0,  "吊灯移动止损 %")
+maxBars  = input.int(120,     "时间止损 K线数")
+
+// v2 新增：分档吊灯 —— 浮盈峰值 ≥ wideAfter 后，离场改用「收盘跌破 ema(fastLen)」
+//   0 = 关闭该机制（退回 v1 的纯固定吊灯）
+wideAfter = input.float(40.0, "浮盈 ≥ % 后改用 EMA 离场 (0=关)")
+fastLen   = input.int(20,     "宽吊灯用的 EMA 周期")
+
+// ---------------- 指标 ----------------
+volMa  = ta.sma(volume, 96)
+volR   = volMa > 0 ? volume / volMa : 0
+imp    = close / close[6] - 1
+hiN    = ta.highest(high, brkLen)
+ema200 = ta.ema(close, 200)
+fastEma = ta.ema(close, fastLen)
+brkPct = hiN[1] > 0 ? (close / hiN[1] - 1) * 100 : 0
+
+plot(ta.sma(close, 20), color=color.orange)
+plot(ema200, color=color.green)
+plot(fastEma, color=color.blue, title="FastEMA")
+
+entryCond = volR >= volMult and brkPct >= brkMin and (impPct < 0.5 or imp >= impPct / 100)
+
+// ---------------- 状态（必须用 var）----------------
+var float stopPx  = 0.0
+var float entryPx = 0.0
+var float hiSince = 0.0
+var bool  armed   = false
+var bool  tp1Done = false
+var float heldN   = 0.0
+
+if (strategy.position_size <= 0)
+    stopPx := 0.0
+    entryPx := 0.0
+    hiSince := 0.0
+    armed := false
+    tp1Done := false
+    heldN := 0.0
+else
+    if (stopPx == 0)
+        // 新成交那一根：按成交均价初始化止损（止损从下一根起生效）
+        entryPx := strategy.position_avg_price
+        stopPx := entryPx * (1 - slPct / 100)
+        hiSince := high
+        armed := false
+        tp1Done := false
+        heldN := 0.0
+    else
+        // 1) 先用「上一根收盘时已确定」的止损 / 止盈判定离场
+        if (low <= stopPx)
+            strategy.close("P", comment="STOP " + str.tostring(close))
+            stopPx := 0.0
+        if (stopPx > 0 and tp1Pct > 0 and tp1Done == false and high >= entryPx * (1 + tp1Pct / 100))
+            strategy.close("P", qty_percent=50, comment="TP1 " + str.tostring(close))
+            tp1Done := true
+        if (stopPx > 0 and heldN >= maxBars and close <= entryPx)
+            strategy.close("P", comment="TIME " + str.tostring(close))
+            stopPx := 0.0
+        if (stopPx > 0 and close < ema200 and close < entryPx)
+            strategy.close("P", comment="TREND " + str.tostring(close))
+            stopPx := 0.0
+
+    // 2) 再用本根收盘信息更新止损，供下一根使用
+    hiSince := math.max(hiSince, high)
+    if (bePct > 0 and armed == false and high >= entryPx * (1 + bePct / 100))
+        armed := true
+    if (armed)
+        stopPx := math.max(stopPx, entryPx)
+    if (trailArm <= 0 or hiSince >= entryPx * (1 + trailArm / 100))
+        // v2：分档吊灯。浮盈峰值够大后，止损改由 ema(fastLen) 接管（不再叠加旧止损，故会放松）
+        peakGain = (hiSince / entryPx - 1) * 100
+        stopPx := wideAfter > 0 and peakGain >= wideAfter ? math.max(entryPx, fastEma) : math.max(stopPx, hiSince * (1 - trailPct / 100))
+    heldN := heldN + 1
+
+// 开仓（引擎在下一根开盘成交）
+if (strategy.position_size <= 0 and entryCond)
+    strategy.entry("P", strategy.long, qty=notional / close, comment="PUMP " + str.tostring(close))
+
+// 止损位输出：title 必须叫 STOP —— 适配器按这个名字把它接成引擎的盘中止损。
+// 空仓时 stopPx = 0，画 na 表示「本根没有止损」。
+plot(stopPx > 0 ? stopPx : na, title="STOP", color=color.red)
