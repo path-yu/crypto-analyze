@@ -36,6 +36,13 @@ export interface AlertEvaluation {
   value: number
   /** 写回运行期状态的补丁 */
   state: Partial<AlertRuntimeState>
+  /**
+   * Pine 类专用：本根 K 线上**实际命中**的信号方向（做多开仓 / 做空开仓 / 平仓）。
+   *
+   * `PineSignal` 只有布尔位、不含任何文字，所以「脚本里到底发生了什么」只能由信号位翻译。
+   * 提示信息据此把「Pine 任意信号」换成具体方向；非 Pine 类或该根无信号时为空。
+   */
+  signalNote?: string
   /** 判定失败的原因；有值时 `fire` 必为 false */
   error?: string
 }
@@ -182,6 +189,21 @@ export function pineScriptSource(id?: string): { id: string; name: string; sourc
   return { id: first.id, name: first.name, source: first.source }
 }
 
+/**
+ * 把一根 K 线上的脚本信号翻译成中文方向标签。
+ *
+ * `PineSignal` 只有 `canLong / canShort / forceClose` 三个布尔位（由脚本的券商账本折算而来），
+ * 脚本里的文字（`alertcondition` / `plotshape(..., text=…)`）既不逐 bar 绑定、多数脚本也没写，
+ * 所以「脚本里发生了什么」只能由这三个位描述；同根同时命中多个时用 ` + ` 连接。
+ */
+function pineDirectionLabel(sig: PineSignal): string {
+  const parts: string[] = []
+  if (sig.canLong) parts.push('做多开仓')
+  if (sig.canShort) parts.push('做空开仓')
+  if (sig.forceClose) parts.push('平仓')
+  return parts.join(' + ')
+}
+
 /** 判定单条警报 */
 export async function evaluateAlert(
   alert: PriceAlert,
@@ -303,6 +325,8 @@ export async function evaluateAlert(
     return {
       fire: baseline ? false : matched,
       value: candles[idx].close,
+      // 无论是否命中都带上方向：命中时进提示信息，「条件自测」也能看到这根到底出了什么信号
+      signalNote: pineDirectionLabel(sig),
       state: { ...baseState, lastBarTime: barTime, lastMatched: matched, lastValue: candles[idx].close },
     }
   } catch (err) {
@@ -319,24 +343,43 @@ export async function evaluateAlert(
 /* 提示信息渲染                                                        */
 /* ------------------------------------------------------------------ */
 
-/** 自动文案（用户没填提示信息时使用） */
-export function autoMessage(alert: PriceAlert, value: number): { title: string; body: string } {
+/**
+ * 自动文案（用户没填提示信息时使用）。
+ *
+ * Pine 类不走「警报名 · 条件标签」那套：条件标签固定是「Pine 任意信号」，看不出多空，
+ * 所以署名换成**脚本名**、并优先用本次实际命中的方向（`signalNote`）。
+ * 方向拿不到时（例如「测试推送」没有跑脚本）退回条件标签。
+ */
+export function autoMessage(
+  alert: PriceAlert,
+  value: number,
+  signalNote?: string,
+): { title: string; body: string } {
   const name = alert.name?.trim() || alert.symbol
-  const title = `${name} · ${describeAlertCondition(alert.condition)}`
-  const body = `${alert.symbol} 触发「${describeAlertCondition(alert.condition)}」，当前值 ${value}`
+  const cond = alert.condition
+  const scriptName = cond.kind.startsWith('pine')
+    ? pineScriptSource(cond.pineScriptId)?.name?.trim()
+    : undefined
+  const direction = signalNote?.trim()
+
+  const title = `${scriptName || name} · ${direction || describeAlertCondition(cond)}`
+  const body = direction
+    ? `${alert.symbol} 出现「${direction}」信号`
+    : `${alert.symbol} 触发「${describeAlertCondition(cond)}」，当前值 ${value}`
   return { title, body }
 }
 
 /**
  * 渲染提示信息：把 `{symbol}` `{price}` `{value}` `{name}` `{time}` `{condition}` 替换成实际值。
- * 未填写提示信息时回落到自动文案。
+ * 未填写提示信息时回落到自动文案（Pine 类会带上脚本名与实际信号方向，无需手填）。
  */
 export function renderMessage(
   alert: PriceAlert,
   value: number,
   at: number,
+  signalNote?: string,
 ): { title: string; body: string } {
-  const fallback = autoMessage(alert, value)
+  const fallback = autoMessage(alert, value, signalNote)
   const template = (alert.message ?? '').trim()
   if (!template) return fallback
 

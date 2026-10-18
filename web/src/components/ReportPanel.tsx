@@ -9,6 +9,7 @@ import Stack from '../ui/Stack'
 import Table from '@mui/material/Table'
 import TableBody from '@mui/material/TableBody'
 import TableCell from '@mui/material/TableCell'
+import TableContainer from '@mui/material/TableContainer'
 import TableHead from '@mui/material/TableHead'
 import TableRow from '@mui/material/TableRow'
 import Typography from '@mui/material/Typography'
@@ -24,10 +25,10 @@ import { UP_COLOR, DOWN_COLOR } from '../theme'
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <Paper sx={{ overflow: 'hidden' }}>
-      <Typography variant="subtitle2" sx={{ px: 2, py: 1.25, borderBottom: '1px solid', borderColor: 'divider' }}>
+      <Typography variant="subtitle2" sx={{ px: { xs: 1.5, sm: 2 }, py: 1.25, borderBottom: '1px solid', borderColor: 'divider' }}>
         {title}
       </Typography>
-      <Box sx={{ p: 2 }}>{children}</Box>
+      <Box sx={{ p: { xs: 1.5, sm: 2 } }}>{children}</Box>
     </Paper>
   )
 }
@@ -205,58 +206,61 @@ export default function ReportPanel({ result }: { result: BacktestResult }) {
 
       {result.trades.length > 0 && (
         <Section title={`全部交易明细（${result.trades.length} 笔）`}>
-          <Table size="small">
-            <TableHead>
-              <TableRow>
-                <TableCell>#</TableCell>
-                <TableCell align="center">方向</TableCell>
-                <TableCell>入场时间</TableCell>
-                <TableCell align="right">入场价</TableCell>
-                <TableCell>出场时间</TableCell>
-                <TableCell align="right">出场价</TableCell>
-                <TableCell align="right">止损</TableCell>
-                <TableCell align="right">TP1</TableCell>
-                <TableCell align="right">TP2</TableCell>
-                <TableCell align="right">价格变动</TableCell>
-                <TableCell align="right">净盈亏</TableCell>
-                <TableCell align="right">收益率</TableCell>
-                <TableCell align="center">原因</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {result.trades.map((t) => (
-                <TableRow key={t.id}>
-                  <TableCell>{t.id}</TableCell>
-                  <TableCell align="center" sx={{ color: t.side === 'long' ? UP_COLOR : DOWN_COLOR }}>
-                    {t.side === 'long' ? '多' : '空'}
-                  </TableCell>
-                  <TableCell>{dateTime(t.entryTime)}</TableCell>
-                  <TableCell align="right">{price(t.entryPrice)}</TableCell>
-                  <TableCell>{dateTime(t.exitTime)}</TableCell>
-                  <TableCell align="right">{price(t.exitPrice)}</TableCell>
-                  <TableCell align="right" sx={{ color: 'text.secondary' }}>
-                    {price(t.stopLoss)}
-                  </TableCell>
-                  <TableCell align="right" sx={{ color: 'text.secondary' }}>
-                    {price(t.takeProfit1)}
-                  </TableCell>
-                  <TableCell align="right" sx={{ color: 'text.secondary' }}>
-                    {price(t.takeProfit2)}
-                  </TableCell>
-                  <TableCell align="right" sx={{ color: t.priceChangePercent >= 0 ? UP_COLOR : DOWN_COLOR }}>
-                    {pct(t.priceChangePercent)}
-                  </TableCell>
-                  <TableCell align="right" sx={{ color: t.netPnl >= 0 ? UP_COLOR : DOWN_COLOR, fontWeight: 600 }}>
-                    {money(t.netPnl)}
-                  </TableCell>
-                  <TableCell align="right" sx={{ color: t.netPnl >= 0 ? UP_COLOR : DOWN_COLOR }}>
-                    {pct(t.pnlPercent)}
-                  </TableCell>
-                  <TableCell align="center">{EXIT_REASON_LABEL[t.exitReason] ?? t.exitReason}</TableCell>
+          {/* 列较多：窄屏下横向滚动，避免单元格被压扁 */}
+          <TableContainer sx={{ overflowX: 'auto' }}>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell>#</TableCell>
+                  <TableCell align="center">方向</TableCell>
+                  <TableCell>入场时间</TableCell>
+                  <TableCell align="right">入场价</TableCell>
+                  <TableCell>出场时间</TableCell>
+                  <TableCell align="right">出场价</TableCell>
+                  <TableCell align="right">止损</TableCell>
+                  <TableCell align="right">TP1</TableCell>
+                  <TableCell align="right">TP2</TableCell>
+                  <TableCell align="right">价格变动</TableCell>
+                  <TableCell align="right">净盈亏</TableCell>
+                  <TableCell align="right">收益率</TableCell>
+                  <TableCell align="center">原因</TableCell>
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+              </TableHead>
+              <TableBody>
+                {result.trades.map((t) => (
+                  <TableRow key={t.id}>
+                    <TableCell>{t.id}</TableCell>
+                    <TableCell align="center" sx={{ color: t.side === 'long' ? UP_COLOR : DOWN_COLOR }}>
+                      {t.side === 'long' ? '多' : '空'}
+                    </TableCell>
+                    <TableCell sx={{ whiteSpace: 'nowrap' }}>{dateTime(t.entryTime)}</TableCell>
+                    <TableCell align="right">{price(t.entryPrice)}</TableCell>
+                    <TableCell sx={{ whiteSpace: 'nowrap' }}>{dateTime(t.exitTime)}</TableCell>
+                    <TableCell align="right">{price(t.exitPrice)}</TableCell>
+                    <TableCell align="right" sx={{ color: 'text.secondary' }}>
+                      {price(t.stopLoss)}
+                    </TableCell>
+                    <TableCell align="right" sx={{ color: 'text.secondary' }}>
+                      {price(t.takeProfit1)}
+                    </TableCell>
+                    <TableCell align="right" sx={{ color: 'text.secondary' }}>
+                      {price(t.takeProfit2)}
+                    </TableCell>
+                    <TableCell align="right" sx={{ color: t.priceChangePercent >= 0 ? UP_COLOR : DOWN_COLOR }}>
+                      {pct(t.priceChangePercent)}
+                    </TableCell>
+                    <TableCell align="right" sx={{ color: t.netPnl >= 0 ? UP_COLOR : DOWN_COLOR, fontWeight: 600 }}>
+                      {money(t.netPnl)}
+                    </TableCell>
+                    <TableCell align="right" sx={{ color: t.netPnl >= 0 ? UP_COLOR : DOWN_COLOR }}>
+                      {pct(t.pnlPercent)}
+                    </TableCell>
+                    <TableCell align="center">{EXIT_REASON_LABEL[t.exitReason] ?? t.exitReason}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
         </Section>
       )}
 

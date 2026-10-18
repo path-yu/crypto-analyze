@@ -24,6 +24,7 @@ import { VelaWorkspace } from '@luxalgo/vela/workspace'
 import type { BacktestResult, Candle, Timeframe, Trade } from '@shared/types'
 import { TIMEFRAMES, TIMEFRAME_MS } from '@shared/types'
 import Stack from '../ui/Stack'
+import useIsMobile from '../ui/useIsMobile'
 import {
   TRADE_REPLAY_LAYER_ID,
   buildReplayLayerPayload,
@@ -74,6 +75,7 @@ interface Props {
  *     `KLinePanel` 的那套 payload 互不干扰。
  */
 export default function TradeReplayDialog({ open, trade, result, onClose }: Props) {
+  const isMobile = useIsMobile()
   const [timeframe, setTimeframe] = useState<Timeframe>(result?.report.timeframe ?? '1h')
   const [intervalMs, setIntervalMs] = useState(1000)
   const [candles, setCandles] = useState<Candle[]>([])
@@ -390,7 +392,7 @@ export default function TradeReplayDialog({ open, trade, result, onClose }: Prop
   const liveTone = (live?.netPnl ?? 0) >= 0 ? UP_COLOR : DOWN_COLOR
 
   return (
-    <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth>
+    <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth fullScreen={isMobile}>
       <DialogTitle sx={{ pr: 6 }}>
         <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap" useFlexGap>
           <Typography variant="subtitle1">

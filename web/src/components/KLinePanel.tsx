@@ -504,7 +504,14 @@ export default function KLinePanel({
         direction="row"
         alignItems="center"
         justifyContent="space-between"
-        sx={{ px: 2, py: 1.25, borderBottom: '1px solid', borderColor: 'divider', flexWrap: 'wrap', gap: 1 }}
+        sx={{
+          px: { xs: 1.5, sm: 2 },
+          py: 1.25,
+          borderBottom: '1px solid',
+          borderColor: 'divider',
+          flexWrap: 'wrap',
+          gap: 1,
+        }}
       >
         <Stack direction="row" alignItems="center" spacing={1.25}>
           <Typography variant="subtitle2">{`${symbol || '—'} · ${timeframe}`}</Typography>
@@ -579,7 +586,7 @@ export default function KLinePanel({
           flexWrap="wrap"
           useFlexGap
           sx={{
-            px: 2,
+            px: { xs: 1.5, sm: 2 },
             py: 0.6,
             borderBottom: '1px solid',
             borderColor: 'divider',
@@ -608,7 +615,7 @@ export default function KLinePanel({
       )}
 
       {markerCount > MAX_MARKERS && showTrades && (
-        <Box sx={{ px: 2, py: 0.5, bgcolor: 'action.hover' }}>
+        <Box sx={{ px: { xs: 1.5, sm: 2 }, py: 0.5, bgcolor: 'action.hover' }}>
           <Typography variant="caption" color="warning.main">
             交易笔数 {markerCount} 超过 {MAX_MARKERS}，为保证流畅已自动隐藏图上标注，可在「交易明细」中查看。
           </Typography>

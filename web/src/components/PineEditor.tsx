@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Accordion from '@mui/material/Accordion'
 import AccordionDetails from '@mui/material/AccordionDetails'
 import AccordionSummary from '@mui/material/AccordionSummary'
@@ -253,14 +253,14 @@ export default function PineEditor({
         </Alert>
       )}
 
-      <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
+      <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mb: 0.5 }}>
         <TextField
           size="small"
           label="脚本名"
           value={name}
           placeholder="保存后可从「策略」下拉菜单直接选择"
           onChange={(e) => onNameChange(e.target.value)}
-          sx={{ flex: 1 }}
+          sx={{ flex: 1, minWidth: { xs: '100%', sm: 160 } }}
           slotProps={{
             htmlInput: { maxLength: 60, style: { fontSize: 13 } },
             inputLabel: { shrink: true },

@@ -140,15 +140,22 @@ export default function TradesTable({
         direction="row"
         alignItems="center"
         justifyContent="space-between"
-        sx={{ px: 2, py: 1.25, borderBottom: '1px solid', borderColor: 'divider', flexWrap: 'wrap', gap: 1 }}
+        sx={{
+          px: { xs: 1.5, sm: 2 },
+          py: 1.25,
+          borderBottom: '1px solid',
+          borderColor: 'divider',
+          flexWrap: 'wrap',
+          gap: 1,
+        }}
       >
-        <Stack direction="row" spacing={1.5} alignItems="center">
+        <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap" useFlexGap>
           <Typography variant="subtitle2">历史交易记录</Typography>
           <Typography variant="caption" color="text.secondary">
             共 {filtered.length} 笔（总计 {result.trades.length} 笔）
           </Typography>
         </Stack>
-        <Stack direction="row" spacing={1.5} alignItems="center">
+        <Stack direction="row" spacing={1.5} alignItems="center" flexWrap="wrap" useFlexGap>
           <TextField
             select
             size="small"

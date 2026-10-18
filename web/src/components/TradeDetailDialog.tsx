@@ -19,6 +19,7 @@ import type { Trade } from '@shared/types'
 import { EXIT_REASON_LABEL, dateTime, money, num, pct, price } from '../utils/format'
 import { UP_COLOR, DOWN_COLOR } from '../theme'
 import Stack from '../ui/Stack'
+import useIsMobile from '../ui/useIsMobile'
 
 /**
  * 单笔交易明细弹窗。
@@ -39,8 +40,9 @@ export default function TradeDetailDialog({
   onClose: () => void
 }) {
   const detail = trade
+  const isMobile = useIsMobile()
   return (
-    <Dialog open={Boolean(detail)} onClose={onClose} maxWidth="md" fullWidth>
+    <Dialog open={Boolean(detail)} onClose={onClose} maxWidth="md" fullWidth fullScreen={isMobile}>
       <DialogTitle sx={{ pr: 6 }}>
         <Stack direction="row" alignItems="center" spacing={1} flexWrap="wrap" useFlexGap>
           <Typography variant="subtitle1">
@@ -118,11 +120,11 @@ export default function TradeDetailDialog({
                 共 {detail.fills.length} 笔减仓
               </Typography>
             </Stack>
-            <TableContainer sx={{ overflowX: 'hidden' }}>
+            <TableContainer sx={{ overflowX: { xs: 'auto', sm: 'hidden' } }}>
               <Table
                 size="small"
                 sx={{
-                  tableLayout: 'fixed',
+                  tableLayout: { xs: 'auto', sm: 'fixed' },
                   '& .MuiTableCell-root': { px: 0.75, py: 0.5, fontSize: 11.5 },
                   '& .MuiTableCell-root:first-of-type': { pl: 0 },
                   '& .MuiTableCell-root:last-of-type': { pr: 0 },

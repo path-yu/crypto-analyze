@@ -19,6 +19,10 @@ import Typography from '@mui/material/Typography'
 import ChevronRightIcon from '@mui/icons-material/ChevronRight'
 import InsightsIcon from '@mui/icons-material/Insights'
 import NotificationsActiveIcon from '@mui/icons-material/NotificationsActive'
+import PlayArrowIcon from '@mui/icons-material/PlayArrow'
+import TuneIcon from '@mui/icons-material/Tune'
+import CircularProgress from '@mui/material/CircularProgress'
+import useMediaQuery from '@mui/material/useMediaQuery'
 import { ThemeProvider } from '@mui/material/styles'
 
 import type {
@@ -55,6 +59,7 @@ import TradesTable from './components/TradesTable'
 import TradeDetailDialog from './components/TradeDetailDialog'
 import TradeReplayDialog from './components/TradeReplayDialog'
 import ReportPanel from './components/ReportPanel'
+import useIsMobile from './ui/useIsMobile'
 import { dateTime, humanizeError, money, num, pct } from './utils/format'
 
 type TabKey = 'chart' | 'equity' | 'analysis' | 'trades' | 'report'
@@ -81,6 +86,14 @@ const PANEL_MIN_W = 300
 const PANEL_MAX_W = 640
 /** 首次进入时的默认宽度 */
 const PANEL_DEFAULT_W = 380
+
+/**
+ * 实时 K 线推送（WebSocket）开关。
+ *
+ * 置 false 时只走 REST 拉取历史 K 线、不再订阅实时尾巴 —— 便于布局调试等场景
+ * 排除 WS 推流的干扰（WS 会在收盘时反复刷新图表）；默认开启。
+ */
+const REALTIME_WS_ENABLED = true
 
 /**
  * 把时间向下取整到 bar 边界。
@@ -202,10 +215,15 @@ export default function App() {
 
   /** 参数面板是否收起（收起时只显示一条窄轨） */
   const [panelCollapsed, setPanelCollapsed] = useState(false)
+  /** 移动端：参数面板以左侧抽屉弹出（桌面端为内嵌可拖拽列） */
+  const [mobilePanelOpen, setMobilePanelOpen] = useState(false)
   /** 参数面板宽度，由拖拽把手调节 */
   const [panelWidth, setPanelWidth] = useState(PANEL_DEFAULT_W)
   const [resizing, setResizing] = useState(false)
   const dragRef = useRef<{ x: number; w: number } | null>(null)
+  /** 顶栏元素与实测高度：移动端标签栏要吸在它正下方，高度得跟着实际渲染走 */
+  const appBarRef = useRef<HTMLElement | null>(null)
+  const [appBarH, setAppBarH] = useState(0)
 
   const expandPanel = useCallback(() => {
     setPanelWidth(PANEL_MAX_W)
@@ -384,6 +402,23 @@ export default function App() {
     void loadDataset()
   }, [loadDataset])
 
+  /**
+   * 实测顶栏高度。
+   *
+   * 移动端标签栏用 `top: 顶栏高度` 吸在顶栏正下方；顶栏高度不是固定值
+   * （加载进度条、字号、安全区都会让它变化），因此用 ResizeObserver 跟着量，
+   * 避免写死像素值后在进度条出现时被顶栏压住。
+   */
+  useEffect(() => {
+    const el = appBarRef.current
+    if (!el) return
+    const measure = () => setAppBarH(el.getBoundingClientRect().height)
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
   /** 供实时推送回调（不随渲染重建）触发一次「刷新」（含可选同步回测） */
   const loadDatasetRef = useRef(loadDataset)
   loadDatasetRef.current = loadDataset
@@ -443,6 +478,7 @@ export default function App() {
   /** 已见过的最后一根 bar 时间戳：WS 推出更晚的时间戳即代表「上一根已收盘」 */
   const lastBarTsRef = useRef(0)
   useEffect(() => {
+    if (!REALTIME_WS_ENABLED) return
     if (!chartData) return
     const { exchange: ex, symbol: sym, timeframe: tf } = chartData
     lastBarTsRef.current = chartData.candles[chartData.candles.length - 1]?.timestamp ?? 0
@@ -597,6 +633,47 @@ export default function App() {
 
   const themeMode = 'dark' as const
   const theme = useMemo(() => buildTheme(themeMode), [themeMode])
+  /** 移动端判定（< 900px）：参数面板走抽屉、图表区独占整屏 */
+  const isMobile = useIsMobile()
+  /**
+   * 宽屏两栏布局（≥ lg / 1200px）。
+   *
+   * 标签栏吸顶的 `top` 取决于「谁在滚动」：
+   *   · 宽屏：右侧结果区自身是滚动容器（overflowY: auto），标签栏贴它顶部即可；
+   *   · 窄屏 / 中屏：页面在滚动、顶栏吸在视口顶部，标签栏得贴在顶栏正下方。
+   */
+  const isWideLayout = useMediaQuery(theme.breakpoints.up('lg'))
+
+  /**
+   * 参数面板工厂：桌面端内嵌在左列、移动端放进左侧抽屉，两处控件完全一致
+   * （仅「收起」按钮的动作不同 —— 桌面收起成窄轨、移动关闭抽屉）。
+   */
+  const renderControlPanel = (onCollapse: () => void) => (
+    <ControlPanel
+      onCollapse={onCollapse}
+      exchange={exchange}
+      onExchangeChange={setExchange}
+      symbol={symbol}
+      onSymbolChange={setSymbol}
+      timeframe={timeframe}
+      onTimeframeChange={setTimeframe}
+      range={range}
+      onRangeChange={setRange}
+      customSince={customSince}
+      onCustomSinceChange={setCustomSince}
+      customUntil={customUntil}
+      onCustomUntilChange={setCustomUntil}
+      params={params}
+      onParamsChange={setParams}
+      onRun={handleRun}
+      loading={loading}
+      estimatedBars={estimatedBars}
+      syncBacktest={syncBacktest}
+      onSyncBacktestChange={setSyncBacktest}
+      pine={pine}
+      onTickSizeChange={setTickSize}
+    />
+  )
 
   const report = result?.report
   const strategyLabel = result ? STRATEGY_LABEL[result.meta.strategy] : ''
@@ -623,11 +700,15 @@ export default function App() {
           height: { xs: 'auto', lg: '100vh' },
           display: 'flex',
           flexDirection: 'column',
-          overflowX: 'hidden',
+          // 用 clip 而不是 hidden：`overflow-x: hidden` 会把 overflow-y 计算成 auto，
+          // 根容器因此变成滚动容器，顶部吸顶栏的 sticky 只能相对它生效 —— 它自身不滚动，
+          // 结果就是页面一滚顶栏跟着滑出视口。clip 不再创建滚动容器，sticky 才能贴住视口。
+          overflowX: 'clip',
           bgcolor: 'background.default',
         }}
       >
         <AppBar
+          ref={appBarRef}
           position="sticky"
           elevation={0}
           sx={{
@@ -638,50 +719,109 @@ export default function App() {
             color: 'text.primary',
           }}
         >
-          <Toolbar sx={{ gap: 2, flexWrap: 'wrap', py: 0.5 }}>
-            <Stack direction="row" alignItems="center" spacing={1.25}>
-              <InsightsIcon sx={{ color: 'primary.main' }} />
-              <Box>
-                <Typography variant="h6" sx={{ fontSize: 17, lineHeight: 1.2 }}>
+          <Toolbar
+            sx={{
+              gap: { xs: 1, sm: 2 },
+              flexWrap: 'nowrap',
+              py: 0.5,
+              px: { xs: 1.5, sm: 2 },
+            }}
+          >
+            <Stack direction="row" alignItems="center" spacing={1.25} sx={{ minWidth: 0, flexShrink: 1 }}>
+              <InsightsIcon sx={{ color: 'primary.main', display: { xs: 'none', sm: 'block' } }} />
+              <Box sx={{ minWidth: 0 }}>
+                <Typography variant="h6" noWrap sx={{ fontSize: { xs: 15, sm: 17 }, lineHeight: 1.2 }}>
                   {strategyTitle}
                 </Typography>
-                <Typography variant="caption" color="text.secondary">
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  noWrap
+                  sx={{ display: { xs: 'none', sm: 'block' } }}
+                >
                   ccxt 公开合约行情 · TypeScript 回测引擎 · Vela 可视化
                 </Typography>
               </Box>
             </Stack>
             <Box sx={{ flex: 1 }} />
-            <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-              <Tooltip title="为合约添加实时价格警报，支持电报机器人与网页通知推送">
-                <Button
-                  size="small"
-                  variant="outlined"
-                  startIcon={<NotificationsActiveIcon />}
-                  onClick={() => setAlertPanelOpen(true)}
-                >
-                  价格警报
-                </Button>
-              </Tooltip>
-              <Chip size="small" label={headline} variant="outlined" />
-              {report && (
+            <Stack direction="row" spacing={1} alignItems="center">
+              {/* 移动端：参数面板入口（抽屉）+ 快捷回测；桌面端这两个按钮让位给信息 Chip */}
+              {isMobile && (
                 <>
-                  <Chip
+                  <Tooltip title="回测参数 / 行情设置">
+                    <IconButton
+                      size="small"
+                      color="inherit"
+                      aria-label="打开回测参数面板"
+                      onClick={() => setMobilePanelOpen(true)}
+                    >
+                      <TuneIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
+                  <Button
                     size="small"
-                    label={`收益 ${pct(report.totalReturnPercent)}`}
-                    sx={{
-                      color: report.totalReturnPercent >= 0 ? UP_COLOR : DOWN_COLOR,
-                      borderColor: 'currentColor',
-                    }}
-                    variant="outlined"
-                  />
-                  <Chip
-                    size="small"
-                    label={`回撤 ${pct(report.maxDrawdownPercent, 1, false)}`}
-                    variant="outlined"
-                  />
-                  <Chip size="small" label={`${report.stats.totalTrades} 笔`} variant="outlined" />
+                    variant="contained"
+                    startIcon={
+                      loading ? <CircularProgress size={14} color="inherit" /> : <PlayArrowIcon fontSize="small" />
+                    }
+                    disabled={loading}
+                    onClick={handleRun}
+                  >
+                    回测
+                  </Button>
                 </>
               )}
+              <Tooltip title="为合约添加实时价格警报，支持电报机器人与网页通知推送">
+                {isMobile ? (
+                  // 移动端：与「参数」保持一致的纯图标按钮（给足点击区域，避免空按钮）
+                  <IconButton
+                    size="small"
+                    color="inherit"
+                    aria-label="价格警报"
+                    onClick={() => setAlertPanelOpen(true)}
+                  >
+                    <NotificationsActiveIcon fontSize="small" />
+                  </IconButton>
+                ) : (
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    startIcon={<NotificationsActiveIcon />}
+                    onClick={() => setAlertPanelOpen(true)}
+                  >
+                    价格警报
+                  </Button>
+                )}
+              </Tooltip>
+              <Stack
+                direction="row"
+                spacing={1}
+                alignItems="center"
+                sx={{ display: { xs: 'none', sm: 'flex' } }}
+                flexWrap="wrap"
+                useFlexGap
+              >
+                <Chip size="small" label={headline} variant="outlined" />
+                {report && (
+                  <>
+                    <Chip
+                      size="small"
+                      label={`收益 ${pct(report.totalReturnPercent)}`}
+                      sx={{
+                        color: report.totalReturnPercent >= 0 ? UP_COLOR : DOWN_COLOR,
+                        borderColor: 'currentColor',
+                      }}
+                      variant="outlined"
+                    />
+                    <Chip
+                      size="small"
+                      label={`回撤 ${pct(report.maxDrawdownPercent, 1, false)}`}
+                      variant="outlined"
+                    />
+                    <Chip size="small" label={`${report.stats.totalTrades} 笔`} variant="outlined" />
+                  </>
+                )}
+              </Stack>
             </Stack>
           </Toolbar>
           {(loading || chartLoading) && <LinearProgress />}
@@ -693,132 +833,92 @@ export default function App() {
             minHeight: 0,
             display: 'flex',
             flexDirection: { xs: 'column', lg: 'row' },
-            gap: { xs: 2, lg: 0 },
-            px: { xs: 2, lg: 3 },
-            py: 2,
+            gap: { xs: 0, lg: 0 },
+            px: { xs: 1.5, sm: 2, lg: 3 },
+            py: { xs: 1.5, sm: 2 },
           }}
         >
-          {/* ---------- 左：参数面板（可收起 / 可拖拽宽度 / 独立滚动） ---------- */}
-          <Box
-            sx={{
-              width: { xs: '100%', lg: panelCollapsed ? PANEL_RAIL_W : panelWidth },
-              flexShrink: 0,
-              minWidth: 0,
-              height: { lg: '100%' },
-              overflowY: { lg: panelCollapsed ? 'hidden' : 'auto' },
-              overflowX: 'hidden',
-              transition: resizing ? 'none' : 'width .2s ease',
-            }}
-          >
-            {panelCollapsed && (
-              <Paper
+          {/* ---------- 左：参数面板（仅桌面端内嵌可拖拽；移动端见下方 Drawer） ---------- */}
+          {!isMobile && (
+            <>
+              <Box
                 sx={{
-                  p: { xs: 1, lg: 0.5 },
-                  display: 'flex',
-                  flexDirection: { xs: 'row', lg: 'column' },
-                  alignItems: 'center',
-                  gap: 1,
+                  width: panelCollapsed ? PANEL_RAIL_W : panelWidth,
+                  flexShrink: 0,
+                  minWidth: 0,
+                  height: '100%',
+                  overflowY: panelCollapsed ? 'hidden' : 'auto',
+                  overflowX: 'hidden',
+                  transition: resizing ? 'none' : 'width .2s ease',
                 }}
               >
-                <Tooltip title="展开参数面板" placement="right">
-                  <IconButton size="small" onClick={expandPanel}>
-                    <ChevronRightIcon fontSize="small" />
-                  </IconButton>
-                </Tooltip>
-                <Typography
-                  variant="caption"
+                {panelCollapsed && (
+                  <Paper
+                    sx={{
+                      p: 0.5,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      gap: 1,
+                    }}
+                  >
+                    <Tooltip title="展开参数面板" placement="right">
+                      <IconButton size="small" onClick={expandPanel}>
+                        <ChevronRightIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                    <Typography
+                      variant="caption"
+                      sx={{
+                        writingMode: 'vertical-rl',
+                        letterSpacing: 2,
+                        color: 'text.secondary',
+                      }}
+                    >
+                      参数面板
+                    </Typography>
+                  </Paper>
+                )}
+
+                {/* 收起时仅隐藏（保留挂载状态，避免重挂载后重新拉取合约列表） */}
+                <Box sx={{ display: panelCollapsed ? 'none' : 'block', width: panelWidth }}>
+                  {renderControlPanel(() => setPanelCollapsed(true))}
+                </Box>
+              </Box>
+
+              {/* ---------- 拖拽把手：调节面板宽度 ---------- */}
+              {!panelCollapsed && (
+                <Box
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="拖拽调整参数面板宽度"
+                  onPointerDown={handleResizeStart}
+                  onPointerMove={handleResizeMove}
+                  onPointerUp={handleResizeEnd}
+                  onPointerCancel={handleResizeEnd}
                   sx={{
-                    display: { xs: 'none', lg: 'block' },
-                    writingMode: 'vertical-rl',
-                    letterSpacing: 2,
-                    color: 'text.secondary',
+                    flexShrink: 0,
+                    width: 10,
+                    cursor: 'col-resize',
+                    touchAction: 'none',
+                    position: 'relative',
+                    '&::after': {
+                      content: '""',
+                      position: 'absolute',
+                      top: 0,
+                      bottom: 0,
+                      left: '50%',
+                      transform: 'translateX(-50%)',
+                      width: 2,
+                      borderRadius: 1,
+                      bgcolor: resizing ? 'primary.main' : 'divider',
+                      transition: 'background-color .15s',
+                    },
+                    '&:hover::after': { bgcolor: 'primary.main' },
                   }}
-                >
-                  参数面板
-                </Typography>
-              </Paper>
-            )}
-
-            {/* 收起时仅隐藏（保留挂载状态，避免重挂载后重新拉取合约列表） */}
-            <Box sx={{ display: panelCollapsed ? 'none' : 'block', width: panelWidth }}>
-              <ControlPanel
-                onCollapse={() => setPanelCollapsed(true)}
-                exchange={exchange}
-                onExchangeChange={setExchange}
-                symbol={symbol}
-                onSymbolChange={setSymbol}
-                timeframe={timeframe}
-                onTimeframeChange={setTimeframe}
-                range={range}
-                onRangeChange={setRange}
-                customSince={customSince}
-                onCustomSinceChange={setCustomSince}
-                customUntil={customUntil}
-                onCustomUntilChange={setCustomUntil}
-                params={params}
-                onParamsChange={setParams}
-                onRun={handleRun}
-                loading={loading}
-                estimatedBars={estimatedBars}
-                syncBacktest={syncBacktest}
-                onSyncBacktestChange={setSyncBacktest}
-                pine={pine}
-                onTickSizeChange={setTickSize}
-              />
-            </Box>
-
-            {/* ---------- Pine 放大编辑：右侧 Drawer（不占面板宽度，跨过图表区） ---------- */}
-            <Drawer
-              anchor="right"
-              open={pineDrawerOpen}
-              onClose={togglePineDrawer}
-              slotProps={{
-                paper: {
-                  sx: {
-                    width: { xs: '100%', md: '80vw' },
-                    maxWidth: 1200,
-                    p: 2,
-                    boxSizing: 'border-box',
-                  },
-                },
-              }}
-            >
-              <PineEditor {...pine} onRun={handleRun} loading={loading} />
-            </Drawer>
-          </Box>
-
-          {/* ---------- 拖拽把手：调节面板宽度 ---------- */}
-          {!panelCollapsed && (
-            <Box
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="拖拽调整参数面板宽度"
-              onPointerDown={handleResizeStart}
-              onPointerMove={handleResizeMove}
-              onPointerUp={handleResizeEnd}
-              onPointerCancel={handleResizeEnd}
-              sx={{
-                display: { xs: 'none', lg: 'block' },
-                flexShrink: 0,
-                width: 10,
-                cursor: 'col-resize',
-                touchAction: 'none',
-                position: 'relative',
-                '&::after': {
-                  content: '""',
-                  position: 'absolute',
-                  top: 0,
-                  bottom: 0,
-                  left: '50%',
-                  transform: 'translateX(-50%)',
-                  width: 2,
-                  borderRadius: 1,
-                  bgcolor: resizing ? 'primary.main' : 'divider',
-                  transition: 'background-color .15s',
-                },
-                '&:hover::after': { bgcolor: 'primary.main' },
-              }}
-            />
+                />
+              )}
+            </>
           )}
 
           {/* ---------- 右：回测结果（独立滚动） ---------- */}
@@ -853,10 +953,21 @@ export default function App() {
                 </Alert>
               )}
 
-              {/* 统计卡片：无回测结果时各卡显示「—」，保持布局稳定 */}
-              <KpiCards report={report ?? null} />
+              {/* 统计卡片：无回测结果时各卡显示「—」，保持布局稳定。
+                  移动端置于图表之后 —— 首屏先看到 K 线，避免十几张统计卡把图表挤出视口 */}
+              {!isMobile && <KpiCards report={report ?? null} />}
 
-              <Paper sx={{ overflow: 'hidden' }}>
+              <Paper
+                sx={{
+                  overflow: 'hidden',
+                  // 标签栏（K 线与交易 / 收益分析 / 交易分析 / 交易明细 / 回测报告）吸顶：
+                  // 滚动长内容时不必再滚回顶部切页签。
+                  // zIndex 低于顶栏：窄屏下它吸在顶栏正下方，不能被顶栏压住。
+                  position: 'sticky',
+                  top: isWideLayout ? 0 : appBarH,
+                  zIndex: (t) => t.zIndex.appBar - 1,
+                }}
+              >
                 <Tabs
                   value={tab}
                   onChange={(_e, v: TabKey) => setTab(v)}
@@ -888,6 +999,8 @@ export default function App() {
                   onSelectTrade={setDetailTrade}
                   onIndicatorInputsChange={applyIndicatorInputs}
                   onRefresh={() => void loadDataset(true)}
+                  // 移动端给一个贴合一屏的高度，避免图表把结果区顶得过长
+                  height={isMobile ? 360 : undefined}
                 />
               )}
 
@@ -907,12 +1020,14 @@ export default function App() {
                   </>
                 ) : (
                   !loading && (
-                    <Paper sx={{ p: 6, textAlign: 'center' }}>
+                    <Paper sx={{ p: { xs: 3, sm: 6 }, textAlign: 'center' }}>
                       <Typography variant="h6" sx={{ mb: 1 }}>
                         还没有回测结果
                       </Typography>
                       <Typography variant="body2" color="text.secondary">
-                        点左侧「开始回测」运行一次，或勾选「同步进行回测」让切换行情设置时自动回测。
+                        {isMobile
+                          ? '点右上角「回测」运行一次，或打开「参数」面板勾选「同步进行回测」。'
+                          : '点左侧「开始回测」运行一次，或勾选「同步进行回测」让切换行情设置时自动回测。'}
                       </Typography>
                     </Paper>
                   )
@@ -928,6 +1043,9 @@ export default function App() {
                 result={result}
                 onClose={() => setReplayTrade(null)}
               />
+
+              {/* 移动端统计卡片：图表/结果区之后 */}
+              {isMobile && <KpiCards report={report ?? null} />}
 
               {report && (
                 <Paper sx={{ p: 1.75 }}>
@@ -955,6 +1073,43 @@ export default function App() {
             </Stack>
           </Box>
         </Box>
+
+        {/* ---------- 移动端：回测参数（左侧抽屉；桌面端为内嵌左列） ---------- */}
+        {isMobile && (
+          <Drawer
+            anchor="left"
+            open={mobilePanelOpen}
+            onClose={() => setMobilePanelOpen(false)}
+            // 常驻挂载：关闭抽屉时保留面板状态，避免每次打开都重新拉取合约列表
+            keepMounted
+            slotProps={{
+              paper: {
+                sx: { width: '100%', maxWidth: 480, boxSizing: 'border-box' },
+              },
+            }}
+          >
+            {renderControlPanel(() => setMobilePanelOpen(false))}
+          </Drawer>
+        )}
+
+        {/* ---------- Pine 放大编辑：右侧 Drawer（不占面板宽度，跨过图表区） ---------- */}
+        <Drawer
+          anchor="right"
+          open={pineDrawerOpen}
+          onClose={togglePineDrawer}
+          slotProps={{
+            paper: {
+              sx: {
+                width: { xs: '100%', md: '80vw' },
+                maxWidth: 1200,
+                p: { xs: 1.5, sm: 2 },
+                boxSizing: 'border-box',
+              },
+            },
+          }}
+        >
+          <PineEditor {...pine} onRun={handleRun} loading={loading} />
+        </Drawer>
 
         {/* ---------- 价格警报：管理面板（右侧 Drawer） ---------- */}
         <AlertPanel

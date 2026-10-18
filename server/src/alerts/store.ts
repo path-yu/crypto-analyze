@@ -396,7 +396,7 @@ export function setAlertEnabled(id: string, enabled: boolean): PriceAlert | null
   alert.enabled = enabled
   alert.updatedAt = Date.now()
   // 重新启用时清掉上次的错误，避免旧错误一直挂在界面上
-  if (enabled) alert.state = { ...alert.state, lastError: undefined }
+  if (enabled) alert.state = { ...alert.state, lastError: undefined, lastPushError: undefined }
   flushAlertsNow()
   return alert
 }
@@ -437,11 +437,36 @@ export function getSettings(): AlertSettings {
   return load().settings
 }
 
+/**
+ * 清掉所有警报上「上一次推送失败」的痕迹，返回是否真的改动过。
+ *
+ * `state.lastPushError` 记录的是**上一次触发**的推送结果，本身不会因为之后改了配置而失效；
+ * 若用户先触发（当时电报没开）再回来打开电报，面板上就会一直挂着一句与当前配置矛盾的
+ * 「全局 Telegram 推送未启用」。配置一动，旧原因即失效，这里统一清掉，等下次真实触发重写。
+ */
+function clearPushErrors(): boolean {
+  let touched = false
+  for (const a of state.alerts) {
+    if (a.state.lastPushError !== undefined) {
+      a.state = { ...a.state, lastPushError: undefined }
+      touched = true
+    }
+  }
+  return touched
+}
+
 export function updateSettings(patch: unknown): AlertSettings {
   const s = load()
   const merged = normalizeSettings({ ...s.settings, ...((patch ?? {}) as object) })
   s.settings = merged
   writeJson(fileOf('settings'), merged)
+
+  // 保存设置 = 用户重新确认了一遍推送配置。各警报上那条「上一次推送为什么没发出去」
+  // 记录的是**旧配置下的一次尝试**，此刻已成历史；不回登记本，它就会一直挂在面板上
+  // 与当前配置打架（典型现象：「明明配好了电报，却还报全局未启用」）。
+  // 清掉即可 —— 若配置本身仍有问题，下一次真实触发会把新的原因重新写回来。
+  if (clearPushErrors()) flushAlertsNow()
+
   return merged
 }
 

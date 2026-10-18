@@ -309,7 +309,7 @@ export default function ControlPanel({
   }
 
   return (
-    <Paper sx={{ p: 2 }}>
+    <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
       <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1 }}>
         <Typography variant="subtitle1" sx={{ fontSize: 15, fontWeight: 700 }}>
           回测参数

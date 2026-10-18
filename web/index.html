@@ -19,6 +19,9 @@
         font-family: 'Inter', 'PingFang SC', 'Microsoft YaHei', system-ui, -apple-system,
           'Segoe UI', Roboto, sans-serif;
         background: #0b0e14;
+        /* 移动端：禁止系统字体缩放导致的布局错位，并去掉点击高亮 */
+        -webkit-text-size-adjust: 100%;
+        -webkit-tap-highlight-color: transparent;
       }
       /* 细滚动条，避免破坏深色界面观感 */
       ::-webkit-scrollbar {

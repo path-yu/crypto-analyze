@@ -92,6 +92,7 @@ import {
   updateAlertSettings,
 } from '../api'
 import { dateTime, humanizeError, price as fmtPrice } from '../utils/format'
+import useIsMobile from '../ui/useIsMobile'
 
 interface Props {
   open: boolean
@@ -200,6 +201,7 @@ export default function AlertPanel({
   defaultSymbol,
   defaultTimeframe,
 }: Props) {
+  const isMobile = useIsMobile()
   const [overview, setOverview] = useState<AlertOverview | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -470,7 +472,7 @@ export default function AlertPanel({
         paper: {
           sx: {
             width: { xs: '100%', md: 'min(1040px, 92vw)' },
-            p: 2.5,
+            p: { xs: 1.5, sm: 2.5 },
             boxSizing: 'border-box',
           },
         },
@@ -623,7 +625,7 @@ export default function AlertPanel({
                 />
                 <TextField
                   size="small"
-                  sx={{ minWidth: 300 }}
+                  sx={{ minWidth: { xs: '100%', sm: 300 }, flex: { xs: '1 1 100%', sm: '1 1 auto' } }}
                   label="Bot Token"
                   placeholder="123456:ABC-DEF..."
                   value={settingsDraft?.telegram.botToken ?? ''}
@@ -632,7 +634,7 @@ export default function AlertPanel({
                 />
                 <TextField
                   size="small"
-                  sx={{ minWidth: 200 }}
+                  sx={{ minWidth: { xs: '100%', sm: 200 }, flex: { xs: '1 1 100%', sm: '1 1 auto' } }}
                   label="Chat ID"
                   placeholder="-1001234567890"
                   value={settingsDraft?.telegram.chatId ?? ''}
@@ -879,7 +881,7 @@ export default function AlertPanel({
       </Accordion>
 
       {/* ---------------- 新建 / 编辑弹窗 ---------------- */}
-      <Dialog open={draft !== null} onClose={() => setDraft(null)} maxWidth="md" fullWidth>
+      <Dialog open={draft !== null} onClose={() => setDraft(null)} maxWidth="md" fullWidth fullScreen={isMobile}>
         <DialogTitle>{draft?.id ? '编辑价格警报' : '新建价格警报'}</DialogTitle>
         <DialogContent dividers>
           {draft && (

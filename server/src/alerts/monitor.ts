@@ -177,7 +177,7 @@ async function evaluateAndPush(
         continue
       }
 
-      const { title, body } = renderMessage(alert, ev.value, now)
+      const { title, body } = renderMessage(alert, ev.value, now, ev.signalNote)
       // 必须先落状态再推送：state 落在内存里（同步生效），而 dispatchAlert 要等电报
       // HTTP 往返；若等推完才写 lastBarTime / lastTriggeredAt，并发的另一条路径会读到
       // 旧状态，把同一根 K 线重复推一遍，冷却也拦不住。

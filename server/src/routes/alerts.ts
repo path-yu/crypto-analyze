@@ -202,7 +202,7 @@ alertsRouter.post('/:id/test', async (req: Request, res: Response) => {
         matched: ev.fire,
         value: ev.value,
         error: ev.error,
-        summary: renderMessage(alert, ev.value, Date.now()),
+        summary: renderMessage(alert, ev.value, Date.now(), ev.signalNote),
       },
     })
   } catch (err) {
