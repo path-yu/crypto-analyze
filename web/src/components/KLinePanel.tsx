@@ -48,15 +48,22 @@ const VELA_TIMEFRAME: Record<Timeframe, string> = {
   '1w': '1W',
 }
 
-/** 与改造前 klinecharts 一致的配色（国内习惯：红涨绿跌） */
-const VELA_THEME = {
-  background: '#0e121b',
-  textColor: '#8a94a6',
-  gridColor: 'rgba(255,255,255,0.06)',
-  borderColor: 'rgba(255,255,255,0.15)',
-  upColor: '#ff4d4f',
-  downColor: '#3ddc97',
-  fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif',
+/**
+ * Vela 画布（K 线本体）的配色。
+ *
+ * 用函数而不是常量：涨跌色是可变绑定（见 theme.ts 的 applyToneScheme），
+ * 建图时现取一次即可 —— 重建图表后新的涨跌色立即生效。
+ */
+export function velaTheme() {
+  return {
+    background: '#0e121b',
+    textColor: '#8a94a6',
+    gridColor: 'rgba(255,255,255,0.06)',
+    borderColor: 'rgba(255,255,255,0.15)',
+    upColor: UP_COLOR,
+    downColor: DOWN_COLOR,
+    fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif',
+  }
 }
 
 const MAX_MARKERS = 1200
@@ -277,9 +284,9 @@ export default function KLinePanel({
         data: velaData,
         symbol,
         timeframe: VELA_TIMEFRAME[timeframe] ?? '60',
-        theme: VELA_THEME,
-        upColor: VELA_THEME.upColor,
-        downColor: VELA_THEME.downColor,
+        theme: velaTheme(),
+        upColor: UP_COLOR,
+        downColor: DOWN_COLOR,
         timezone: 'Asia/Shanghai',
         // 内嵌场景：顶层 chrome 全部关掉，只保留 Vela 自己的署名水印
         topbar: { left: [], right: [] },
@@ -641,7 +648,7 @@ export default function KLinePanel({
   )
 }
 
-export { klineAxisTime, VELA_TIMEFRAME, VELA_THEME }
+export { klineAxisTime, VELA_TIMEFRAME }
 
 /** 预留：把本项目的数据源做成 Vela Provider 时用（当前走离线 `data`，无需网络） */
 export type VelaProviderFactory = () => DataProvider

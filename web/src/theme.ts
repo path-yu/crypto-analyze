@@ -52,14 +52,63 @@ export const lightChartPalette: ChartPalette = {
   muted: '#9aa4b8',
 }
 
+/** 涨跌配色方案：国内习惯「红涨绿跌」为默认，可切到国际习惯「绿涨红跌」 */
+export type ToneScheme = 'red-up' | 'green-up'
+
+const TONE_SCHEME_KEY = 'crypto-tone-scheme'
+
 /**
- * 中国市场约定：涨 = 红，跌 = 绿。
- * 用于 K 线、盈亏数字与图表。
+ * 涨跌色是**模块级可变绑定**（`let` 导出），不是常量。
+ *
+ * 组件里成百处 `sx={{ color: UP_COLOR }}`、recharts 的 `fill`、以及 Vela 画布的
+ * `upColor` 都直接读它；切换配色时把子树重挂载一次，所有读取点就都拿到新值 ——
+ * 不必把颜色改造成 context 再逐个组件改造。
  */
-export const UP_COLOR = '#ff4d4f'
-export const DOWN_COLOR = '#3ddc97'
-export const UP_COLOR_LIGHT = '#d9363e'
-export const DOWN_COLOR_LIGHT = '#12855c'
+export let UP_COLOR = '#ff4d4f'
+export let DOWN_COLOR = '#3ddc97'
+export let UP_COLOR_LIGHT = '#d9363e'
+export let DOWN_COLOR_LIGHT = '#12855c'
+
+/** 当前生效的配色方案（文案里要用到「红涨绿跌 / 绿涨红跌」时读它） */
+let toneScheme: ToneScheme = 'red-up'
+
+export function getToneScheme(): ToneScheme {
+  return toneScheme
+}
+
+export function readToneScheme(): ToneScheme {
+  try {
+    return localStorage.getItem(TONE_SCHEME_KEY) === 'green-up' ? 'green-up' : 'red-up'
+  } catch {
+    return 'red-up'
+  }
+}
+
+/**
+ * 切换涨跌配色并落盘。
+ *
+ * 顺带把图表调色板里的 `profit` / `loss` 也改掉 —— 它们就是「盈 = 涨色、亏 = 跌色」，
+ * 保证金曲线、月度盈亏柱状图等 recharts 图形直接读这两个字段。
+ */
+export function applyToneScheme(scheme: ToneScheme, persist = true): void {
+  const greenUp = scheme === 'green-up'
+  toneScheme = scheme
+  UP_COLOR = greenUp ? '#3ddc97' : '#ff4d4f'
+  DOWN_COLOR = greenUp ? '#ff4d4f' : '#3ddc97'
+  UP_COLOR_LIGHT = greenUp ? '#12855c' : '#d9363e'
+  DOWN_COLOR_LIGHT = greenUp ? '#d9363e' : '#12855c'
+  darkChartPalette.profit = UP_COLOR
+  darkChartPalette.loss = DOWN_COLOR
+  lightChartPalette.profit = UP_COLOR_LIGHT
+  lightChartPalette.loss = DOWN_COLOR_LIGHT
+  if (persist) {
+    try {
+      localStorage.setItem(TONE_SCHEME_KEY, scheme)
+    } catch {
+      // 隐私模式 / 存储被禁用：记不住偏好，但本次会话照常生效
+    }
+  }
+}
 
 export function buildTheme(mode: 'dark' | 'light'): Theme {
   const isDark = mode === 'dark'
@@ -68,8 +117,10 @@ export function buildTheme(mode: 'dark' | 'light'): Theme {
       mode,
       primary: { main: isDark ? '#5b8cff' : '#2f6bde' },
       secondary: { main: isDark ? '#ffb01f' : '#c47f00' },
-      success: { main: isDark ? DOWN_COLOR : DOWN_COLOR_LIGHT },
-      error: { main: isDark ? UP_COLOR : UP_COLOR_LIGHT },
+      // success / error 是通用的语义色（成功绿、错误红），与涨跌方向无关：
+      // 这里写死，否则切到「绿涨红跌」之后错误提示会变成绿色
+      success: { main: isDark ? '#3ddc97' : '#12855c' },
+      error: { main: isDark ? '#ff4d4f' : '#d9363e' },
       background: {
         default: isDark ? '#0b0e14' : '#f4f6fa',
         paper: isDark ? '#131824' : '#ffffff',
@@ -139,3 +190,9 @@ export function buildTheme(mode: 'dark' | 'light'): Theme {
     },
   })
 }
+
+/**
+ * 模块加载时先按已存偏好应用一次 —— 必须在任何组件渲染之前生效，
+ * 否则首屏会先按默认配色画一遍、再被切过来（闪色）。
+ */
+applyToneScheme(readToneScheme(), false)

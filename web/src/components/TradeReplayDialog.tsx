@@ -31,7 +31,7 @@ import {
   registerTradeReplayVisuals,
   setTradeReplayPayload,
 } from '../charts/tradeMarkersLayer'
-import { VELA_THEME, VELA_TIMEFRAME } from './KLinePanel'
+import { velaTheme, VELA_TIMEFRAME } from './KLinePanel'
 import { installVelaLocale } from '../charts/velaLocale'
 import { fetchKlines } from '../api'
 import { dateTime, money, pct, price as fmtPrice } from '../utils/format'
@@ -230,9 +230,9 @@ export default function TradeReplayDialog({ open, trade, result, onClose }: Prop
         })),
         symbol: result.report.symbol,
         timeframe: VELA_TIMEFRAME[timeframe] ?? '60',
-        theme: VELA_THEME,
-        upColor: VELA_THEME.upColor,
-        downColor: VELA_THEME.downColor,
+        theme: velaTheme(),
+        upColor: UP_COLOR,
+        downColor: DOWN_COLOR,
         timezone: 'Asia/Shanghai',
         topbar: { left: [], right: [] },
         statusline: false,

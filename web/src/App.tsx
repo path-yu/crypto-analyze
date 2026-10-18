@@ -16,6 +16,8 @@ import Tabs from '@mui/material/Tabs'
 import Toolbar from '@mui/material/Toolbar'
 import Tooltip from '@mui/material/Tooltip'
 import Typography from '@mui/material/Typography'
+import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward'
+import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward'
 import ChevronRightIcon from '@mui/icons-material/ChevronRight'
 import InsightsIcon from '@mui/icons-material/Insights'
 import NotificationsActiveIcon from '@mui/icons-material/NotificationsActive'
@@ -37,7 +39,15 @@ import type {
   Timeframe,
 } from '@shared/types'
 import { TIMEFRAME_MS } from '@shared/types'
-import { buildTheme, UP_COLOR, DOWN_COLOR } from './theme'
+import {
+  buildTheme,
+  applyToneScheme,
+  readToneScheme,
+  getToneScheme,
+  UP_COLOR,
+  DOWN_COLOR,
+  type ToneScheme,
+} from './theme'
 import { loadBacktestForm, saveBacktestForm } from './backtestForm'
 import {
   deletePineScript,
@@ -650,7 +660,26 @@ export default function App() {
   )
 
   const themeMode = 'dark' as const
-  const theme = useMemo(() => buildTheme(themeMode), [themeMode])
+  /**
+   * 涨跌配色：`red-up` 红涨绿跌（国内习惯，默认）/ `green-up` 绿涨红跌（国际习惯）。
+   *
+   * 首屏的那一次由 theme.ts 在模块加载时按 localStorage 应用（避免闪色），
+   * 这里只负责切换后的重渲染。
+   */
+  const [toneScheme, setToneScheme] = useState<ToneScheme>(readToneScheme)
+  const theme = useMemo(() => buildTheme(themeMode), [themeMode, toneScheme])
+
+  /**
+   * 切换涨跌配色。
+   *
+   * **顺序不能反**：先改模块级的可变绑定（顺带落盘），再 setState 触发重渲染 ——
+   * 否则这一帧的 `buildTheme` 与各处组件读到的仍是旧色，要等下一帧才对。
+   */
+  const toggleToneScheme = useCallback(() => {
+    const next: ToneScheme = getToneScheme() === 'red-up' ? 'green-up' : 'red-up'
+    applyToneScheme(next)
+    setToneScheme(next)
+  }, [])
   /** 移动端判定（< 900px）：参数面板走抽屉、图表区独占整屏 */
   const isMobile = useIsMobile()
   /**
@@ -789,6 +818,27 @@ export default function App() {
                   </Button>
                 </>
               )}
+              <Tooltip
+                title={
+                  toneScheme === 'red-up'
+                    ? '涨跌配色：红涨绿跌（点击切为绿涨红跌）'
+                    : '涨跌配色：绿涨红跌（点击切为红涨绿跌）'
+                }
+              >
+                <IconButton
+                  size="small"
+                  color="inherit"
+                  // 当前配色写进 aria-label：读屏与自动化检查都能直接问出状态
+                  aria-label={`切换涨跌配色，当前为${toneScheme === 'red-up' ? '红涨绿跌' : '绿涨红跌'}`}
+                  onClick={toggleToneScheme}
+                >
+                  {/* 两个箭头直接按当前配色着色，一眼看出现在是哪种 */}
+                  <Stack direction="row" alignItems="center">
+                    <ArrowUpwardIcon sx={{ fontSize: 14, color: UP_COLOR }} />
+                    <ArrowDownwardIcon sx={{ fontSize: 14, color: DOWN_COLOR }} />
+                  </Stack>
+                </IconButton>
+              </Tooltip>
               <Tooltip title="为合约添加实时价格警报，支持电报机器人与网页通知推送">
                 {isMobile ? (
                   // 移动端：与「参数」保持一致的纯图标按钮（给足点击区域，避免空按钮）
@@ -846,6 +896,9 @@ export default function App() {
         </AppBar>
 
         <Box
+          /* 切涨跌配色时整棵子树重挂载：Vela 画布只在建图时取一次涨跌色，
+             不重挂载的话已建好的图不会换色（recharts 之类也会被重跑一遍） */
+          key={toneScheme}
           sx={{
             flex: { lg: 1 },
             minHeight: 0,

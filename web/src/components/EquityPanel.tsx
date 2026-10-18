@@ -20,7 +20,7 @@ import {
 import type { BacktestResult } from '@shared/types'
 import { axisTimeLabel, compact, money, num, pct, price } from '../utils/format'
 import { downsample } from '../utils/series'
-import { darkChartPalette, UP_COLOR, DOWN_COLOR } from '../theme'
+import { darkChartPalette, getToneScheme, UP_COLOR, DOWN_COLOR } from '../theme'
 
 const PAL = darkChartPalette
 
@@ -281,7 +281,7 @@ export default function EquityPanel({ result }: { result: BacktestResult }) {
 
         <ChartCard
           title="月度收益"
-          subtitle={`共 ${monthlyData.length} 个自然月 · 红涨绿跌`}
+          subtitle={`共 ${monthlyData.length} 个自然月 · ${getToneScheme() === 'green-up' ? '绿涨红跌' : '红涨绿跌'}`}
           height={230}
         >
           <ResponsiveContainer width="100%" height="100%">

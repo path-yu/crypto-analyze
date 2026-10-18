@@ -34,17 +34,33 @@ type SortKey =
   | 'barsHeld'
   | 'priceChangePercent'
 
-const REASON_COLOR: Record<string, string> = {
-  TP1: UP_COLOR,
-  TP2: UP_COLOR,
-  StopLoss: DOWN_COLOR,
-  BreakEven: '#8a94a6',
-  Reverse: '#ffb01f',
-  TrendSwitch: '#5b8cff',
-  ScriptClose: '#5b8cff',
-  Liquidation: '#ff2244',
-  TimeStop: '#ffb01f',
-  EndOfData: '#8a94a6',
+/**
+ * 平仓原因 → 颜色。
+ *
+ * 写成函数而不是常量表：涨跌色是可变的（见 theme.ts 的 applyToneScheme），
+ * 常量表会在模块加载那一刻把旧配色定格，切换后不会跟着变。
+ */
+function reasonColor(reason: string): string {
+  switch (reason) {
+    case 'TP1':
+    case 'TP2':
+      return UP_COLOR
+    case 'StopLoss':
+      return DOWN_COLOR
+    case 'BreakEven':
+    case 'EndOfData':
+      return '#8a94a6'
+    case 'Reverse':
+    case 'TimeStop':
+      return '#ffb01f'
+    case 'TrendSwitch':
+    case 'ScriptClose':
+      return '#5b8cff'
+    case 'Liquidation':
+      return '#ff2244'
+    default:
+      return '#8a94a6'
+  }
 }
 
 export default function TradesTable({
@@ -255,7 +271,7 @@ export default function TradesTable({
                         height: 18,
                         fontSize: 10,
                         bgcolor: 'action.hover',
-                        color: REASON_COLOR[t.exitReason] ?? 'text.secondary',
+                        color: reasonColor(t.exitReason),
                       }}
                     />
                   </TableCell>

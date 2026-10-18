@@ -20,6 +20,7 @@
 
 import { registerNativeIndicator, registerRendererLayer } from '@luxalgo/vela/plugin'
 import type { BacktestResult, Trade } from '@shared/types'
+import { UP_COLOR, DOWN_COLOR } from '../theme'
 
 /** 图层 id 同时也是原生指标 type 与原生数据通道名 */
 export const TRADE_LAYER_ID = 'stock-trades'
@@ -177,11 +178,8 @@ export const MARKER_HIT_RADIUS = 14
 /* 绘制                                                                */
 /* ------------------------------------------------------------------ */
 
-const COLOR_LONG = '#ff4d4f'
-const COLOR_SHORT = '#3ddc97'
+/** 入场价线的固定色（蓝），与涨跌配色无关 */
 const COLOR_ENTRY = '#5b8cff'
-const COLOR_WIN = '#ff4d4f'
-const COLOR_LOSS = '#3ddc97'
 
 interface RenderArgs {
   bars: readonly { time: number }[]
@@ -257,11 +255,11 @@ function drawLayer(
       const x2 = xOf(t.exitTime)
       const yEntry = yOf(t.entryPrice)
       const yExit = yOf(t.exitPrice)
-      const color = t.side === 'long' ? COLOR_LONG : COLOR_SHORT
-      const pnlColor = t.profitable ? COLOR_WIN : COLOR_LOSS
+      const color = t.side === 'long' ? UP_COLOR : DOWN_COLOR
+      const pnlColor = t.profitable ? UP_COLOR : DOWN_COLOR
 
       // 持仓区间着色
-      ctx2d.fillStyle = t.profitable ? 'rgba(255,77,79,0.10)' : 'rgba(61,220,151,0.10)'
+      ctx2d.fillStyle = `${t.profitable ? UP_COLOR : DOWN_COLOR}1a`
       ctx2d.fillRect(Math.min(x1, x2), Math.min(yEntry, yExit), Math.abs(x2 - x1) || 1, Math.abs(yExit - yEntry) || 1)
 
       // 入场价线（蓝，自开仓至平仓）
