@@ -36,8 +36,9 @@ import type {
   StrategyParams,
   Timeframe,
 } from '@shared/types'
-import { DEFAULT_STRATEGY_PARAMS, TIMEFRAME_MS } from '@shared/types'
+import { TIMEFRAME_MS } from '@shared/types'
 import { buildTheme, UP_COLOR, DOWN_COLOR } from './theme'
+import { loadBacktestForm, saveBacktestForm } from './backtestForm'
 import {
   deletePineScript,
   fetchKlines,
@@ -150,27 +151,20 @@ function sameInputs(
 }
 
 export default function App() {
-  const [exchange, setExchange] = useState<ExchangeId>('binanceusdm')
-  const [symbol, setSymbol] = useState('BTC/USDT:USDT')
-  const [timeframe, setTimeframe] = useState<Timeframe>('1h')
-  const [range, setRange] = useState<RangeKey>('1y')
-  const [customSince, setCustomSince] = useState(() => {
-    const d = new Date(Date.now() - 365 * 86400_000)
-    return d.toISOString().slice(0, 10)
-  })
+  /** 启动时读一次本地存储的表单：下面各字段的初始值都取自它，刷新后不用重选品种/周期/杠杆 */
+  const [form] = useState(loadBacktestForm)
+  const [exchange, setExchange] = useState<ExchangeId>(form.exchange)
+  const [symbol, setSymbol] = useState(form.symbol)
+  const [timeframe, setTimeframe] = useState<Timeframe>(form.timeframe)
+  const [range, setRange] = useState<RangeKey>(form.range)
+  const [customSince, setCustomSince] = useState(form.customSince)
   /** 自定义结束日期（YYYY-MM-DD）；空串 = 回测到今天 */
-  const [customUntil, setCustomUntil] = useState('')
+  const [customUntil, setCustomUntil] = useState(form.customUntil)
   /**
    * 本应用现在只跑 Pine 脚本：strategy 固定为 'pine'，并按服务端 normalizeParams
    * 对 pine 的强制语义（Zone OCO / 不分批止盈 / 不加仓）初始化一次。
    */
-  const [params, setParams] = useState<StrategyParams>(() => ({
-    ...DEFAULT_STRATEGY_PARAMS,
-    strategy: 'pine',
-    exitStrategy: 'Zone OCO',
-    partialTp: false,
-    pyramiding: 1,
-  }))
+  const [params, setParams] = useState<StrategyParams>(form.params)
   /** Pine 策略源码（strategy === 'pine' 时随回测请求一起提交） */
   const [pineSource, setPineSource] = useState('')
   /**
@@ -184,8 +178,8 @@ export default function App() {
   const [pineName, setPineName] = useState('')
   /** 已保存到本地缓存的脚本（策略下拉菜单直接可选） */
   const [pineScripts, setPineScripts] = useState<SavedPineScript[]>([])
-  /** 当前载入的已保存脚本 id */
-  const [pineScriptId, setPineScriptId] = useState<string | null>(null)
+  /** 当前载入的已保存脚本 id（随表单一起落本地存储，刷新后恢复） */
+  const [pineScriptId, setPineScriptId] = useState<string | null>(form.pineScriptId)
   /** Pine 编辑器是否在右侧 Drawer 弹窗中放大编辑 */
   const [pineDrawerOpen, setPineDrawerOpen] = useState(false)
   /** 价格警报面板（右侧 Drawer） */
@@ -204,7 +198,7 @@ export default function App() {
   /** 正在拉取 K 线（与回测的 loading 分开，图表有自己的加载态） */
   const [chartLoading, setChartLoading] = useState(false)
   /** 「同步进行回测」：切换品种/周期/区间后自动重跑一次回测（默认关闭） */
-  const [syncBacktest, setSyncBacktest] = useState(false)
+  const [syncBacktest, setSyncBacktest] = useState(form.syncBacktest)
   const [tab, setTab] = useState<TabKey>('chart')
   const [showTrades, setShowTrades] = useState(true)
   /** 单笔交易明细弹窗（「交易明细」表与 K 线图上的交易标记共用） */
@@ -461,13 +455,37 @@ export default function App() {
   )
 
   /**
-   * 首次拿到脚本列表时自动选中第一份 —— 本应用只跑 Pine 脚本，
-   * 「一进页面就有脚本在跑」靠这一步兜住（没有它，首屏只能空着等用户选）。
+   * 拿到脚本列表后落定当前脚本 —— 本应用只跑 Pine 脚本，两条路径都靠这一步兜住：
+   *   1. 本地存储恢复过 id：把它的**最新源码**补进来（只存 id，源码以磁盘为准）
+   *   2. 没有选中项（首次进入 / 原脚本已被删除）：自动选中第一份
    */
   useEffect(() => {
-    if (pineScriptId || pineScripts.length === 0) return
+    if (pineScripts.length === 0) return
+    if (pineScriptId) {
+      if (!pineSource) handleSelectPineScript(pineScriptId)
+      return
+    }
     handleSelectPineScript(pineScripts[0].id)
-  }, [pineScripts, pineScriptId, handleSelectPineScript])
+  }, [pineScripts, pineScriptId, pineSource, handleSelectPineScript])
+
+  /**
+   * 回测参数表单 → localStorage：任一字段变化即落盘，刷新后原样恢复。
+   * 覆盖行情设置（交易所 / 合约 / 周期 / 区间 / 结束日期）、资金与杠杆、
+   * 「同步进行回测」开关、以及所选 Pine 脚本 id。
+   */
+  useEffect(() => {
+    saveBacktestForm({
+      exchange,
+      symbol,
+      timeframe,
+      range,
+      customSince,
+      customUntil,
+      params,
+      syncBacktest,
+      pineScriptId,
+    })
+  }, [exchange, symbol, timeframe, range, customSince, customUntil, params, syncBacktest, pineScriptId])
 
   /**
    * 实时尾巴（WebSocket）：订阅当前窗口的 (交易所, 品种, 周期)，把推来的最新 bar

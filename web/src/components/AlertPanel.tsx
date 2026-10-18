@@ -218,6 +218,8 @@ export default function AlertPanel({
   const [saving, setSaving] = useState(false)
   const [instruments, setInstruments] = useState<Instrument[]>([])
   const [pineScripts, setPineScripts] = useState<SavedPineScript[]>([])
+  /** 脚本列表是否已拉取完（用于区分「还在加载」与「确实找不到这个 id」） */
+  const [scriptsLoaded, setScriptsLoaded] = useState(false)
   const [events, setEvents] = useState<AlertEvent[]>([])
 
   /* ---------------- 数据拉取 ---------------- */
@@ -276,13 +278,42 @@ export default function AlertPanel({
     }
   }, [draft?.exchange])
 
-  /** Pine 脚本列表（Pine 类条件选脚本用） */
+  /**
+   * Pine 脚本列表（Pine 类条件选脚本用）。
+   *
+   * 面板打开、以及每次打开编辑弹窗时都刷一次 —— 下拉的选项由它决定，只拉一次的话
+   * 一旦首次拉取失败，弹窗里的「Pine 脚本」就会一直显示空白（选中值找不到对应选项）。
+   */
   useEffect(() => {
     if (!open) return
     fetchPineScripts()
-      .then(setPineScripts)
-      .catch(() => setPineScripts([]))
-  }, [open])
+      .then((list) => {
+        setPineScripts(list)
+        setScriptsLoaded(true)
+      })
+      .catch((err) => {
+        setPineScripts([])
+        setScriptsLoaded(true)
+        // 不静默吞掉：否则「弹窗里脚本名一片空白」会无从排查
+        console.warn('[alerts] 已保存脚本列表拉取失败：', err)
+      })
+  }, [open, draft !== null])
+
+  /**
+   * 「Pine 脚本」下拉的显示文案。
+   *
+   * 空值走默认脚本时**点出脚本名**（只写「第一份已保存脚本」等于没说）；选中值在列表里
+   * 找不到对应项时也不留空白 —— 列表还在路上就显示「加载中…」，确实找不到就说「未知脚本」。
+   */
+  const scriptLabel = (id: string): string => {
+    if (!id) {
+      const first = pineScripts[0]?.name
+      return first ? `（默认：${first}）` : '（默认：列表第一份已保存脚本）'
+    }
+    const hit = pineScripts.find((s) => s.id === id)
+    if (hit) return hit.name
+    return scriptsLoaded ? `未知脚本（${id}）` : '加载中…'
+  }
 
   /** 草稿里的周期变化时同步周期默认值 */
   const selectedInstrument = useMemo(
@@ -1028,10 +1059,14 @@ export default function AlertPanel({
                     <Select
                       label="Pine 脚本"
                       notched
+                      // 空值是常态（新建警报、以及保存时没选脚本的警报都会是空）：
+                      // 不加 displayEmpty 的话 MUI 对空值直接不渲染任何文案，下拉框就是一片空白
+                      displayEmpty
                       value={draft.pineScriptId}
                       onChange={(e) => setDraft({ ...draft, pineScriptId: e.target.value })}
+                      renderValue={(v) => scriptLabel(String(v ?? ''))}
                     >
-                      <MenuItem value="">（默认：第一份已保存脚本）</MenuItem>
+                      <MenuItem value="">{scriptLabel('')}</MenuItem>
                       {pineScripts.map((s) => (
                         <MenuItem key={s.id} value={s.id}>
                           {s.name}

@@ -190,17 +190,33 @@ export function pineScriptSource(id?: string): { id: string; name: string; sourc
 }
 
 /**
- * 把一根 K 线上的脚本信号翻译成中文方向标签。
+ * 该根 K 线上的 `forceClose` 是不是**真平仓**。
  *
- * `PineSignal` 只有 `canLong / canShort / forceClose` 三个布尔位（由脚本的券商账本折算而来），
- * 脚本里的文字（`alertcondition` / `plotshape(..., text=…)`）既不逐 bar 绑定、多数脚本也没写，
- * 所以「脚本里发生了什么」只能由这三个位描述；同根同时命中多个时用 ` + ` 连接。
+ * 适配器对「脚本在数据末尾仍持仓」会在最后一根打一个收尾标记（`openAtEnd`）供回测收尾，
+ * 那不是脚本发出的平仓信号。警报正好在 K 线收盘那一刻判定，「刚收盘的那根」就是数据数组的
+ * 最后一根 —— 不排除它的话，每根 K 线都会误报一条没有方向、没有止损/止盈的「平仓」。
+ */
+const hasRealClose = (sig: PineSignal): boolean => Boolean(sig.forceClose) && !sig.openAtEnd
+
+/**
+ * 把一根 K 线上的脚本信号翻译成中文**操作类型**：开多 / 开空 / 平多 / 平空，
+ * 平仓再带上性质 —— 平多（止损）/ 平多（止盈）/ 平空（止损）/ 平空（止盈）。
+ *
+ * `PineSignal` 只有布尔位与几个价位（脚本的券商账本折算而来），脚本里的文字
+ * （`alertcondition` / `plotshape(..., text=…)`）既不逐 bar 绑定、多数脚本也没写，
+ * 所以「脚本里发生了什么」只能由信号位描述；同根同时命中多个时用 ` + ` 连接。
  */
 function pineDirectionLabel(sig: PineSignal): string {
   const parts: string[] = []
-  if (sig.canLong) parts.push('做多开仓')
-  if (sig.canShort) parts.push('做空开仓')
-  if (sig.forceClose) parts.push('平仓')
+  if (sig.canLong) parts.push('开多')
+  if (sig.canShort) parts.push('开空')
+  if (hasRealClose(sig)) {
+    // 平的是哪一边看那笔成交的方向；判不出时退化成中性的「平仓」
+    const side = sig.closeSide === 'short' ? '平空' : sig.closeSide === 'long' ? '平多' : '平仓'
+    const why =
+      sig.closeReason === 'stopLoss' ? '（止损）' : sig.closeReason === 'takeProfit' ? '（止盈）' : ''
+    parts.push(`${side}${why}`)
+  }
   return parts.join(' + ')
 }
 
@@ -317,8 +333,8 @@ export async function evaluateAlert(
         : cond.kind === 'pineEntryShort'
           ? sig.canShort
           : cond.kind === 'pineExit'
-            ? Boolean(sig.forceClose)
-            : sig.canLong || sig.canShort || Boolean(sig.forceClose)
+            ? hasRealClose(sig)
+            : sig.canLong || sig.canShort || hasRealClose(sig)
 
     // 同指标类：首次判定只建基线，创建前那根已收盘 K 线上的信号不推送
     const baseline = st.lastBarTime === undefined

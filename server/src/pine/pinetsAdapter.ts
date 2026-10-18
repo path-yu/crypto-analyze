@@ -46,6 +46,30 @@ export interface PineSignal {
   entryQty?: number
   /** `strategy.close(...)` / `strategy.close_all()` → 引擎下一根开盘市价平仓 */
   forceClose?: boolean
+  /**
+   * 该根 K 线平的是**哪一边**：由那笔成交的 `size` 符号决定（正 = 多、负 = 空）。
+   *
+   * 不能用 `canLong / canShort` 反推 —— 同根常见「先平后开」（例如平空的同时开多），
+   * 只看开仓信号会把「平空」误判成「平多」。
+   */
+  closeSide?: 'long' | 'short'
+  /**
+   * 该根 K 线平仓的性质：止损 / 止盈。
+   *
+   * 判据是那笔成交的**盈亏正负**（< 0 = 止损，≥ 0 = 止盈）。不用脚本的平仓 comment：
+   * 实测只有部分脚本写了，且内容不统一（有的为空、有的是 `STOP 84222.1`、有的干脆是价格数字）。
+   * 仍持仓（`status = open`，没有盈亏）时缺省。
+   */
+  closeReason?: 'stopLoss' | 'takeProfit'
+  /**
+   * 该根是**序列末尾的收尾标记**：脚本在这根之后仍持仓，适配器为了让回测能收尾
+   * （引擎最后按 `EndOfData` 平掉剩余仓位）才在最后一根打了 `forceClose`。
+   *
+   * **它不代表脚本真的发出了平仓信号**。订阅类消费方（价格警报）必须把它排除 ——
+   * 警报是在 K 线刚收盘那一刻判定的，而「刚收盘的那根」正好是数据数组的最后一根，
+   * 不排除的话每根 K 线都会误报一次「平仓」（实测 BTW/HYPE/Q 每 2 小时一条）。
+   */
+  openAtEnd?: boolean
 }
 
 /** 空的信号快照 */
@@ -383,12 +407,20 @@ export async function runPineTsSignals(
         ;(signals[entryIdx] as unknown as Record<string, number>).entryQty = qty
       }
     }
-    // 已平仓的用 exit_bar_index；仍持仓（status = open）的用最后一根收尾
-    const exitIdx =
-      t.status === 'open' || t.exit_bar_index === undefined
-        ? last
-        : Math.max(0, Math.min(last, t.exit_bar_index + PINE_ENTRY_OFFSET))
-    mark(exitIdx, 'forceClose')
+    if (t.status === 'open' || t.exit_bar_index === undefined) {
+      // 仍持仓：在最后一根打收尾标记。forceClose 保持不变（回测按它收尾），
+      // 另加 openAtEnd 供订阅类消费方识别「这不是真平仓」。
+      mark(last, 'forceClose')
+      signals[last].openAtEnd = true
+    } else {
+      const exitIdx = Math.max(0, Math.min(last, t.exit_bar_index + PINE_ENTRY_OFFSET))
+      mark(exitIdx, 'forceClose')
+      // 真平仓才带方向与性质：方向取该笔的 size 符号（同根可能先平后开，不能拿开仓信号反推），
+      // 性质按该笔盈亏正负判定（脚本 comment 不可靠，见 PineSignal.closeReason 注释）。
+      const s = signals[exitIdx]
+      s.closeSide = isLong ? 'long' : 'short'
+      if (typeof t.profit === 'number') s.closeReason = t.profit < 0 ? 'stopLoss' : 'takeProfit'
+    }
   }
 
   /*
